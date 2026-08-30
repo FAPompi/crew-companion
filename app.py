@@ -70,7 +70,7 @@ def load_roster_from_db(username):
     conn.close()
     return data[0] if data else ""
 
-# --- 2. ADVANCED STRUCTURED PARSER LOGIC ---
+# --- 2. DETAILED TIMING PARSER LOGIC ---
 def parse_roster_text(raw_text):
     lines = raw_text.split('\n')
     parsed_rows = []
@@ -82,51 +82,69 @@ def parse_roster_text(raw_text):
             
         activity_type = "OTHER"
         flight_no = "-"
-        date_str = "-"
+        checkin_time = "-"
+        dep_time = "-"
         route = "-"
+        arr_time = "-"
+        checkout_time = "-"
         ac_type = "-"
+        
+        # Find all date-time patterns like 31AUG26 16:15
+        dt_matches = re.findall(r'(\d{2}[A-Z]{3}\d{2}\s+\d{2}:\d{2})', line_str)
         
         if "OFF" in line_str:
             activity_type = "DAY OFF"
-            # Extract date if present (e.g. 04SEP26)
-            date_match = re.search(r'(\d{2}[A-Z]{3}\d{2})', line_str)
-            if date_match:
-                date_str = date_match.group(1)
+            if dt_matches:
+                checkin_time = dt_matches[0]
         elif "HTL" in line_str:
             activity_type = "LAYOVER"
-            date_match = re.search(r'(\d{2}[A-Z]{3}\d{2})', line_str)
-            if date_match:
-                date_str = date_match.group(1)
-            # Find route like CAN CAN
+            if len(dt_matches) >= 2:
+                checkin_time = dt_matches[0]
+                checkout_time = dt_matches[1]
+            elif len(dt_matches) == 1:
+                checkin_time = dt_matches[0]
+            
             route_match = re.search(r'([A-Z]{3})\s+([A-Z]{3})', line_str)
             if route_match:
                 route = f"{route_match.group(1)} ➔ {route_match.group(2)}"
         elif "UL" in line_str:
             activity_type = "FLIGHT"
-            # Flight number
             match = re.search(r'(UL\d+)', line_str)
             if match:
                 flight_no = match.group(1)
-            # Date
-            date_match = re.search(r'(\d{2}[A-Z]{3}\d{2})', line_str)
-            if date_match:
-                date_str = date_match.group(1)
-            # Route airports (e.g. CMB CAN)
+                
             route_match = re.search(r'([A-Z]{3})\s+([A-Z]{3})', line_str)
             if route_match:
                 route = f"{route_match.group(1)} ➔ {route_match.group(2)}"
-            # Aircraft type (3-character code at the end like 333, 32A, 320)
+                
+            # Assign timestamps sequentially if found
+            if len(dt_matches) >= 4:
+                checkin_time = dt_matches[0]
+                dep_time = dt_matches[1]
+                arr_time = dt_matches[2]
+                checkout_time = dt_matches[3]
+            elif len(dt_matches) == 3:
+                checkin_time = dt_matches[0]
+                dep_time = dt_matches[1]
+                arr_time = dt_matches[2]
+            elif len(dt_matches) == 2:
+                dep_time = dt_matches[0]
+                arr_time = dt_matches[1]
+                
             parts = line_str.split()
             for p in parts:
-                if len(p) == 3 and (p.isalnum()) and p not in ["FA", "J28", "CMB", "CAN", "BKK", "TRZ"]:
+                if len(p) == 3 and p.isalnum() and p not in ["FA", "J28", "CMB", "CAN", "BKK", "TRZ"]:
                     ac_type = p
                     
         if "UL" in line_str or "OFF" in line_str or "HTL" in line_str:
             parsed_rows.append({
-                "Date": date_str,
                 "Type": activity_type,
-                "Flight / Details": flight_no if flight_no != "-" else activity_type,
+                "Flight / Code": flight_no if flight_no != "-" else activity_type,
+                "Check-In": checkin_time,
+                "Departure": dep_time,
                 "Route": route,
+                "Arrival": arr_time,
+                "Checkout": checkout_time,
                 "Aircraft": ac_type
             })
             
