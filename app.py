@@ -1,12 +1,13 @@
 import streamlit as st
 import sqlite3
 import hashlib
+import pandas as pd
+import re
 
 # --- 1. DATABASE SETUP ---
 def init_db():
     conn = sqlite3.connect('crew_companion.db')
     c = conn.cursor()
-    # Create table for crew users
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             username TEXT PRIMARY KEY,
@@ -15,10 +16,17 @@ def init_db():
             rank TEXT
         )
     ''')
+    # Table to store user rosters
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS rosters (
+            username TEXT,
+            roster_text TEXT,
+            PRIMARY KEY (username)
+        )
+    ''')
     conn.commit()
     conn.close()
 
-# Hash passwords for security
 def make_hash(password):
     return hashlib.sha256(str.encode(password)).hexdigest()
 
@@ -44,17 +52,44 @@ def login_user(username, password):
     c.execute('SELECT * FROM users WHERE username = ?', (username,))
     data = c.fetchone()
     conn.close()
-    if data:
-        if check_hash(password, data[1]):
-            return data # Returns (username, hashed_password, full_name, rank)
+    if data and check_hash(password, data[1]):
+        return data
     return None
 
-# --- 2. STREAMLIT INTERFACE ---
-st.set_page_config(page_title="Crew Companion", page_icon="✈️", layout="wide")
+def save_roster_to_db(username, text):
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    c.execute('REPLACE INTO rosters (username, roster_text) VALUES (?, ?)', (username, text))
+    conn.commit()
+    conn.close()
 
+def load_roster_from_db(username):
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    c.execute('SELECT roster_text FROM rosters WHERE username = ?', (username,))
+    data = c.fetchone()
+    conn.close()
+    return data[0] if data else ""
+
+# --- 2. PARSER LOGIC ---
+def parse_roster_text(raw_text):
+    lines = raw_text.split('\n')
+    parsed_rows = []
+    
+    for line in lines:
+        # Match flight lines or OFF/HTL lines based on SriLankan portal format
+        if "UL" in line or "OFF" in line or "HTL" in line:
+            parts = re.split(r'\s{2,}|\t', line.strip())
+            if len(parts) >= 3:
+                parsed_rows.append({
+                    "Line Details": line.strip()
+                })
+    return parsed_rows
+
+# --- 3. STREAMLIT INTERFACE ---
+st.set_page_config(page_title="Crew Companion", page_icon="✈️", layout="wide")
 init_db()
 
-# Session state management for login
 if 'logged_in' not in st.session_state:
     st.session_state['logged_in'] = False
     st.session_state['username'] = ''
@@ -83,7 +118,7 @@ if not st.session_state['logged_in']:
             else:
                 st.sidebar.error("Invalid username or password.")
                 
-    else: # Register
+    else:
         new_user = st.sidebar.text_input("Choose Username / Email", key="reg_user")
         new_pass = st.sidebar.text_input("Choose Password", type="password", key="reg_pass")
         new_name = st.sidebar.text_input("Full Name", key="reg_name")
@@ -108,16 +143,41 @@ else:
         st.session_state['rank'] = ''
         st.rerun()
 
-# --- 3. MAIN APP VIEW ---
+# --- MAIN APP VIEW ---
 if not st.session_state['logged_in']:
     st.title("✈️ Crew Companion Platform")
     st.markdown("### Welcome to your interactive crew management and analytics hub.")
-    st.info("👈 Please **Log In** or **Register Account** using the sidebar to access your private roster dashboard.")
+    st.info("👈 Please **Log In** or **Register Account** using the sidebar to access your private dashboard.")
 else:
     st.title(f"Welcome back, {st.session_state['full_name']}!")
-    st.write(f"**Rank:** {st.session_state['rank']}")
-    st.success("Database connection active. Secure session initialized.")
     
-    # Placeholder for the next step (Roster Upload & Dashboard)
-    st.markdown("---")
-    st.info("Next up: We will add the **Roster Ingestion and Parsing Engine** right here so you can paste or upload your schedule and see the visual dashboard.")
+    tab1, tab2 = st.tabs(["📅 Roster Parser & Dashboard", "⚙️ Account Settings"])
+    
+    with tab1:
+        st.subheader("Paste Your Sabre Roster Text")
+        st.markdown("Copy the text block from your web portal schedule view and paste it below:")
+        
+        saved_text = load_roster_from_db(st.session_state['username'])
+        roster_input = st.text_area("Raw Roster Text", value=saved_text, height=150)
+        
+        if st.button("Save & Parse Roster"):
+            if roster_input.strip():
+                save_roster_to_db(st.session_state['username'], roster_input)
+                st.success("Roster saved successfully!")
+            else:
+                st.warning("Please paste some roster text first.")
+                
+        if saved_text:
+            st.markdown("---")
+            st.subheader("Parsed Schedule Activity")
+            rows = parse_roster_text(saved_text)
+            if rows:
+                st.dataframe(rows, use_container_width=True)
+            else:
+                st.info("No flight patterns recognized yet. Ensure it includes flight codes like UL or OFF indicators.")
+                
+    with tab2:
+        st.subheader("User Configuration")
+        st.write(f"**Username / Email:** {st.session_state['username']}")
+        st.write(f"**Assigned Rank:** {st.session_state['rank']}")
+        st.info("Custom preference settings (like preferred layovers and notifications) will appear here soon.")
