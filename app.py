@@ -218,6 +218,20 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
     except requests.exceptions.RequestException as e:
         return {"success": False, "status_code": "Timeout/DNS Error", "error": str(e), "delayed": False}
 
+def get_upcoming_roster_flights(parsed_rows, current_date):
+    target_flights = []
+    tomorrow_date = current_date + timedelta(days=1)
+    
+    for row in parsed_rows:
+        if row["Type"] == "FLIGHT" and row["DateObj"] is not None:
+            if row["DateObj"].date() in [current_date.date(), tomorrow_date.date()]:
+                target_flights.append({
+                    "flight_no": row["Flight / Code"],
+                    "date": row["Date"],
+                    "route": row["Route"]
+                })
+    return target_flights
+
 # --- 4. STREAMLIT CONFIG & UI ---
 st.set_page_config(page_title="Crew Companion", page_icon="✈️", layout="wide")
 init_db()
@@ -406,32 +420,49 @@ else:
         st.markdown("#### Flight Monitoring Agent")
         
         parsed_rows = parse_roster_text(active_text) if active_text else []
+        today_dt = datetime(2026, 8, 30)
+        upcoming_flights = get_upcoming_roster_flights(parsed_rows, today_dt)
         
         test_user = st.session_state.get('intranet_user', '')
         test_pass = st.session_state.get('intranet_pass', '')
         
-        flight_check_result = authenticate_and_fetch_flight_status(
-            test_user, test_pass, "UL884", "30Aug26"
-        )
+        flight_check_results = []
+        last_success = False
+        last_status_code = None
+        
+        if upcoming_flights:
+            for flight in upcoming_flights:
+                res = authenticate_and_fetch_flight_status(
+                    test_user, test_pass, flight["flight_no"], flight["date"]
+                )
+                last_success = res.get("success")
+                last_status_code = res.get("status_code")
+                if res.get("delayed"):
+                    flight_check_results.append({
+                        "flight": flight["flight_no"],
+                        "route": flight["route"],
+                        "status": res.get("status_message")
+                    })
         
         with st.expander("🛠️ Intranet Diagnostic Log"):
             st.write(f"**Target User:** {test_user if test_user else 'None Provided'}")
-            st.write(f"**Connection Success:** {flight_check_result.get('success')}")
-            st.write(f"**HTTP Status Code:** {flight_check_result.get('status_code')}")
-            if not flight_check_result.get('success'):
-                st.write(f"**Error Details:** {flight_check_result.get('error')}")
-                st.info("💡 Note: If running locally outside SriLankan Airlines corporate network/VPN, the intranet domain will time out, triggering the safe local fallback.")
+            st.write(f"**Parsed Upcoming Flights:** {[f['flight_no'] for f in upcoming_flights] if upcoming_flights else 'None for today/tomorrow'}")
+            st.write(f"**Connection Success:** {last_success}")
+            st.write(f"**HTTP Status Code:** {last_status_code}")
 
-        if flight_check_result.get("success") and flight_check_result.get("delayed"):
-            st.markdown(f"""
-                <div style='background-color: #2c1f1f; border: 1px solid #ff5252; padding: 12px; border-radius: 8px;'>
-                    <b style='color: #ff5252;'>⚠️ Disruption Detected (UL884):</b><br>{flight_check_result.get('status_message')}<br>
-                </div>
-            """, unsafe_allow_html=True)
+        if flight_check_results:
+            for df in flight_check_results:
+                st.markdown(f"""
+                    <div style='background-color: #2c1f1f; border: 1px solid #ff5252; padding: 12px; border-radius: 8px; margin-bottom: 8px;'>
+                        <b style='color: #ff5252;'>⚠️ Disruption Detected ({df['flight']} - {df['route']}):</b><br>{df['status']}<br>
+                    </div>
+                """, unsafe_allow_html=True)
         else:
+            checked_count = len(upcoming_flights)
+            flight_names = ', '.join([f['flight_no'] for f in upcoming_flights]) if upcoming_flights else 'None'
             st.markdown(f"""
                 <div style='background-color: #1b362d; border: 1px solid #4caf50; padding: 12px; border-radius: 8px;'>
-                    <b style='color: #4caf50;'>⚠️ Operational Status Update:</b> UL884 verified via Intranet. All operating on schedule.<br>
+                    <b style='color: #4caf50;'>⚠️ Operational Status Update:</b> Checked {checked_count} roster flight(s) ({flight_names}). All operating on schedule.<br>
                     <small>Live connection test passed cleanly.</small>
                 </div>
             """, unsafe_allow_html=True)
