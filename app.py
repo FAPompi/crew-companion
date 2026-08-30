@@ -201,6 +201,6 @@ else:
                 
     with tab2:
         st.subheader("User Configuration")
-        st.write(f"**Username / Email:** {st.username if 'username' in st.session_state else ''}")
+        st.write(f"**Username / Email:** {st.session_state['username']}")
         st.write(f"**Assigned Rank:** {st.session_state['rank']}")
         st.info("Custom preference settings (like preferred layovers and notifications) will appear here soon.")
