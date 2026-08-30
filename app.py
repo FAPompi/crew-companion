@@ -169,7 +169,7 @@ def parse_roster_text(raw_text):
             
     return parsed_rows
 
-# --- 3. LIVE INTRANET i-FLEET API SESSION ---
+# --- 3. LIVE INTRANET i-FLEET API SESSION (DEBUG ENHANCED) ---
 def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no, flight_date, dep_stn="CMB", arr_stn=""):
     login_url = "https://intraneti.srilankan.com/ifv/login"
     details_endpoint = "https://intraneti.srilankan.com/IFV/iFLEET_Local/GetFlightDetails"
@@ -190,7 +190,15 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
     }
     
     try:
-        login_resp = session.post(login_url, data=login_payload, headers=headers, timeout=10, verify=True)
+        login_resp = session.post(login_url, data=login_payload, headers=headers, timeout=10, allow_redirects=True, verify=True)
+        
+        if "login" in login_resp.url.lower() or "invalid" in login_resp.text.lower():
+            return {
+                "success": False, 
+                "status_code": login_resp.status_code, 
+                "error": "Authentication rejected or redirected back to login page.", 
+                "delayed": False
+            }
         
         if login_resp.status_code in [200, 302, 303]:
             api_headers = {
@@ -239,7 +247,7 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
                         "eta": data.get("ETA", "As Scheduled")
                     }
                 except ValueError:
-                    return {"success": False, "status_code": resp.status_code, "error": "Invalid JSON returned from GetFlightDetails"}
+                    return {"success": False, "status_code": resp.status_code, "error": f"Invalid JSON. Response text preview: {resp.text[:100]}"}
                     
             return {"success": False, "status_code": resp.status_code, "error": f"Details API returned status {resp.status_code}"}
         return {"success": False, "status_code": login_resp.status_code, "error": f"Login returned status {login_resp.status_code}"}
