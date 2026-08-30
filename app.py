@@ -169,7 +169,7 @@ def parse_roster_text(raw_text):
             
     return parsed_rows
 
-# --- 3. LIVE INTRANET i-FLEET API SESSION (UPDATED CREDENTIAL MAPPING) ---
+# --- 3. LIVE INTRANET i-FLEET API SESSION (EXACT FORMAT PRESERVATION) ---
 def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no, flight_date, dep_stn="CMB", arr_stn=""):
     login_url = "https://intraneti.srilankan.com/ifv/login"
     details_endpoint = "https://intraneti.srilankan.com/IFV/iFLEET_Local/GetFlightDetails"
@@ -184,6 +184,7 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
         "X-Requested-With": "XMLHttpRequest"
     }
     
+    # Preserves exact backslash syntax format like UL\23546
     login_payload = {
         "UserName": intranet_user,
         "Password": intranet_pass
@@ -363,7 +364,7 @@ else:
         if 'intranet_pass' not in st.session_state:
             st.session_state['intranet_pass'] = ""
             
-        i_user = st.text_input("Intranet Username / ID", value=st.session_state['intranet_user'])
+        i_user = st.text_input("Intranet Username / ID (e.g. UL\\23546)", value=st.session_state['intranet_user'])
         i_pass = st.text_input("Intranet Password", type="password", value=st.session_state['intranet_pass'])
         
         if st.button("Save Intranet Credentials"):
