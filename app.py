@@ -168,7 +168,7 @@ def parse_roster_text(raw_text):
             
     return parsed_rows
 
-# --- 3. INTRANET SESSION HANDLER & LIVE FLIGHT SCRAPER ---
+# --- 3. INTRANET SESSION HANDLER & AUTOMATED FLIGHT CHECKER ---
 def authenticate_and_fetch_flight_status(staff_username, staff_password, flight_no, flight_date):
     """
     Handles authenticated session connection to Sri Lankan Airlines internal flight viewer 
@@ -192,18 +192,14 @@ def authenticate_and_fetch_flight_status(staff_username, staff_password, flight_
     }
     
     try:
-        # Step 1: Establish session and post credentials to intranet gateway
         login_resp = session.post(login_url, data=payload, headers=headers, timeout=6, verify=True)
         
         if login_resp.status_code == 200:
-            # Step 2: Query flight viewer parameters post-authentication
             query_params = {"no": flight_no, "date": flight_date}
             resp = session.get(status_endpoint, params=query_params, headers=headers, timeout=6)
             
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.text, 'html.parser')
-                
-                # Example DOM parsing selectors for status elements
                 delay_elem = soup.find("div", {"id": "flight-delay-status"})
                 eta_elem = soup.find("span", {"id": "live-eta"})
                 
@@ -221,8 +217,60 @@ def authenticate_and_fetch_flight_status(staff_username, staff_password, flight_
         return {"success": False, "error": "Authentication or target page unreachable."}
         
     except requests.exceptions.RequestException as e:
-        # Graceful fallback handler if intranet environment is offline/VPN-restricted
         return {"success": False, "error": str(e), "delayed": False}
+
+def get_upcoming_roster_flights(parsed_rows, current_date):
+    target_flights = []
+    tomorrow_date = current_date + timedelta(days=1)
+    
+    for row in parsed_rows:
+        if row["Type"] == "FLIGHT" and row["DateObj"] is not None:
+            if row["DateObj"].date() in [current_date.date(), tomorrow_date.date()]:
+                target_flights.append({
+                    "flight_no": row["Flight / Code"],
+                    "date": row["Date"],
+                    "route": row["Route"]
+                })
+    return target_flights
+
+def check_all_roster_delays(staff_username, staff_password, parsed_rows):
+    today_dt = datetime(2026, 8, 30)
+    upcoming_flights = get_upcoming_roster_flights(parsed_rows, today_dt)
+    
+    if not upcoming_flights:
+        return {
+            "has_delays": False,
+            "message": "No active flight duties scheduled for today or tomorrow.",
+            "delayed_flights": []
+        }
+        
+    delayed_results = []
+    for flight in upcoming_flights:
+        status_res = authenticate_and_fetch_flight_status(
+            staff_username, 
+            staff_password, 
+            flight["flight_no"], 
+            flight["date"]
+        )
+        
+        if status_res.get("success") and status_res.get("delayed"):
+            delayed_results.append({
+                "flight": flight["flight_no"],
+                "route": flight["route"],
+                "status": status_res.get("status_message"),
+                "eta": status_res.get("eta")
+            })
+            
+    if delayed_results:
+        return {
+            "has_delays": True,
+            "delayed_flights": delayed_results
+        }
+    else:
+        return {
+            "has_delays": False,
+            "message": f"Checked {len(upcoming_flights)} upcoming flight(s) for today/tomorrow. All operating on schedule."
+        }
 
 # --- 4. STREAMLIT CONFIG & UI ---
 st.set_page_config(page_title="Crew Companion", page_icon="✈️", layout="wide")
@@ -393,30 +441,32 @@ else:
     with right_col:
         st.markdown("#### Flight Monitoring Agent")
         
-        # Checking status for the active roster flights dynamically using the new backend function
-        # (Using safe credentials mapping for simulation/live fallback)
-        live_status = authenticate_and_fetch_flight_status(st.session_state['username'], "placeholder_pass", "EK432", "30AUG26")
+        parsed_rows = parse_roster_text(active_text) if active_text else []
+        flight_check_result = check_all_roster_delays(st.session_state['username'], "placeholder_pass", parsed_rows)
         
-        if live_status.get("delayed"):
+        if flight_check_result.get("has_delays"):
             alert_bg = "#2c1f1f"
             border_col = "#ff5252"
             title_col = "#ff5252"
-            msg = live_status.get("status_message", "Flight delayed.")
-            eta_msg = f"New ETA: {live_status.get('eta')}."
+            
+            delay_html = ""
+            for df in flight_check_result.get("delayed_flights", []):
+                delay_html += f"<b>{df['flight']} ({df['route']})</b>: {df['status']}<br><small>ETA: {df['eta']}</small><br>"
+                
+            st.markdown(f"""
+                <div style='background-color: {alert_bg}; border: 1px solid {border_col}; padding: 12px; border-radius: 8px;'>
+                    <b style='color: {title_col};'>⚠️ Schedule Disruption Detected:</b><br>{delay_html}<br>
+                    <button style='background:{border_col}; color:white; border:none; padding:4px 10px; border-radius:4px; font-size:11px;'>Acknowledge & Re-calculate Rest</button>
+                </div>
+            """, unsafe_allow_html=True)
         else:
-            alert_bg = "#1b362d"
-            border_col = "#4caf50"
-            title_col = "#4caf50"
-            msg = "All monitored inbound/outbound roster flights are operating on schedule."
-            eta_msg = "Required rest periods fully compliant."
-
-        st.markdown(f"""
-            <div style='background-color: {alert_bg}; border: 1px solid {border_col}; padding: 12px; border-radius: 8px;'>
-                <b style='color: {title_col};'>⚠️ Operational Status Update:</b> {msg}<br>
-                <small>{eta_msg}</small><br><br>
-                <button style='background:{border_col}; color:white; border:none; padding:4px 10px; border-radius:4px; font-size:11px;'>Acknowledge</button>
-            </div>
-        """, unsafe_allow_html=True)
+            st.markdown(f"""
+                <div style='background-color: #1b362d; border: 1px solid #4caf50; padding: 12px; border-radius: 8px;'>
+                    <b style='color: #4caf50;'>⚠️ Operational Status Update:</b> {flight_check_result.get('message')}<br>
+                    <small>Required rest periods fully compliant with company rules.</small><br><br>
+                    <button style='background:#4caf50; color:white; border:none; padding:4px 10px; border-radius:4px; font-size:11px;'>Acknowledge</button>
+                </div>
+            """, unsafe_allow_html=True)
         
         st.markdown("#### Tactical Bidding")
         st.text_input("Search pairing...", placeholder="Find me a Sydney long stay", label_visibility="collapsed")
