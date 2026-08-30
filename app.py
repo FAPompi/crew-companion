@@ -91,11 +91,16 @@ def parse_roster_text(raw_text):
             checkout_time = "-"
             ac_type = "-"
             date_str = "-"
+            dt_obj = None
             
             dt_matches = re.findall(r'(\d{2}[A-Z]{3}\d{2}\s+\d{2}:\d{2})', line_str)
             date_match = re.search(r'(\d{2}[A-Z]{3}\d{2})', line_str)
             if date_match:
                 date_str = date_match.group(1)
+                try:
+                    dt_obj = datetime.strptime(date_str, "%d%b%y")
+                except ValueError:
+                    pass
             
             if "OFF" in line_str:
                 activity_type = "DAY OFF"
@@ -144,6 +149,7 @@ def parse_roster_text(raw_text):
             
             parsed_rows.append({
                 "Date": date_str,
+                "DateObj": dt_obj,
                 "Type": activity_type,
                 "Flight / Code": flight_no if flight_no != "-" else activity_type,
                 "Check-In": checkin_time,
@@ -251,8 +257,7 @@ else:
             
             st.markdown("---")
             
-            # View Mode Selector
-            view_mode = st.radio("Select Schedule View", ["Detailed Table View", "Monthly Calendar Grid View"], horizontal=True)
+            view_mode = st.radio("Select Schedule View", ["Detailed Table View", "Rolling Timeline View"], horizontal=True)
             
             rows = parse_roster_text(active_text)
             
@@ -260,62 +265,41 @@ else:
                 if view_mode == "Detailed Table View":
                     st.markdown("### Scheduled Activities")
                     df = pd.DataFrame(rows)
+                    if "DateObj" in df.columns:
+                        df = df.drop(columns=["DateObj"])
                     cols = ["Date"] + [c for c in df.columns if c != "Date"]
                     df = df[cols]
                     st.dataframe(df, use_container_width=True, hide_index=True)
                 else:
-                    st.markdown("### 🗓️ September 2026 Roster Grid")
+                    st.markdown("### ⏱️ Rolling Schedule (Today Onward)")
                     
-                    # Map roster days for quick lookup (supporting multiple activities per day)
-                    roster_map = {}
-                    for r in rows:
-                        d_str = r["Date"]
-                        if d_str not in roster_map:
-                            roster_map[d_str] = []
-                        roster_map[d_str].append(r)
+                    # Filter rows from today (Aug 30, 2026) onward
+                    today_date = datetime(2026, 8, 30)
+                    future_rows = [r for r in rows if r["DateObj"] and r["DateObj"] >= today_date]
                     
-                    days_in_sept = list(range(1, 31))
-                    cols_per_row = 7
-                    empty_slots = 1  # Monday offset for Sep 1, 2026
-                    current_slot = 0
-                    
-                    # Weekday headers
-                    weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-                    header_cols = st.columns(7)
-                    for idx, day_name in enumerate(weekdays):
-                        header_cols[idx].markdown(f"<div style='text-align: center; font-weight: bold; color: #888;'>{day_name}</div>", unsafe_allow_html=True)
-                    
-                    st.markdown("---")
-                    
-                    grid_cols = st.columns(7)
-                    
-                    # Padding for start of month
-                    for _ in range(empty_slots):
-                        with grid_cols[current_slot]:
-                            st.write("")
-                        current_slot += 1
-                        
-                    for day in days_in_sept:
-                        day_str = f"{day:02d}SEP26"
-                        
-                        with grid_cols[current_slot]:
-                            st.markdown(f"**{day} SEP**")
-                            if day_str in roster_map:
-                                for act in roster_map[day_str]:
-                                    if act["Type"] == "DAY OFF":
-                                        st.success("🟢 OFF")
-                                    elif act["Type"] == "LAYOVER":
-                                        st.info(f"🏨 {act['Route']}")
-                                    else:
-                                        st.warning(f"✈️ **{act['Flight / Code']}**\n`{act['Route']}`")
-                            else:
-                                st.caption("No duty")
-                                
-                        current_slot += 1
-                        if current_slot >= 7:
-                            current_slot = 0
-                            grid_cols = st.columns(7)
-                            st.markdown("")
+                    if future_rows:
+                        # Group by exact date
+                        timeline_map = {}
+                        for r in future_rows:
+                            d_str = r["Date"]
+                            if d_str not in timeline_map:
+                                timeline_map[d_str] = []
+                            timeline_map[d_str].append(r)
+                            
+                        for d_str, acts in timeline_map.items():
+                            with st.container(border=True):
+                                st.markdown(f"#### 📅 {d_str}")
+                                cols = st.columns(len(acts))
+                                for idx, act in enumerate(acts):
+                                    with cols[idx]:
+                                        if act["Type"] == "DAY OFF":
+                                            st.success("🟢 DAY OFF")
+                                        elif act["Type"] == "LAYOVER":
+                                            st.info(f"🏨 LAYOVER\n`{act['Route']}`\nCheck-in: {act['Check-In']}")
+                                        else:
+                                            st.warning(f"✈️ **{act['Flight / Code']}**\n`{act['Route']}`\nDep: {act['Departure']}")
+                    else:
+                        st.info("No upcoming duties found from today onward on this roster.")
             else:
                 st.info("No recognized patterns found.")
                 
