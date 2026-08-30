@@ -257,7 +257,7 @@ else:
             
             st.markdown("---")
             
-            view_mode = st.radio("Select Schedule View", ["Detailed Table View", "Rolling Timeline View"], horizontal=True)
+            view_mode = st.radio("Select Schedule View", ["Detailed Table View", "Rolling Calendar Grid View"], horizontal=True)
             
             rows = parse_roster_text(active_text)
             
@@ -271,35 +271,81 @@ else:
                     df = df[cols]
                     st.dataframe(df, use_container_width=True, hide_index=True)
                 else:
-                    st.markdown("### ⏱️ Rolling Schedule (Today Onward)")
+                    st.markdown("### 🗓️ Rolling Schedule (Today Onward - Calendar Grid)")
                     
-                    # Filter rows from today (Aug 30, 2026) onward
+                    # Map roster days
+                    roster_map = {}
+                    for r in rows:
+                        d_str = r["Date"]
+                        if d_str not in roster_map:
+                            roster_map[d_str] = []
+                        roster_map[d_str].append(r)
+                        
+                    # Filter dates from today (Aug 30, 2026) until the latest date present in roster
+                    valid_dates = [r["DateObj"] for r in rows if r["DateObj"] is not None]
                     today_date = datetime(2026, 8, 30)
-                    future_rows = [r for r in rows if r["DateObj"] and r["DateObj"] >= today_date]
                     
-                    if future_rows:
-                        # Group by exact date
-                        timeline_map = {}
-                        for r in future_rows:
-                            d_str = r["Date"]
-                            if d_str not in timeline_map:
-                                timeline_map[d_str] = []
-                            timeline_map[d_str].append(r)
+                    if valid_dates:
+                        max_date = max(valid_dates)
+                        
+                        # Generate sequence of dates from today until max_date
+                        delta = (max_date - today_date).days
+                        if delta < 0:
+                            delta = 0
+                        rolling_days = [today_date + timedelta(days=i) for i in range(delta + 1)]
+                        
+                        # Align starting weekday header slot (Monday=0 ... Sunday=6)
+                        start_weekday = today_date.weekday() # Mon=0, Tue=1...
+                        
+                        # Weekday headers
+                        weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+                        header_cols = st.columns(7)
+                        for idx, day_name in enumerate(weekdays):
+                            header_cols[idx].markdown(f"<div style='text-align: center; font-weight: bold; color: #888;'>{day_name}</div>", unsafe_allow_html=True)
+                        
+                        st.markdown("---")
+                        
+                        grid_cols = st.columns(7)
+                        current_slot = start_weekday
+                        
+                        # Pad empty slots before today if needed
+                        for _ in range(current_slot):
+                            with grid_cols[current_slot]:
+                                st.write("")
+                            # Note: keep alignment simple
+                        
+                        # Re-initialize grid row for rendering
+                        grid_cols = st.columns(7)
+                        current_slot = start_weekday
+                        
+                        for _ in range(start_weekday):
+                            with grid_cols[_]:
+                                st.write("")
+                                
+                        for dt in rolling_days:
+                            d_str = dt.strftime("%d%b%y").upper()
+                            display_date_label = dt.strftime("%d %b")
                             
-                        for d_str, acts in timeline_map.items():
-                            with st.container(border=True):
-                                st.markdown(f"#### 📅 {d_str}")
-                                cols = st.columns(len(acts))
-                                for idx, act in enumerate(acts):
-                                    with cols[idx]:
+                            with grid_cols[current_slot]:
+                                st.markdown(f"**{display_date_label}**")
+                                if d_str in roster_map:
+                                    for act in roster_map[d_str]:
                                         if act["Type"] == "DAY OFF":
-                                            st.success("🟢 DAY OFF")
+                                            st.success("🟢 OFF")
                                         elif act["Type"] == "LAYOVER":
-                                            st.info(f"🏨 LAYOVER\n`{act['Route']}`\nCheck-in: {act['Check-In']}")
+                                            st.info(f"🏨 {act['Route']}")
                                         else:
-                                            st.warning(f"✈️ **{act['Flight / Code']}**\n`{act['Route']}`\nDep: {act['Departure']}")
+                                            st.warning(f"✈️ **{act['Flight / Code']}**\n`{act['Route']}`")
+                                else:
+                                    st.caption("No duty")
+                                    
+                            current_slot += 1
+                            if current_slot >= 7:
+                                current_slot = 0
+                                grid_cols = st.columns(7)
+                                st.markdown("")
                     else:
-                        st.info("No upcoming duties found from today onward on this roster.")
+                        st.info("No valid dated duties found.")
             else:
                 st.info("No recognized patterns found.")
                 
