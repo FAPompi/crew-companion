@@ -168,30 +168,33 @@ def parse_roster_text(raw_text):
             
     return parsed_rows
 
-# --- 3. INTRANET SESSION HANDLER & AUTOMATED FLIGHT CHECKER ---
-def authenticate_and_fetch_flight_status(staff_username, staff_password, flight_no, flight_date):
+# --- 3. LIVE INTRANET SESSION & FLIGHT SCRAPER ---
+def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no, flight_date):
     """
-    Handles authenticated session connection to Sri Lankan Airlines internal flight viewer 
-    and scrapes real-time metrics (delay status, ETA updates, and structural impact).
+    Connects to the company intranet flight viewer using user-supplied credentials 
+    to retrieve live operational updates.
     """
     login_url = "https://intraneti.srilankan.com/ifv/login"
     status_endpoint = f"https://intraneti.srilankan.com/ifv/flight"
     
+    if not intranet_user or not intranet_pass:
+        return {"success": False, "error": "Intranet credentials missing.", "delayed": False}
+        
     session = requests.Session()
-    
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
         "Referer": login_url
     }
     
     payload = {
-        "username": staff_username,
-        "password": staff_password,
+        "username": intranet_user,
+        "password": intranet_pass,
         "flight_no": flight_no,
         "date": flight_date
     }
     
     try:
+        # Authenticate against the company portal
         login_resp = session.post(login_url, data=payload, headers=headers, timeout=6, verify=True)
         
         if login_resp.status_code == 200:
@@ -214,9 +217,10 @@ def authenticate_and_fetch_flight_status(staff_username, staff_password, flight_
                     "status_message": delay_text,
                     "eta": live_eta
                 }
-        return {"success": False, "error": "Authentication or target page unreachable."}
+        return {"success": False, "error": "Authentication failed or gateway restricted."}
         
     except requests.exceptions.RequestException as e:
+        # Falls back gracefully if running off-network / without corporate VPN connection
         return {"success": False, "error": str(e), "delayed": False}
 
 def get_upcoming_roster_flights(parsed_rows, current_date):
@@ -233,7 +237,7 @@ def get_upcoming_roster_flights(parsed_rows, current_date):
                 })
     return target_flights
 
-def check_all_roster_delays(staff_username, staff_password, parsed_rows):
+def check_all_roster_delays(intranet_user, intranet_pass, parsed_rows):
     today_dt = datetime(2026, 8, 30)
     upcoming_flights = get_upcoming_roster_flights(parsed_rows, today_dt)
     
@@ -247,8 +251,8 @@ def check_all_roster_delays(staff_username, staff_password, parsed_rows):
     delayed_results = []
     for flight in upcoming_flights:
         status_res = authenticate_and_fetch_flight_status(
-            staff_username, 
-            staff_password, 
+            intranet_user, 
+            intranet_pass, 
             flight["flight_no"], 
             flight["date"]
         )
@@ -269,7 +273,7 @@ def check_all_roster_delays(staff_username, staff_password, parsed_rows):
     else:
         return {
             "has_delays": False,
-            "message": f"Checked {len(upcoming_flights)} upcoming flight(s) for today/tomorrow. All operating on schedule."
+            "message": f"Checked {len(upcoming_flights)} upcoming flight(s) via Intranet. All operating on schedule."
         }
 
 # --- 4. STREAMLIT CONFIG & UI ---
@@ -347,6 +351,24 @@ else:
             st.rerun()
 
     st.markdown("---")
+
+    # --- SIDEBAR: INTRANET CREDENTIALS BRIDGE ---
+    with st.sidebar:
+        st.markdown("### 🔗 Intranet Integration")
+        st.write("Provide your company intranet portal credentials to enable live background flight checks.")
+        
+        if 'intranet_user' not in st.session_state:
+            st.session_state['intranet_user'] = ""
+        if 'intranet_pass' not in st.session_state:
+            st.session_state['intranet_pass'] = ""
+            
+        i_user = st.text_input("Intranet Username / ID", value=st.session_state['intranet_user'])
+        i_pass = st.text_input("Intranet Password", type="password", value=st.session_state['intranet_pass'])
+        
+        if st.button("Save Intranet Credentials"):
+            st.session_state['intranet_user'] = i_user
+            st.session_state['intranet_pass'] = i_pass
+            st.success("Credentials updated for session!")
 
     # --- MAIN DASHBOARD LAYOUT ---
     left_col, main_col, right_col = st.columns([1, 2.2, 1.2])
@@ -442,7 +464,13 @@ else:
         st.markdown("#### Flight Monitoring Agent")
         
         parsed_rows = parse_roster_text(active_text) if active_text else []
-        flight_check_result = check_all_roster_delays(st.session_state['username'], "placeholder_pass", parsed_rows)
+        
+        # Uses the saved session intranet credentials to query live stats
+        flight_check_result = check_all_roster_delays(
+            st.session_state.get('intranet_user', ''), 
+            st.session_state.get('intranet_pass', ''), 
+            parsed_rows
+        )
         
         if flight_check_result.get("has_delays"):
             alert_bg = "#2c1f1f"
