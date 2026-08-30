@@ -153,24 +153,30 @@ else:
     
     tab1, tab2 = st.tabs(["📅 Roster Parser & Dashboard", "⚙️ Account Settings"])
     
-    with tab1:
+with tab1:
         st.subheader("Paste Your Sabre Roster Text")
         st.markdown("Copy the text block from your web portal schedule view and paste it below:")
         
-        saved_text = load_roster_from_db(st.session_state['username'])
-        roster_input = st.text_area("Raw Roster Text", value=saved_text, height=150)
+        # Keep track of text in session state so it displays immediately
+        if 'current_roster' not in st.session_state:
+            st.session_state['current_roster'] = load_roster_from_db(st.session_state['username'])
+            
+        roster_input = st.text_area("Raw Roster Text", value=st.session_state['current_roster'], height=150)
         
         if st.button("Save & Parse Roster"):
             if roster_input.strip():
                 save_roster_to_db(st.session_state['username'], roster_input)
-                st.success("Roster saved successfully!")
+                st.session_state['current_roster'] = roster_input
+                st.success("Roster saved and parsed successfully!")
             else:
                 st.warning("Please paste some roster text first.")
                 
-        if saved_text:
+        # Always check and display parsed rows if text exists
+        active_text = st.session_state.get('current_roster', '')
+        if active_text:
             st.markdown("---")
             st.subheader("Parsed Schedule Activity")
-            rows = parse_roster_text(saved_text)
+            rows = parse_roster_text(active_text)
             if rows:
                 st.dataframe(rows, use_container_width=True)
             else:
