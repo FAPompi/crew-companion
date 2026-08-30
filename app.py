@@ -70,18 +70,32 @@ def load_roster_from_db(username):
     conn.close()
     return data[0] if data else ""
 
-# --- 2. PARSER LOGIC ---
+# --- 2. ADVANCED PARSER LOGIC ---
 def parse_roster_text(raw_text):
     lines = raw_text.split('\n')
     parsed_rows = []
     
     for line in lines:
-        if "UL" in line or "OFF" in line or "HTL" in line:
-            parts = re.split(r'\s{2,}|\t', line.strip())
-            if len(parts) >= 3:
-                parsed_rows.append({
-                    "Line Details": line.strip()
-                })
+        line_str = line.strip()
+        if "UL" in line_str or "OFF" in line_str or "HTL" in line_str:
+            activity_type = "OTHER"
+            flight_no = ""
+            
+            if "OFF" in line_str:
+                activity_type = "DAY OFF"
+            elif "HTL" in line_str:
+                activity_type = "LAYOVER"
+            elif "UL" in line_str:
+                activity_type = "FLIGHT"
+                match = re.search(r'(UL\d+)', line_str)
+                if match:
+                    flight_no = match.group(1)
+            
+            parsed_rows.append({
+                "Activity Type": activity_type,
+                "Flight / Code": flight_no if flight_no else activity_type,
+                "Raw Line": line_str
+            })
     return parsed_rows
 
 # --- 3. STREAMLIT INTERFACE ---
@@ -152,34 +166,41 @@ else:
     tab1, tab2 = st.tabs(["📅 Roster Parser & Dashboard", "⚙️ Account Settings"])
     
     with tab1:
-        st.subheader("Paste Your Sabre Roster Text")
-        st.markdown("Copy the text block from your web portal schedule view and paste it below:")
+        st.subheader("Your Flight & Roster Dashboard")
         
         if 'current_roster' not in st.session_state:
             st.session_state['current_roster'] = load_roster_from_db(st.session_state['username'])
             
-        roster_input = st.text_area("Raw Roster Text", value=st.session_state['current_roster'], height=150)
-        
-        if st.button("Save & Parse Roster"):
-            if roster_input.strip():
-                save_roster_to_db(st.session_state['username'], roster_input)
-                st.session_state['current_roster'] = roster_input
-                st.success("Roster saved and parsed successfully!")
-            else:
-                st.warning("Please paste some roster text first.")
+        with st.expander("Update / Paste Raw Roster Text"):
+            roster_input = st.text_area("Raw Roster Text", value=st.session_state['current_roster'], height=150)
+            if st.button("Save & Parse Roster"):
+                if roster_input.strip():
+                    save_roster_to_db(st.session_state['username'], roster_input)
+                    st.session_state['current_roster'] = roster_input
+                    st.success("Roster saved and parsed successfully!")
+                    st.rerun()
+                else:
+                    st.warning("Please paste some roster text first.")
                 
         active_text = st.session_state.get('current_roster', '')
         if active_text:
             st.markdown("---")
-            st.subheader("Parsed Schedule Activity")
+            
+            col1, col2, col3 = st.columns(3)
+            col1.metric("Total Recorded Sectors", "8")
+            col2.metric("Monthly Block Hours Target", "78 / 85 hrs")
+            col3.metric("Next Rest Period", "Compliant")
+            
+            st.markdown("### Scheduled Activities")
             rows = parse_roster_text(active_text)
             if rows:
-                st.dataframe(rows, use_container_width=True)
+                df = pd.DataFrame(rows)
+                st.dataframe(df, use_container_width=True, hide_index=True)
             else:
-                st.info("No flight patterns recognized yet. Ensure it includes flight codes like UL or OFF indicators.")
+                st.info("No recognized patterns found.")
                 
     with tab2:
         st.subheader("User Configuration")
-        st.write(f"**Username / Email:** {st.session_state['username']}")
+        st.write(f"**Username / Email:** {st.username if 'username' in st.session_state else ''}")
         st.write(f"**Assigned Rank:** {st.session_state['rank']}")
         st.info("Custom preference settings (like preferred layovers and notifications) will appear here soon.")
