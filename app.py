@@ -16,7 +16,6 @@ def init_db():
             rank TEXT
         )
     ''')
-    # Table to store user rosters
     c.execute('''
         CREATE TABLE IF NOT EXISTS rosters (
             username TEXT,
@@ -77,7 +76,6 @@ def parse_roster_text(raw_text):
     parsed_rows = []
     
     for line in lines:
-        # Match flight lines or OFF/HTL lines based on SriLankan portal format
         if "UL" in line or "OFF" in line or "HTL" in line:
             parts = re.split(r'\s{2,}|\t', line.strip())
             if len(parts) >= 3:
@@ -153,11 +151,10 @@ else:
     
     tab1, tab2 = st.tabs(["📅 Roster Parser & Dashboard", "⚙️ Account Settings"])
     
-with tab1:
+    with tab1:
         st.subheader("Paste Your Sabre Roster Text")
         st.markdown("Copy the text block from your web portal schedule view and paste it below:")
         
-        # Keep track of text in session state so it displays immediately
         if 'current_roster' not in st.session_state:
             st.session_state['current_roster'] = load_roster_from_db(st.session_state['username'])
             
@@ -171,7 +168,6 @@ with tab1:
             else:
                 st.warning("Please paste some roster text first.")
                 
-        # Always check and display parsed rows if text exists
         active_text = st.session_state.get('current_roster', '')
         if active_text:
             st.markdown("---")
