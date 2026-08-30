@@ -260,32 +260,26 @@ else:
                 if view_mode == "Detailed Table View":
                     st.markdown("### Scheduled Activities")
                     df = pd.DataFrame(rows)
-                    # Reorder columns to show Date first
                     cols = ["Date"] + [c for c in df.columns if c != "Date"]
                     df = df[cols]
                     st.dataframe(df, use_container_width=True, hide_index=True)
                 else:
                     st.markdown("### 🗓️ September 2026 Roster Grid")
                     
-                    # Map roster days for quick lookup
+                    # Map roster days for quick lookup (supporting multiple activities per day)
                     roster_map = {}
                     for r in rows:
                         d_str = r["Date"]
                         if d_str not in roster_map:
                             roster_map[d_str] = []
-                        roster_map[d_str].append(f"**{r['Type']}**: {r['Flight / Code']} ({r['Route']})")
+                        roster_map[d_str].append(r)
                     
-                    # Build 7-column calendar grid layout for September 2026
                     days_in_sept = list(range(1, 31))
                     cols_per_row = 7
-                    
-                    # September 2026 starts on a Tuesday (Mon=0, Tue=1, etc. Let's pad empty cells for Mon)
-                    empty_slots = 1 # Monday blank slot if week starts on Monday
+                    empty_slots = 1  # Monday offset for Sep 1, 2026
                     current_slot = 0
                     
-                    week_cols = st.columns(cols_per_row)
-                    
-                    # Header row for weekdays
+                    # Weekday headers
                     weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
                     header_cols = st.columns(7)
                     for idx, day_name in enumerate(weekdays):
@@ -293,10 +287,9 @@ else:
                     
                     st.markdown("---")
                     
-                    # Render days
                     grid_cols = st.columns(7)
                     
-                    # Add leading empty placeholders for alignment (Sep 1 is Tuesday)
+                    # Padding for start of month
                     for _ in range(empty_slots):
                         with grid_cols[current_slot]:
                             st.write("")
@@ -308,13 +301,13 @@ else:
                         with grid_cols[current_slot]:
                             st.markdown(f"**{day} SEP**")
                             if day_str in roster_map:
-                                for activity in roster_map[day_str]:
-                                    if "DAY OFF" in activity:
+                                for act in roster_map[day_str]:
+                                    if act["Type"] == "DAY OFF":
                                         st.success("🟢 OFF")
-                                    elif "LAYOVER" in activity:
-                                        st.info("🏨 LAYOVER")
+                                    elif act["Type"] == "LAYOVER":
+                                        st.info(f"🏨 {act['Route']}")
                                     else:
-                                        st.warning(f"✈️ {activity.split('**')[1].replace('FLIGHT', '').strip()}")
+                                        st.warning(f"✈️ **{act['Flight / Code']}**\n`{act['Route']}`")
                             else:
                                 st.caption("No duty")
                                 
