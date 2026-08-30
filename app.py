@@ -83,17 +83,18 @@ if not st.session_state['logged_in']:
             else:
                 st.sidebar.error("Invalid username or password.")
                 
-    else: # Register
-        new_user = st.sidebar.text_input("Choose Username / Email")
-        new_pass = st.sidebar.text_input("Choose Password", type="password")
-        new_name = st.sidebar.text_input("Full Name")
-        new_rank = st.sidebar.selectbox("Rank", ["Senior Cabin Crew", "Cabin Crew", "Purser", "Flight Deck"])
+   else: # Register
+        new_user = st.sidebar.text_input("Choose Username / Email", key="reg_user")
+        new_pass = st.sidebar.text_input("Choose Password", type="password", key="reg_pass")
+        new_name = st.sidebar.text_input("Full Name", key="reg_name")
+        new_rank = st.sidebar.selectbox("Rank", ["Senior Cabin Crew", "Cabin Crew", "Purser", "Flight Deck"], key="reg_rank")
         
         if st.sidebar.button("Register"):
-            if new_user and new_pass and new_name:
-                success = add_user(new_user, new_pass, new_name, new_rank)
+            # Strip whitespace to ensure fields aren't just empty spaces
+            if new_user.strip() and new_pass.strip() and new_name.strip():
+                success = add_user(new_user.strip(), new_pass, new_name.strip(), new_rank)
                 if success:
-                    st.sidebar.success("Account created successfully! Please log in.")
+                    st.sidebar.success("Account created successfully! Please switch to Login.")
                 else:
                     st.sidebar.error("Username already exists.")
             else:
