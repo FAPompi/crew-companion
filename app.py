@@ -69,8 +69,8 @@ if not st.session_state['logged_in']:
     auth_option = st.sidebar.radio("Select Action", ["Login", "Register Account"])
     
     if auth_option == "Login":
-        user_input = st.sidebar.text_input("Staff Email / Username")
-        pass_input = st.sidebar.text_input("Password", type="password")
+        user_input = st.sidebar.text_input("Staff Email / Username", key="login_user")
+        pass_input = st.sidebar.text_input("Password", type="password", key="login_pass")
         
         if st.sidebar.button("Log In"):
             user_record = login_user(user_input, pass_input)
@@ -83,14 +83,13 @@ if not st.session_state['logged_in']:
             else:
                 st.sidebar.error("Invalid username or password.")
                 
-   else: # Register
+    else: # Register
         new_user = st.sidebar.text_input("Choose Username / Email", key="reg_user")
         new_pass = st.sidebar.text_input("Choose Password", type="password", key="reg_pass")
         new_name = st.sidebar.text_input("Full Name", key="reg_name")
         new_rank = st.sidebar.selectbox("Rank", ["Senior Cabin Crew", "Cabin Crew", "Purser", "Flight Deck"], key="reg_rank")
         
         if st.sidebar.button("Register"):
-            # Strip whitespace to ensure fields aren't just empty spaces
             if new_user.strip() and new_pass.strip() and new_name.strip():
                 success = add_user(new_user.strip(), new_pass, new_name.strip(), new_rank)
                 if success:
