@@ -5,7 +5,6 @@ import pandas as pd
 import re
 from datetime import datetime, timedelta
 import requests
-from bs4 import BeautifulSoup
 
 # --- 1. DATABASE SETUP ---
 def init_db():
@@ -124,9 +123,12 @@ def parse_roster_text(raw_text):
                     route = f"{route_match.group(1)} ➔ {route_match.group(2)}"
             elif "UL" in line_str:
                 activity_type = "FLIGHT"
-                match = re.search(r'(UL\d+)', line_str)
+                match = re.search(r'(UL\s*\d+)', line_str)
                 if match:
-                    flight_no = match.group(1)
+                    # Normalize flight number to match API format like "UL 0470" or "UL 470"
+                    raw_fn = match.group(1).replace(" ", "")
+                    num_part = re.search(r'\d+', raw_fn).group(0)
+                    flight_no = f"UL {num_part}"
                     
                 route_match = re.search(r'([A-Z]{3})\s+([A-Z]{3})', line_str)
                 if route_match:
@@ -150,7 +152,7 @@ def parse_roster_text(raw_text):
                     
                 parts = line_str.split()
                 for p in parts:
-                    if len(p) == 3 and p.isalnum() and p not in ["FA", "J28", "CMB", "CAN", "BKK", "TRZ"]:
+                    if len(p) == 3 and p.isalnum() and p not in ["FA", "J28", "CMB", "CAN", "BKK", "TRZ", "MAA"]:
                         ac_type = p
             
             parsed_rows.append({
@@ -168,10 +170,10 @@ def parse_roster_text(raw_text):
             
     return parsed_rows
 
-# --- 3. LIVE INTRANET SESSION & FLIGHT SCRAPER ---
-def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no, flight_date):
+# --- 3. LIVE INTRANET i-FLEET API SESSION ---
+def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no, flight_date, dep_stn="CMB", arr_stn=""):
     login_url = "https://intraneti.srilankan.com/ifv/login"
-    status_endpoint = f"https://intraneti.srilankan.com/ifv/flight"
+    details_endpoint = "https://intraneti.srilankan.com/IFV/iFLEET_Local/GetFlightDetails"
     
     if not intranet_user or not intranet_pass:
         return {"success": False, "status_code": None, "error": "Intranet credentials missing.", "delayed": False}
@@ -179,41 +181,63 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
     session = requests.Session()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": login_url
+        "Referer": "https://intraneti.srilankan.com/ifv",
+        "Content-Type": "application/json; charset=UTF-8",
+        "X-Requested-With": "XMLHttpRequest"
     }
     
-    payload = {
+    login_payload = {
         "username": intranet_user,
-        "password": intranet_pass,
-        "flight_no": flight_no,
-        "date": flight_date
+        "password": intranet_pass
     }
     
     try:
-        login_resp = session.post(login_url, data=payload, headers=headers, timeout=5, verify=True)
+        login_resp = session.post(login_url, data=login_payload, headers=headers, timeout=5, verify=True)
         
         if login_resp.status_code == 200:
-            query_params = {"no": flight_no, "date": flight_date}
-            resp = session.get(status_endpoint, params=query_params, headers=headers, timeout=5)
+            api_payload = {
+                "DATOP": flight_date, 
+                "FLTID": flight_no, 
+                "DEPSTN": dep_stn, 
+                "ARRSTN": arr_stn, 
+                "FlyingTime": "0"
+            }
+            
+            resp = session.post(details_endpoint, json=api_payload, headers=headers, timeout=5)
             
             if resp.status_code == 200:
-                soup = BeautifulSoup(resp.text, 'html.parser')
-                delay_elem = soup.find("div", {"id": "flight-delay-status"})
-                eta_elem = soup.find("span", {"id": "live-eta"})
-                
-                delay_text = delay_elem.text.strip() if delay_elem else "On Time"
-                live_eta = eta_elem.text.strip() if eta_elem else "As Scheduled"
-                is_delayed = "delay" in delay_text.lower() or "late" in delay_text.lower()
-                
-                return {
-                    "success": True,
-                    "status_code": resp.status_code,
-                    "delayed": is_delayed,
-                    "status_message": delay_text,
-                    "eta": live_eta
-                }
-            return {"success": False, "status_code": resp.status_code, "error": f"Endpoint returned status {resp.status_code}"}
-        return {"success": False, "status_code": login_resp.status_code, "error": f"Login returned status {login_resp.status_code}"}
+                try:
+                    data = resp.json()
+                    
+                    dep_details = data.get("DepDetails", "On Time")
+                    arr_details = data.get("ArrDetails", "On Time")
+                    late_min_dep = data.get("Latemin_Dep", 0)
+                    late_min_arr = data.get("Latemin_Arr", 0)
+                    
+                    is_delayed = (
+                        (late_min_dep and late_min_dep > 0) or 
+                        (late_min_arr and late_min_arr > 0) or
+                        ("delay" in str(dep_details).lower()) or 
+                        ("delay" in str(arr_details).lower()) or
+                        (data.get("STATUS") and "cancel" in str(data.get("STATUS")).lower())
+                    )
+                    
+                    status_text = f"Dep: {dep_details} | Arr: {arr_details}"
+                    if late_min_dep > 0:
+                        status_text += f" (Late Dep: {data.get('Latemin_Dep_Str', f'{late_min_dep} mins')})"
+                    
+                    return {
+                        "success": True,
+                        "status_code": resp.status_code,
+                        "delayed": is_delayed,
+                        "status_message": status_text,
+                        "eta": data.get("ETA", "As Scheduled")
+                    }
+                except ValueError:
+                    return {"success": False, "status_code": resp.status_code, "error": "Invalid JSON response"}
+                    
+            return {"success": False, "status_code": resp.status_code, "error": f"API endpoint returned {resp.status_code}"}
+        return {"success": False, "status_code": login_resp.status_code, "error": f"Login returned {login_resp.status_code}"}
         
     except requests.exceptions.RequestException as e:
         return {"success": False, "status_code": "Timeout/DNS Error", "error": str(e), "delayed": False}
@@ -225,9 +249,17 @@ def get_upcoming_roster_flights(parsed_rows, current_date):
     for row in parsed_rows:
         if row["Type"] == "FLIGHT" and row["DateObj"] is not None:
             if row["DateObj"].date() in [current_date.date(), tomorrow_date.date()]:
+                formatted_date = row["DateObj"].strftime("%Y-%m-%d")
+                
+                route_parts = row["Route"].split("➔")
+                dep_stn = route_parts[0].strip() if len(route_parts) > 0 else "CMB"
+                arr_stn = route_parts[1].strip() if len(route_parts) > 1 else ""
+                
                 target_flights.append({
                     "flight_no": row["Flight / Code"],
-                    "date": row["Date"],
+                    "date": formatted_date,
+                    "dep_stn": dep_stn,
+                    "arr_stn": arr_stn,
                     "route": row["Route"]
                 })
     return target_flights
@@ -433,7 +465,7 @@ else:
         if upcoming_flights:
             for flight in upcoming_flights:
                 res = authenticate_and_fetch_flight_status(
-                    test_user, test_pass, flight["flight_no"], flight["date"]
+                    test_user, test_pass, flight["flight_no"], flight["date"], flight["dep_stn"], flight["arr_stn"]
                 )
                 last_success = res.get("success")
                 last_status_code = res.get("status_code")
@@ -463,7 +495,7 @@ else:
             st.markdown(f"""
                 <div style='background-color: #1b362d; border: 1px solid #4caf50; padding: 12px; border-radius: 8px;'>
                     <b style='color: #4caf50;'>⚠️ Operational Status Update:</b> Checked {checked_count} roster flight(s) ({flight_names}). All operating on schedule.<br>
-                    <small>Live connection test passed cleanly.</small>
+                    <small>i-FLEET API query passed cleanly.</small>
                 </div>
             """, unsafe_allow_html=True)
         
