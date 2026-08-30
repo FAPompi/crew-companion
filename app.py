@@ -125,7 +125,6 @@ def parse_roster_text(raw_text):
                 activity_type = "FLIGHT"
                 match = re.search(r'(UL\s*\d+)', line_str)
                 if match:
-                    # Normalize flight number to match API format like "UL 0470" or "UL 470"
                     raw_fn = match.group(1).replace(" ", "")
                     num_part = re.search(r'\d+', raw_fn).group(0)
                     flight_no = f"UL {num_part}"
@@ -181,8 +180,7 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
     session = requests.Session()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://intraneti.srilankan.com/ifv",
-        "Content-Type": "application/json; charset=UTF-8",
+        "Referer": "https://intraneti.srilankan.com/ifv/login",
         "X-Requested-With": "XMLHttpRequest"
     }
     
@@ -192,9 +190,16 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
     }
     
     try:
-        login_resp = session.post(login_url, data=login_payload, headers=headers, timeout=5, verify=True)
+        login_resp = session.post(login_url, data=login_payload, headers=headers, timeout=10, verify=True)
         
-        if login_resp.status_code == 200:
+        if login_resp.status_code in [200, 302, 303]:
+            api_headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://intraneti.srilankan.com/ifv/",
+                "Content-Type": "application/json; charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest"
+            }
+            
             api_payload = {
                 "DATOP": flight_date, 
                 "FLTID": flight_no, 
@@ -203,7 +208,7 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
                 "FlyingTime": "0"
             }
             
-            resp = session.post(details_endpoint, json=api_payload, headers=headers, timeout=5)
+            resp = session.post(details_endpoint, json=api_payload, headers=api_headers, timeout=10)
             
             if resp.status_code == 200:
                 try:
@@ -234,10 +239,10 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
                         "eta": data.get("ETA", "As Scheduled")
                     }
                 except ValueError:
-                    return {"success": False, "status_code": resp.status_code, "error": "Invalid JSON response"}
+                    return {"success": False, "status_code": resp.status_code, "error": "Invalid JSON returned from GetFlightDetails"}
                     
-            return {"success": False, "status_code": resp.status_code, "error": f"API endpoint returned {resp.status_code}"}
-        return {"success": False, "status_code": login_resp.status_code, "error": f"Login returned {login_resp.status_code}"}
+            return {"success": False, "status_code": resp.status_code, "error": f"Details API returned status {resp.status_code}"}
+        return {"success": False, "status_code": login_resp.status_code, "error": f"Login returned status {login_resp.status_code}"}
         
     except requests.exceptions.RequestException as e:
         return {"success": False, "status_code": "Timeout/DNS Error", "error": str(e), "delayed": False}
@@ -495,7 +500,7 @@ else:
             st.markdown(f"""
                 <div style='background-color: #1b362d; border: 1px solid #4caf50; padding: 12px; border-radius: 8px;'>
                     <b style='color: #4caf50;'>⚠️ Operational Status Update:</b> Checked {checked_count} roster flight(s) ({flight_names}). All operating on schedule.<br>
-                    <small>i-FLEET API query passed cleanly.</small>
+                    <small>i-FLEET API session query passed cleanly.</small>
                 </div>
             """, unsafe_allow_html=True)
         
