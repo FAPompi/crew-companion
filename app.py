@@ -169,7 +169,7 @@ def parse_roster_text(raw_text):
             
     return parsed_rows
 
-# --- 3. LIVE INTRANET i-FLEET API SESSION (EXACT FORMAT PRESERVATION) ---
+# --- 3. LIVE INTRANET i-FLEET API SESSION (WITH PRE-FLIGHT TOKEN HARVESTING) ---
 def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no, flight_date, dep_stn="CMB", arr_stn=""):
     login_url = "https://intraneti.srilankan.com/ifv/login"
     details_endpoint = "https://intraneti.srilankan.com/IFV/iFLEET_Local/GetFlightDetails"
@@ -179,32 +179,54 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
         
     session = requests.Session()
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://intraneti.srilankan.com/ifv/login",
-        "X-Requested-With": "XMLHttpRequest"
-    }
-    
-    # Preserves exact backslash syntax format like UL\23546
-    login_payload = {
-        "UserName": intranet_user,
-        "Password": intranet_pass
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
     }
     
     try:
-        login_resp = session.post(login_url, data=login_payload, headers=headers, timeout=10, allow_redirects=True, verify=True)
+        # Step 1: Pre-flight GET request to establish cookies and grab any potential Anti-Forgery tokens
+        get_resp = session.get(login_url, headers=headers, timeout=10, verify=True)
         
-        if "login" in login_resp.url.lower() or "invalid" in login_resp.text.lower() or "error" in login_resp.text.lower():
+        # Extract hidden form verification tokens if present in the HTML view
+        verification_token = ""
+        if get_resp.status_code == 200:
+            token_match = re.search(r'name="__RequestVerificationToken" type="hidden" value="([^"]+)"', get_resp.text)
+            if token_match:
+                verification_token = token_match.group(1)
+
+        # Step 2: Build payload with exact formatting requested (e.g., UL\23546)
+        login_payload = {
+            "UserName": intranet_user,
+            "Password": intranet_pass
+        }
+        if verification_token:
+            login_payload["__RequestVerificationToken"] = verification_token
+
+        post_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": login_url,
+            "Origin": "https://intraneti.srilankan.com",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        
+        # Step 3: Execute login post with session cookies intact
+        login_resp = session.post(login_url, data=login_payload, headers=post_headers, timeout=10, allow_redirects=True, verify=True)
+        
+        # Check if the resulting page indicates a failed login loop
+        response_text_lower = login_resp.text.lower()
+        if "login" in login_resp.url.lower() or "invalid" in response_text_lower or "incorrect" in response_text_lower or "access denied" in response_text_lower:
             return {
                 "success": False, 
                 "status_code": login_resp.status_code, 
-                "error": "Authentication rejected by server form.", 
+                "error": "Authentication rejected by corporate login form.", 
                 "delayed": False
             }
         
+        # Step 4: If session is authenticated, target the i-FLEET Local API endpoint
         if login_resp.status_code in [200, 302, 303]:
             api_headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": "https://intraneti.srilankan.com/ifv/",
+                "Referer": "https://intraneti.srilankan.com/IFV/",
                 "Content-Type": "application/json; charset=UTF-8",
                 "X-Requested-With": "XMLHttpRequest"
             }
@@ -255,29 +277,6 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
         
     except requests.exceptions.RequestException as e:
         return {"success": False, "status_code": "Timeout/DNS Error", "error": str(e), "delayed": False}
-
-def get_upcoming_roster_flights(parsed_rows, current_date):
-    target_flights = []
-    tomorrow_date = current_date + timedelta(days=1)
-    
-    for row in parsed_rows:
-        if row["Type"] == "FLIGHT" and row["DateObj"] is not None:
-            if row["DateObj"].date() in [current_date.date(), tomorrow_date.date()]:
-                formatted_date = row["DateObj"].strftime("%Y-%m-%d")
-                
-                route_parts = row["Route"].split("➔")
-                dep_stn = route_parts[0].strip() if len(route_parts) > 0 else "CMB"
-                arr_stn = route_parts[1].strip() if len(route_parts) > 1 else ""
-                
-                target_flights.append({
-                    "flight_no": row["Flight / Code"],
-                    "date": formatted_date,
-                    "dep_stn": dep_stn,
-                    "arr_stn": arr_stn,
-                    "route": row["Route"]
-                })
-    return target_flights
-
 # --- 4. STREAMLIT CONFIG & UI ---
 st.set_page_config(page_title="Crew Companion", page_icon="✈️", layout="wide")
 init_db()
