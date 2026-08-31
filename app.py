@@ -169,7 +169,7 @@ def parse_roster_text(raw_text):
             
     return parsed_rows
 
-# --- 3. LIVE INTRANET i-FLEET API SESSION (WITH TOKEN HARVESTING) ---
+# --- 3. LIVE INTRANET i-FLEET API SESSION (DIAGNOSTIC & DEBUGGER WRAPPER) ---
 def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no, flight_date, dep_stn="CMB", arr_stn=""):
     login_url = "https://intraneti.srilankan.com/ifv/login"
     details_endpoint = "https://intraneti.srilankan.com/IFV/iFLEET_Local/GetFlightDetails"
@@ -184,6 +184,7 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
     }
     
     try:
+        # Pre-flight request to catch antiforgery tokens or cookies
         get_resp = session.get(login_url, headers=headers, timeout=10, verify=True)
         
         verification_token = ""
@@ -208,12 +209,14 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
         
         login_resp = session.post(login_url, data=login_payload, headers=post_headers, timeout=10, allow_redirects=True, verify=True)
         
-        response_text_lower = login_resp.text.lower()
-        if "login" in login_resp.url.lower() or "invalid" in response_text_lower or "incorrect" in response_text_lower or "access denied" in response_text_lower:
+        # Diagnostic tracking
+        is_still_on_login = "login" in login_resp.url.lower() or "invalid" in login_resp.text.lower() or "error" in login_resp.text.lower()
+        
+        if is_still_on_login:
             return {
                 "success": False, 
                 "status_code": login_resp.status_code, 
-                "error": "Authentication rejected by corporate login form.", 
+                "error": f"Auth rejected or blocked. Final Redirect URL: {login_resp.url}", 
                 "delayed": False
             }
         
@@ -238,7 +241,6 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
             if resp.status_code == 200:
                 try:
                     data = resp.json()
-                    
                     dep_details = data.get("DepDetails", "On Time")
                     arr_details = data.get("ArrDetails", "On Time")
                     late_min_dep = data.get("Latemin_Dep", 0)
@@ -359,7 +361,6 @@ if not st.session_state['logged_in']:
                     st.warning("Please complete all fields.")
 
 else:
-    # Top Navbar Header
     nav_col1, nav_col2, nav_col3 = st.columns([3, 4, 1])
     with nav_col1:
         st.markdown("### 🌲 CrewAI Roster Companion")
@@ -491,6 +492,7 @@ else:
         flight_check_results = []
         last_success = False
         last_status_code = None
+        last_error_msg = "No execution attempted yet"
         
         if upcoming_flights:
             for flight in upcoming_flights:
@@ -499,6 +501,7 @@ else:
                 )
                 last_success = res.get("success")
                 last_status_code = res.get("status_code")
+                last_error_msg = res.get("error", "Unknown error")
                 if res.get("delayed"):
                     flight_check_results.append({
                         "flight": flight["flight_no"],
@@ -511,6 +514,7 @@ else:
             st.write(f"**Parsed Upcoming Flights:** {[f['flight_no'] for f in upcoming_flights] if upcoming_flights else 'None for today/tomorrow'}")
             st.write(f"**Connection Success:** {last_success}")
             st.write(f"**HTTP Status Code:** {last_status_code}")
+            st.write(f"**Details / Error:** {last_error_msg}")
 
         if flight_check_results:
             for df in flight_check_results:
@@ -522,12 +526,18 @@ else:
         else:
             checked_count = len(upcoming_flights)
             flight_names = ', '.join([f['flight_no'] for f in upcoming_flights]) if upcoming_flights else 'None'
-            st.markdown(f"""
-                <div style='background-color: #1b362d; border: 1px solid #4caf50; padding: 12px; border-radius: 8px;'>
-                    <b style='color: #4caf50;'>⚠️ Operational Status Update:</b> Checked {checked_count} roster flight(s) ({flight_names}). All operating on schedule.<br>
-                    <small>i-FLEET API session query passed cleanly.</small>
-                </div>
-            """, unsafe_allow_html=True)
+            if last_success:
+                st.markdown(f"""
+                    <div style='background-color: #1b362d; border: 1px solid #4caf50; padding: 12px; border-radius: 8px;'>
+                        <b style='color: #4caf50;'>Operational Status Update:</b> Checked {checked_count} flight(s) ({flight_names}). All operating on schedule.<br>
+                    </div>
+                """, unsafe_allow_html=True)
+            else:
+                st.markdown(f"""
+                    <div style='background-color: #2a2517; border: 1px solid #ff9800; padding: 12px; border-radius: 8px;'>
+                        <b style='color: #ff9800;'>Intranet Session Warning:</b> Could not automatically query live i-Fleet API using provided credentials. Check diagnostic log above.<br>
+                    </div>
+                """, unsafe_allow_html=True)
         
         st.markdown("#### Tactical Bidding")
         st.text_input("Search pairing...", placeholder="Find me a Sydney long stay", label_visibility="collapsed")
