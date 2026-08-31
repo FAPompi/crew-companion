@@ -181,18 +181,21 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
     }
     
     try:
-# If manual cookie is provided, bypass automated credential posting entirely
+        # Manual cookie override handling
         if manual_cookie:
-            # Clean and parse cookies if multiple or custom-named
-            if "=" in manual_cookie:
-                for cookie_pair in manual_cookie.split(";"):
+            clean_cookie = manual_cookie.strip()
+            if "=" in clean_cookie:
+                for cookie_pair in clean_cookie.split(";"):
                     if "=" in cookie_pair:
                         k, v = cookie_pair.strip().split("=", 1)
                         session.cookies.set(k, v, domain="intraneti.srilankan.com")
             else:
-                # If they pasted just the raw Auth-Key value, map it directly
-                session.cookies.set("Auth-Key", manual_cookie.strip(), domain="intraneti.srilankan.com")
-            # Step 1: Hit login portal to establish cookies & harvest ALL hidden form fields
+                session.cookies.set("Auth-Key", clean_cookie, domain="intraneti.srilankan.com")
+        else:
+            if not intranet_user or not intranet_pass:
+                return {"success": False, "status_code": None, "error": "Intranet credentials or manual session cookie missing.", "delayed": False}
+                
+            # Step 1: Hit login portal to establish cookies & harvest form fields
             get_resp = session.get(login_url, headers=headers, timeout=10, verify=True)
             if get_resp.status_code != 200:
                 return {"success": False, "status_code": get_resp.status_code, "error": "Failed to reach portal page.", "delayed": False}
@@ -214,13 +217,12 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
             form_payload[pass_field] = intranet_pass
 
             post_headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 "Referer": login_url,
                 "Origin": "https://intraneti.srilankan.com",
                 "Content-Type": "application/x-www-form-urlencoded"
             }
             
-            # Step 2: Submit credentials via POST
             login_resp = session.post(login_url, data=form_payload, headers=post_headers, timeout=10, allow_redirects=True, verify=True)
             
             if "#input-box" in login_resp.text or "passcode" in login_resp.text.lower() or "login" in login_resp.url.lower():
@@ -231,12 +233,15 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
                     "delayed": False
                 }
 
-        # Step 3: Query the flight details endpoint using the session cookies
+        # Step 2: Query flight details endpoint with explicit cookie headers
+        cookie_header_val = manual_cookie.strip() if manual_cookie and "=" in manual_cookie else f"Auth-Key={manual_cookie.strip()}"
+        
         api_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Referer": "https://intraneti.srilankan.com/IFV/",
             "Content-Type": "application/json; charset=UTF-8",
-            "X-Requested-With": "XMLHttpRequest"
+            "X-Requested-With": "XMLHttpRequest",
+            "Cookie": cookie_header_val
         }
         
         api_payload = {
@@ -389,7 +394,7 @@ else:
     # --- SIDEBAR: INTRANET CREDENTIALS & COOKIE BRIDGE ---
     with st.sidebar:
         st.markdown("### 🔗 Intranet Integration")
-        st.write("If automated login fails due to portal security walls, log in via your browser, copy your `ASP.NET_SessionId` cookie, and paste it below.")
+        st.write("If automated login fails due to portal security walls, log in via your browser, copy your `Auth-Key` cookie value, and paste it below.")
         
         if 'intranet_user' not in st.session_state:
             st.session_state['intranet_user'] = ""
@@ -402,7 +407,7 @@ else:
         i_pass = st.text_input("Intranet Password", type="password", value=st.session_state['intranet_pass'])
         
         st.markdown("---")
-        m_cookie = st.text_input("Manual Session Cookie / ID", value=st.session_state['manual_cookie'], placeholder="e.g. abc123xyz789 or ASP.NET_SessionId=...")
+        m_cookie = st.text_input("Manual Session Cookie / ID", value=st.session_state['manual_cookie'], placeholder="Auth-Key=...")
         
         if st.button("Save Intranet Settings"):
             st.session_state['intranet_user'] = i_user
@@ -448,7 +453,7 @@ else:
                     roster_map[d_str].append(r)
                     
                 valid_dates = [r["DateObj"] for r in rows if r["DateObj"] is not None]
-                today_date = datetime(2026, 8, 30)
+                today_date = datetime(2026, 8, 31)
                 
                 if valid_dates:
                     max_date = max(valid_dates)
@@ -504,7 +509,7 @@ else:
         st.markdown("#### Flight Monitoring Agent")
         
         parsed_rows = parse_roster_text(active_text) if active_text else []
-        today_dt = datetime(2026, 8, 30)
+        today_dt = datetime(2026, 8, 31)
         upcoming_flights = get_upcoming_roster_flights(parsed_rows, today_dt)
         
         test_user = st.session_state.get('intranet_user', '')
@@ -557,7 +562,7 @@ else:
             else:
                 st.markdown(f"""
                     <div style='background-color: #2a2517; border: 1px solid #ff9800; padding: 12px; border-radius: 8px;'>
-                        <b style='color: #ff9800;'>Intranet Session Warning:</b> Could not query live i-Fleet API. Provide manual session cookie in sidebar if login challenge persists.<br>
+                        <b style='color: #ff9800;'>Intranet Session Warning:</b> Could not query live i-Fleet API. Provide manual session cookie (`Auth-Key=...`) in sidebar if login challenge persists.<br>
                     </div>
                 """, unsafe_allow_html=True)
         
