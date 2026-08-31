@@ -169,7 +169,7 @@ def parse_roster_text(raw_text):
             
     return parsed_rows
 
-# --- 3. LIVE INTRANET i-FLEET API SESSION (DIAGNOSTIC & DEBUGGER WRAPPER) ---
+# --- 3. LIVE INTRANET i-FLEET API SESSION (FULL ASP.NET FORM STATE CAPTURE) ---
 def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no, flight_date, dep_stn="CMB", arr_stn=""):
     login_url = "https://intraneti.srilankan.com/ifv/login"
     details_endpoint = "https://intraneti.srilankan.com/IFV/iFLEET_Local/GetFlightDetails"
@@ -184,21 +184,27 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
     }
     
     try:
-        # Pre-flight request to catch antiforgery tokens or cookies
+        # Step 1: Perform GET to load the login page and harvest all hidden ASP.NET form fields
         get_resp = session.get(login_url, headers=headers, timeout=10, verify=True)
-        
-        verification_token = ""
-        if get_resp.status_code == 200:
-            token_match = re.search(r'name="__RequestVerificationToken" type="hidden" value="([^"]+)"', get_resp.text)
-            if token_match:
-                verification_token = token_match.group(1)
+        if get_resp.status_code != 200:
+            return {"success": False, "status_code": get_resp.status_code, "error": "Failed to reach login page.", "delayed": False}
 
-        login_payload = {
+        # Extract all hidden input fields (ViewState, EventValidation, AntiForgery tokens, etc.)
+        form_payload = {}
+        hidden_inputs = re.findall(r'<input[^>]+type=["\']hidden["\'][^>]*>', get_resp.text, re.IGNORECASE)
+        for inp in hidden_inputs:
+            name_match = re.search(r'name=["\']([^"\']+)["\']', inp, re.IGNORECASE)
+            val_match = re.search(r'value=["\']([^"\']*)["\']', inp, re.IGNORECASE)
+            if name_match:
+                form_payload[name_match.group(1)] = val_match.group(1) if val_match else ""
+
+        # Step 2: Inject exact user credentials alongside harvested form state
+        form_payload.update({
             "UserName": intranet_user,
-            "Password": intranet_pass
-        }
-        if verification_token:
-            login_payload["__RequestVerificationToken"] = verification_token
+            "Password": intranet_pass,
+            "txtUserName": intranet_user,
+            "txtPassword": intranet_pass
+        })
 
         post_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -207,19 +213,20 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
             "Content-Type": "application/x-www-form-urlencoded"
         }
         
-        login_resp = session.post(login_url, data=login_payload, headers=post_headers, timeout=10, allow_redirects=True, verify=True)
+        # Step 3: Submit login post with full state payload
+        login_resp = session.post(login_url, data=form_payload, headers=post_headers, timeout=10, allow_redirects=True, verify=True)
         
-        # Diagnostic tracking
         is_still_on_login = "login" in login_resp.url.lower() or "invalid" in login_resp.text.lower() or "error" in login_resp.text.lower()
         
         if is_still_on_login:
             return {
                 "success": False, 
                 "status_code": login_resp.status_code, 
-                "error": f"Auth rejected or blocked. Final Redirect URL: {login_resp.url}", 
+                "error": f"Form state rejected. Final URL: {login_resp.url}", 
                 "delayed": False
             }
         
+        # Step 4: Query the i-FLEET local API endpoint if authentication succeeded
         if login_resp.status_code in [200, 302, 303]:
             api_headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
