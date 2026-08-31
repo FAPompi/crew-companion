@@ -184,6 +184,7 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
     }
     
     try:
+        # Step 1: Hit login portal to establish cookies & harvest form parameters
         get_resp = session.get(login_url, headers=headers, timeout=10, verify=True)
         if get_resp.status_code != 200:
             return {"success": False, "status_code": get_resp.status_code, "error": "Failed to reach portal page.", "delayed": False}
@@ -196,6 +197,7 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
             if name_match:
                 form_payload[name_match.group(1)] = val_match.group(1) if val_match else ""
 
+        # Inject username and password parameters
         form_payload.update({
             "username": intranet_user,
             "password": intranet_pass
@@ -208,15 +210,15 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
             "Content-Type": "application/x-www-form-urlencoded"
         }
         
+        # Step 2: Submit credentials via POST
         login_resp = session.post(login_url, data=form_payload, headers=post_headers, timeout=10, allow_redirects=True, verify=True)
         
-        is_still_on_login = "login" in login_resp.url.lower() or "invalid" in login_resp.text.lower() or "error" in login_resp.text.lower()
-        
-        if is_still_on_login:
+        # Check if the page returned contains input boxes characteristic of the login screen
+        if "#input-box" in login_resp.text or "passcode" in login_resp.text.lower() or "login" in login_resp.url.lower():
             return {
                 "success": False, 
                 "status_code": login_resp.status_code, 
-                "error": f"Form state rejected. Final URL: {login_resp.url}", 
+                "error": "Authentication challenge failed or session rejected (returned login HTML form).", 
                 "delayed": False
             }
         
@@ -236,6 +238,7 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
                 "FlyingTime": "0"
             }
             
+            # Step 3: Query the flight details endpoint using the authenticated session
             resp = session.post(details_endpoint, json=api_payload, headers=api_headers, timeout=10)
             
             if resp.status_code == 200:
@@ -266,12 +269,10 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
                         "eta": data.get("ETA", "As Scheduled")
                     }
                 except ValueError:
-                    # Capture exact text returned so we can diagnose the layout mismatch
-                    snippet = resp.text[:200].replace('\n', ' ')
                     return {
                         "success": False, 
                         "status_code": resp.status_code, 
-                        "error": f"Invalid JSON. Response preview: {snippet}", 
+                        "error": "API returned non-JSON data (Session likely unauthenticated).", 
                         "delayed": False
                     }
                     
@@ -527,7 +528,7 @@ else:
             for df in flight_check_results:
                 st.markdown(f"""
                     <div style='background-color: #2c1f1f; border: 1px solid #ff5252; padding: 12px; border-radius: 8px; margin-bottom: 8px;'>
-                        <b style='color: #ff5252;>⚠️ Disruption Detected ({df['flight']} - {df['route']}):</b><br>{df['status']}<br>
+                        <b style='color: #ff5252;'>⚠️ Disruption Detected ({df['flight']} - {df['route']}):</b><br>{df['status']}<br>
                     </div>
                 """, unsafe_allow_html=True)
         else:
