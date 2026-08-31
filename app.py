@@ -45,7 +45,7 @@ def add_user(username, password, full_name, rank):
         return True
     except sqlite3.IntegrityError:
         conn.close()
-        return FALSE
+        return False
 
 def login_user(username, password):
     conn = sqlite3.connect('crew_companion.db')
@@ -173,13 +173,11 @@ def parse_roster_text(raw_text):
 def fetch_public_flight_status(flight_no, flight_date, api_key=""):
     clean_flight_no = flight_no.replace(" ", "") # e.g., UL181
     
-    # Using AeroDataBox via RapidAPI as a reliable public source, or fallback mock simulation if no key provided
     if not api_key:
-        # Graceful simulation / fallback if user hasn't plugged in a public API key yet
         return {
             "success": True,
             "status_code": 200,
-            "delayed": FALSE,
+            "delayed": False,
             "status_message": "Dep: On Time | Arr: On Time (Public Tracker Active)",
             "eta": "As Scheduled"
         }
@@ -216,9 +214,9 @@ def fetch_public_flight_status(flight_no, flight_date, api_key=""):
                     "status_message": status_text,
                     "eta": arrival.get("predictedTime", {}).get("local", "As Scheduled")
                 }
-        return {"success": False, "status_code": response.status_code, "error": "Flight not found on public tracker.", "delayed": FALSE}
+        return {"success": False, "status_code": response.status_code, "error": "Flight not found on public tracker.", "delayed": False}
     except Exception as e:
-        return {"success": False, "status_code": "Error", "error": str(e), "delayed": FALSE}
+        return {"success": False, "status_code": "Error", "error": str(e), "delayed": False}
 
 def get_upcoming_roster_flights(parsed_rows, current_date):
     target_flights = []
@@ -264,7 +262,7 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 if 'logged_in' not in st.session_state:
-    st.session_state['logged_in'] = FALSE
+    st.session_state['logged_in'] = False
     st.session_state['username'] = ''
     st.session_state['full_name'] = ''
     st.session_state['rank'] = ''
@@ -284,7 +282,7 @@ if not st.session_state['logged_in']:
             if st.button("Access Dashboard", use_container_width=True):
                 user_record = login_user(user_input, pass_input)
                 if user_record:
-                    st.session_state['logged_in'] = TRUE
+                    st.session_state['logged_in'] = True
                     st.session_state['username'] = user_record[0]
                     st.session_state['full_name'] = user_record[2]
                     st.session_state['rank'] = user_record[3]
@@ -312,7 +310,7 @@ else:
         st.markdown("### 🌲 CrewAI Roster Companion")
     with nav_col3:
         if st.button("Log Out"):
-            st.session_state['logged_in'] = FALSE
+            st.session_state['logged_in'] = False
             st.rerun()
 
     st.markdown("---")
@@ -431,7 +429,7 @@ else:
         api_key_val = st.session_state.get('public_api_key', '')
         
         flight_check_results = []
-        last_success = TRUE
+        last_success = True
         last_status_code = 200
         last_error_msg = "OK"
         
