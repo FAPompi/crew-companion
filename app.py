@@ -184,24 +184,29 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
     }
     
     try:
-        # Step 1: Hit login portal to establish cookies & harvest form parameters
+        # Step 1: Hit login portal to establish cookies & harvest ALL hidden form fields
         get_resp = session.get(login_url, headers=headers, timeout=10, verify=True)
         if get_resp.status_code != 200:
             return {"success": False, "status_code": get_resp.status_code, "error": "Failed to reach portal page.", "delayed": False}
 
         form_payload = {}
-        hidden_inputs = re.findall(r'<input[^>]+type=["\']hidden["\'][^>]*>', get_resp.text, re.IGNORECASE)
-        for inp in hidden_inputs:
+        
+        # Extract all input fields (including hidden viewstates, tokens, and button names)
+        inputs = re.findall(r'<input[^>]+>', get_resp.text, re.IGNORECASE)
+        for inp in inputs:
             name_match = re.search(r'name=["\']([^"\']+)["\']', inp, re.IGNORECASE)
             val_match = re.search(r'value=["\']([^"\']*)["\']', inp, re.IGNORECASE)
             if name_match:
-                form_payload[name_match.group(1)] = val_match.group(1) if val_match else ""
+                field_name = name_match.group(1)
+                field_val = val_match.group(1) if val_match else ""
+                form_payload[field_name] = field_val
 
-        # Inject username and password parameters
-        form_payload.update({
-            "username": intranet_user,
-            "password": intranet_pass
-        })
+        # Map common intranet form field name variations safely
+        user_field = next((k for k in form_payload.keys() if 'user' in k.lower() or 'email' in k.lower()), 'username')
+        pass_field = next((k for k in form_payload.keys() if 'pass' in k.lower()), 'password')
+
+        form_payload[user_field] = intranet_user
+        form_payload[pass_field] = intranet_pass
 
         post_headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -210,10 +215,10 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
             "Content-Type": "application/x-www-form-urlencoded"
         }
         
-        # Step 2: Submit credentials via POST
+        # Step 2: Submit credentials via POST with all extracted hidden tokens
         login_resp = session.post(login_url, data=form_payload, headers=post_headers, timeout=10, allow_redirects=True, verify=True)
         
-        # Check if the page returned contains input boxes characteristic of the login screen
+        # Verify if the response still contains login form elements
         if "#input-box" in login_resp.text or "passcode" in login_resp.text.lower() or "login" in login_resp.url.lower():
             return {
                 "success": False, 
@@ -238,7 +243,7 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
                 "FlyingTime": "0"
             }
             
-            # Step 3: Query the flight details endpoint using the authenticated session
+            # Step 3: Query the flight details endpoint using the successfully authenticated session cookies
             resp = session.post(details_endpoint, json=api_payload, headers=api_headers, timeout=10)
             
             if resp.status_code == 200:
