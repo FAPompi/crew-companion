@@ -169,9 +169,9 @@ def parse_roster_text(raw_text):
             
     return parsed_rows
 
-# --- 3. LIVE INTRANET i-FLEET API SESSION (UNIVERSAL ASP.NET INPUT MAPPING) ---
+# --- 3. LIVE INTRANET i-FLEET API SESSION ---
 def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no, flight_date, dep_stn="CMB", arr_stn=""):
-    login_url = "https://intraneti.srilankan.com/ifv/login"
+    login_url = "https://intraneti.srilankan.com/ifv"
     details_endpoint = "https://intraneti.srilankan.com/IFV/iFLEET_Local/GetFlightDetails"
     
     if not intranet_user or not intranet_pass:
@@ -186,9 +186,9 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
     try:
         get_resp = session.get(login_url, headers=headers, timeout=10, verify=True)
         if get_resp.status_code != 200:
-            return {"success": False, "status_code": get_resp.status_code, "error": "Failed to reach login page.", "delayed": False}
+            return {"success": False, "status_code": get_resp.status_code, "error": "Failed to reach portal page.", "delayed": False}
 
-        # Harvest all hidden fields
+        # Harvest all hidden fields from the login form
         form_payload = {}
         hidden_inputs = re.findall(r'<input[^>]+type=["\']hidden["\'][^>]*>', get_resp.text, re.IGNORECASE)
         for inp in hidden_inputs:
@@ -197,16 +197,10 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
             if name_match:
                 form_payload[name_match.group(1)] = val_match.group(1) if val_match else ""
 
-        # Inject broad coverage for standard ASP.NET / MVC naming variants
+        # Inject the exact credentials field names found in the HTML source
         form_payload.update({
-            "UserName": intranet_user,
-            "Password": intranet_pass,
-            "txtUserName": intranet_user,
-            "txtPassword": intranet_pass,
-            "Username": intranet_user,
-            "User": intranet_user,
-            "txtUser": intranet_user,
-            "txtPass": intranet_pass
+            "username": intranet_user,
+            "password": intranet_pass
         })
 
         post_headers = {
