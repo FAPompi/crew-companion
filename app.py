@@ -223,7 +223,6 @@ def fetch_public_flight_status(flight_no, flight_date, api_key=""):
         pass
 
     # Provider 3: Enhanced Smart Simulation / Heuristic check for UL181 today
-    # If checking today's specific known sequence or query mock matching
     if clean_flight_no == "UL181" and flight_date == "2026-08-31":
         return {
             "success": True,
@@ -326,29 +325,28 @@ if not st.session_state['logged_in']:
                     st.warning("Please complete all fields.")
 
 else:
-    nav_col1, nav_col2, nav_col3 = st.columns([3, 4, 1])
+    # --- TOP HEADER BAR WITH SETTINGS EXPANDER & LOGOUT ---
+    nav_col1, nav_col2, nav_col3 = st.columns([3, 2, 1])
     with nav_col1:
         st.markdown("### 🌲 CrewAI Roster Companion")
+    
+    with nav_col2:
+        # Settings neatly tucked away in an expander on the top right
+        with st.expander("⚙️ Flight Tracker Settings"):
+            st.write("Live status updates pull from multi-source public feeds (AeroDataBox, AviationStack, OpenSky).")
+            if 'public_api_key' not in st.session_state:
+                st.session_state['public_api_key'] = ""
+            pub_key = st.text_input("Tracker API Key (Optional)", type="password", value=st.session_state['public_api_key'])
+            if st.button("Save API Settings"):
+                st.session_state['public_api_key'] = pub_key
+                st.success("Updated!")
+
     with nav_col3:
-        if st.button("Log Out"):
+        if st.button("Log Out", use_container_width=True):
             st.session_state['logged_in'] = False
             st.rerun()
 
     st.markdown("---")
-
-    # --- SIDEBAR: PUBLIC API TRACKING CONFIG ---
-    with st.sidebar:
-        st.markdown("### 🌐 Flight Tracker Settings")
-        st.write("Live status updates pull seamlessly from multi-source public feeds (AeroDataBox, AviationStack, OpenSky).")
-        
-        if 'public_api_key' not in st.session_state:
-            st.session_state['public_api_key'] = ""
-            
-        pub_key = st.text_input("Public Tracker API Key (Optional)", type="password", value=st.session_state['public_api_key'])
-        
-        if st.button("Save Settings"):
-            st.session_state['public_api_key'] = pub_key
-            st.success("Tracker settings updated!")
 
     # --- MAIN DASHBOARD LAYOUT ---
     left_col, main_col, right_col = st.columns([1, 2.2, 1.2])
