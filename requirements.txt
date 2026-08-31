@@ -3,4 +3,3 @@ pandas
 requests
 beautifulsoup4
 duckduckgo_search
-serpapi
