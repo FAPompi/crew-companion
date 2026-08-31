@@ -181,19 +181,17 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
     }
     
     try:
-        # If manual cookie is provided, bypass automated credential posting entirely
+# If manual cookie is provided, bypass automated credential posting entirely
         if manual_cookie:
-            session.cookies.set("ASP.NET_SessionId", manual_cookie.strip())
-            # Alternatively set cookies directly via domain jar if formatted like name=val
+            # Clean and parse cookies if multiple or custom-named
             if "=" in manual_cookie:
                 for cookie_pair in manual_cookie.split(";"):
                     if "=" in cookie_pair:
                         k, v = cookie_pair.strip().split("=", 1)
                         session.cookies.set(k, v, domain="intraneti.srilankan.com")
-        else:
-            if not intranet_user or not intranet_pass:
-                return {"success": False, "status_code": None, "error": "Intranet credentials or manual session cookie missing.", "delayed": False}
-                
+            else:
+                # If they pasted just the raw Auth-Key value, map it directly
+                session.cookies.set("Auth-Key", manual_cookie.strip(), domain="intraneti.srilankan.com")
             # Step 1: Hit login portal to establish cookies & harvest ALL hidden form fields
             get_resp = session.get(login_url, headers=headers, timeout=10, verify=True)
             if get_resp.status_code != 200:
