@@ -169,14 +169,11 @@ def parse_roster_text(raw_text):
             
     return parsed_rows
 
-# --- 3. LIVE INTRANET i-FLEET API SESSION ---
-def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no, flight_date, dep_stn="CMB", arr_stn=""):
+# --- 3. LIVE INTRANET i-FLEET API SESSION (WITH MANUAL COOKIE OVERRIDE) ---
+def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no, flight_date, dep_stn="CMB", arr_stn="", manual_cookie=""):
     login_url = "https://intraneti.srilankan.com/ifv"
     details_endpoint = "https://intraneti.srilankan.com/IFV/iFLEET_Local/GetFlightDetails"
     
-    if not intranet_user or not intranet_pass:
-        return {"success": False, "status_code": None, "error": "Intranet credentials missing.", "delayed": False}
-        
     session = requests.Session()
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -184,105 +181,112 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
     }
     
     try:
-        # Step 1: Hit login portal to establish cookies & harvest ALL hidden form fields
-        get_resp = session.get(login_url, headers=headers, timeout=10, verify=True)
-        if get_resp.status_code != 200:
-            return {"success": False, "status_code": get_resp.status_code, "error": "Failed to reach portal page.", "delayed": False}
+        # If manual cookie is provided, bypass automated credential posting entirely
+        if manual_cookie:
+            session.cookies.set("ASP.NET_SessionId", manual_cookie.strip())
+            # Alternatively set cookies directly via domain jar if formatted like name=val
+            if "=" in manual_cookie:
+                for cookie_pair in manual_cookie.split(";"):
+                    if "=" in cookie_pair:
+                        k, v = cookie_pair.strip().split("=", 1)
+                        session.cookies.set(k, v, domain="intraneti.srilankan.com")
+        else:
+            if not intranet_user or not intranet_pass:
+                return {"success": False, "status_code": None, "error": "Intranet credentials or manual session cookie missing.", "delayed": False}
+                
+            # Step 1: Hit login portal to establish cookies & harvest ALL hidden form fields
+            get_resp = session.get(login_url, headers=headers, timeout=10, verify=True)
+            if get_resp.status_code != 200:
+                return {"success": False, "status_code": get_resp.status_code, "error": "Failed to reach portal page.", "delayed": False}
 
-        form_payload = {}
-        
-        # Extract all input fields (including hidden viewstates, tokens, and button names)
-        inputs = re.findall(r'<input[^>]+>', get_resp.text, re.IGNORECASE)
-        for inp in inputs:
-            name_match = re.search(r'name=["\']([^"\']+)["\']', inp, re.IGNORECASE)
-            val_match = re.search(r'value=["\']([^"\']*)["\']', inp, re.IGNORECASE)
-            if name_match:
-                field_name = name_match.group(1)
-                field_val = val_match.group(1) if val_match else ""
-                form_payload[field_name] = field_val
+            form_payload = {}
+            inputs = re.findall(r'<input[^>]+>', get_resp.text, re.IGNORECASE)
+            for inp in inputs:
+                name_match = re.search(r'name=["\']([^"\']+)["\']', inp, re.IGNORECASE)
+                val_match = re.search(r'value=["\']([^"\']*)["\']', inp, re.IGNORECASE)
+                if name_match:
+                    field_name = name_match.group(1)
+                    field_val = val_match.group(1) if val_match else ""
+                    form_payload[field_name] = field_val
 
-        # Map common intranet form field name variations safely
-        user_field = next((k for k in form_payload.keys() if 'user' in k.lower() or 'email' in k.lower()), 'username')
-        pass_field = next((k for k in form_payload.keys() if 'pass' in k.lower()), 'password')
+            user_field = next((k for k in form_payload.keys() if 'user' in k.lower() or 'email' in k.lower()), 'username')
+            pass_field = next((k for k in form_payload.keys() if 'pass' in k.lower()), 'password')
 
-        form_payload[user_field] = intranet_user
-        form_payload[pass_field] = intranet_pass
+            form_payload[user_field] = intranet_user
+            form_payload[pass_field] = intranet_pass
 
-        post_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Referer": login_url,
-            "Origin": "https://intraneti.srilankan.com",
-            "Content-Type": "application/x-www-form-urlencoded"
+            post_headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Referer": login_url,
+                "Origin": "https://intraneti.srilankan.com",
+                "Content-Type": "application/x-www-form-urlencoded"
+            }
+            
+            # Step 2: Submit credentials via POST
+            login_resp = session.post(login_url, data=form_payload, headers=post_headers, timeout=10, allow_redirects=True, verify=True)
+            
+            if "#input-box" in login_resp.text or "passcode" in login_resp.text.lower() or "login" in login_resp.url.lower():
+                return {
+                    "success": False, 
+                    "status_code": login_resp.status_code, 
+                    "error": "Authentication challenge failed or session rejected (returned login HTML form).", 
+                    "delayed": False
+                }
+
+        # Step 3: Query the flight details endpoint using the session cookies
+        api_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://intraneti.srilankan.com/IFV/",
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Requested-With": "XMLHttpRequest"
         }
         
-        # Step 2: Submit credentials via POST with all extracted hidden tokens
-        login_resp = session.post(login_url, data=form_payload, headers=post_headers, timeout=10, allow_redirects=True, verify=True)
+        api_payload = {
+            "DATOP": flight_date, 
+            "FLTID": flight_no, 
+            "DEPSTN": dep_stn, 
+            "ARRSTN": arr_stn, 
+            "FlyingTime": "0"
+        }
         
-        # Verify if the response still contains login form elements
-        if "#input-box" in login_resp.text or "passcode" in login_resp.text.lower() or "login" in login_resp.url.lower():
-            return {
-                "success": False, 
-                "status_code": login_resp.status_code, 
-                "error": "Authentication challenge failed or session rejected (returned login HTML form).", 
-                "delayed": False
-            }
+        resp = session.post(details_endpoint, json=api_payload, headers=api_headers, timeout=10)
         
-        if login_resp.status_code in [200, 302, 303]:
-            api_headers = {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                "Referer": "https://intraneti.srilankan.com/IFV/",
-                "Content-Type": "application/json; charset=UTF-8",
-                "X-Requested-With": "XMLHttpRequest"
-            }
-            
-            api_payload = {
-                "DATOP": flight_date, 
-                "FLTID": flight_no, 
-                "DEPSTN": dep_stn, 
-                "ARRSTN": arr_stn, 
-                "FlyingTime": "0"
-            }
-            
-            # Step 3: Query the flight details endpoint using the successfully authenticated session cookies
-            resp = session.post(details_endpoint, json=api_payload, headers=api_headers, timeout=10)
-            
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    dep_details = data.get("DepDetails", "On Time")
-                    arr_details = data.get("ArrDetails", "On Time")
-                    late_min_dep = data.get("Latemin_Dep", 0)
-                    late_min_arr = data.get("Latemin_Arr", 0)
-                    
-                    is_delayed = (
-                        (late_min_dep and late_min_dep > 0) or 
-                        (late_min_arr and late_min_arr > 0) or
-                        ("delay" in str(dep_details).lower()) or 
-                        ("delay" in str(arr_details).lower()) or
-                        (data.get("STATUS") and "cancel" in str(data.get("STATUS")).lower())
-                    )
-                    
-                    status_text = f"Dep: {dep_details} | Arr: {arr_details}"
-                    if late_min_dep > 0:
-                        status_text += f" (Late Dep: {data.get('Latemin_Dep_Str', f'{late_min_dep} mins')})"
-                    
-                    return {
-                        "success": True,
-                        "status_code": resp.status_code,
-                        "delayed": is_delayed,
-                        "status_message": status_text,
-                        "eta": data.get("ETA", "As Scheduled")
-                    }
-                except ValueError:
-                    return {
-                        "success": False, 
-                        "status_code": resp.status_code, 
-                        "error": "API returned non-JSON data (Session likely unauthenticated).", 
-                        "delayed": False
-                    }
-                    
-            return {"success": False, "status_code": resp.status_code, "error": f"Details API returned status {resp.status_code}"}
-        return {"success": False, "status_code": login_resp.status_code, "error": f"Login returned status {login_resp.status_code}"}
+        if resp.status_code == 200:
+            try:
+                data = resp.json()
+                dep_details = data.get("DepDetails", "On Time")
+                arr_details = data.get("ArrDetails", "On Time")
+                late_min_dep = data.get("Latemin_Dep", 0)
+                late_min_arr = data.get("Latemin_Arr", 0)
+                
+                is_delayed = (
+                    (late_min_dep and late_min_dep > 0) or 
+                    (late_min_arr and late_min_arr > 0) or
+                    ("delay" in str(dep_details).lower()) or 
+                    ("delay" in str(arr_details).lower()) or
+                    (data.get("STATUS") and "cancel" in str(data.get("STATUS")).lower())
+                )
+                
+                status_text = f"Dep: {dep_details} | Arr: {arr_details}"
+                if late_min_dep > 0:
+                    status_text += f" (Late Dep: {data.get('Latemin_Dep_Str', f'{late_min_dep} mins')})"
+                
+                return {
+                    "success": True,
+                    "status_code": resp.status_code,
+                    "delayed": is_delayed,
+                    "status_message": status_text,
+                    "eta": data.get("ETA", "As Scheduled")
+                }
+            except ValueError:
+                return {
+                    "success": False, 
+                    "status_code": resp.status_code, 
+                    "error": "API returned non-JSON data (Session cookie expired or unauthenticated).", 
+                    "delayed": False
+                }
+                
+        return {"success": False, "status_code": resp.status_code, "error": f"Details API returned status {resp.status_code}"}
         
     except requests.exceptions.RequestException as e:
         return {"success": False, "status_code": "Timeout/DNS Error", "error": str(e), "delayed": False}
@@ -384,23 +388,29 @@ else:
 
     st.markdown("---")
 
-    # --- SIDEBAR: INTRANET CREDENTIALS BRIDGE ---
+    # --- SIDEBAR: INTRANET CREDENTIALS & COOKIE BRIDGE ---
     with st.sidebar:
         st.markdown("### 🔗 Intranet Integration")
-        st.write("Provide your company intranet portal credentials to enable live background flight checks.")
+        st.write("If automated login fails due to portal security walls, log in via your browser, copy your `ASP.NET_SessionId` cookie, and paste it below.")
         
         if 'intranet_user' not in st.session_state:
             st.session_state['intranet_user'] = ""
         if 'intranet_pass' not in st.session_state:
             st.session_state['intranet_pass'] = ""
+        if 'manual_cookie' not in st.session_state:
+            st.session_state['manual_cookie'] = ""
             
-        i_user = st.text_input("Intranet Username / ID (e.g. UL\\23546)", value=st.session_state['intranet_user'])
+        i_user = st.text_input("Intranet Username / ID", value=st.session_state['intranet_user'])
         i_pass = st.text_input("Intranet Password", type="password", value=st.session_state['intranet_pass'])
         
-        if st.button("Save Intranet Credentials"):
+        st.markdown("---")
+        m_cookie = st.text_input("Manual Session Cookie / ID", value=st.session_state['manual_cookie'], placeholder="e.g. abc123xyz789 or ASP.NET_SessionId=...")
+        
+        if st.button("Save Intranet Settings"):
             st.session_state['intranet_user'] = i_user
             st.session_state['intranet_pass'] = i_pass
-            st.success("Credentials updated for session!")
+            st.session_state['manual_cookie'] = m_cookie
+            st.success("Settings saved for session!")
 
     # --- MAIN DASHBOARD LAYOUT ---
     left_col, main_col, right_col = st.columns([1, 2.2, 1.2])
@@ -501,6 +511,7 @@ else:
         
         test_user = st.session_state.get('intranet_user', '')
         test_pass = st.session_state.get('intranet_pass', '')
+        test_cookie = st.session_state.get('manual_cookie', '')
         
         flight_check_results = []
         last_success = False
@@ -510,7 +521,7 @@ else:
         if upcoming_flights:
             for flight in upcoming_flights:
                 res = authenticate_and_fetch_flight_status(
-                    test_user, test_pass, flight["flight_no"], flight["date"], flight["dep_stn"], flight["arr_stn"]
+                    test_user, test_pass, flight["flight_no"], flight["date"], flight["dep_stn"], flight["arr_stn"], manual_cookie=test_cookie
                 )
                 last_success = res.get("success")
                 last_status_code = res.get("status_code")
@@ -548,7 +559,7 @@ else:
             else:
                 st.markdown(f"""
                     <div style='background-color: #2a2517; border: 1px solid #ff9800; padding: 12px; border-radius: 8px;'>
-                        <b style='color: #ff9800;'>Intranet Session Warning:</b> Could not automatically query live i-Fleet API using provided credentials. Check diagnostic log above.<br>
+                        <b style='color: #ff9800;'>Intranet Session Warning:</b> Could not query live i-Fleet API. Provide manual session cookie in sidebar if login challenge persists.<br>
                     </div>
                 """, unsafe_allow_html=True)
         
