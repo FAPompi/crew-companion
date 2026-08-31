@@ -188,7 +188,6 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
         if get_resp.status_code != 200:
             return {"success": False, "status_code": get_resp.status_code, "error": "Failed to reach portal page.", "delayed": False}
 
-        # Harvest all hidden fields from the login form
         form_payload = {}
         hidden_inputs = re.findall(r'<input[^>]+type=["\']hidden["\'][^>]*>', get_resp.text, re.IGNORECASE)
         for inp in hidden_inputs:
@@ -197,7 +196,6 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
             if name_match:
                 form_payload[name_match.group(1)] = val_match.group(1) if val_match else ""
 
-        # Inject the exact credentials field names found in the HTML source
         form_payload.update({
             "username": intranet_user,
             "password": intranet_pass
@@ -268,7 +266,14 @@ def authenticate_and_fetch_flight_status(intranet_user, intranet_pass, flight_no
                         "eta": data.get("ETA", "As Scheduled")
                     }
                 except ValueError:
-                    return {"success": False, "status_code": resp.status_code, "error": "Invalid JSON returned from GetFlightDetails"}
+                    # Capture exact text returned so we can diagnose the layout mismatch
+                    snippet = resp.text[:200].replace('\n', ' ')
+                    return {
+                        "success": False, 
+                        "status_code": resp.status_code, 
+                        "error": f"Invalid JSON. Response preview: {snippet}", 
+                        "delayed": False
+                    }
                     
             return {"success": False, "status_code": resp.status_code, "error": f"Details API returned status {resp.status_code}"}
         return {"success": False, "status_code": login_resp.status_code, "error": f"Login returned status {login_resp.status_code}"}
@@ -522,7 +527,7 @@ else:
             for df in flight_check_results:
                 st.markdown(f"""
                     <div style='background-color: #2c1f1f; border: 1px solid #ff5252; padding: 12px; border-radius: 8px; margin-bottom: 8px;'>
-                        <b style='color: #ff5252;'>⚠️ Disruption Detected ({df['flight']} - {df['route']}):</b><br>{df['status']}<br>
+                        <b style='color: #ff5252;>⚠️ Disruption Detected ({df['flight']} - {df['route']}):</b><br>{df['status']}<br>
                     </div>
                 """, unsafe_allow_html=True)
         else:
