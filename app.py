@@ -31,6 +31,12 @@ def init_db():
             data TEXT
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS performed_rosters (
+            username TEXT PRIMARY KEY,
+            roster_text TEXT
+        )
+    ''')
     conn.commit()
     conn.close()
 
@@ -69,6 +75,21 @@ def save_roster_to_db(username, text):
     c.execute('REPLACE INTO rosters (username, roster_text) VALUES (?, ?)', (username, text))
     conn.commit()
     conn.close()
+
+def save_performed_roster(username, text):
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    c.execute('REPLACE INTO performed_rosters (username, roster_text) VALUES (?, ?)', (username, text))
+    conn.commit()
+    conn.close()
+
+def load_performed_roster(username):
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    c.execute('SELECT roster_text FROM performed_rosters WHERE username = ?', (username,))
+    d = c.fetchone()
+    conn.close()
+    return d[0] if d else ''
 
 def save_profile(username, data):
     conn = sqlite3.connect('crew_companion.db')
@@ -1665,15 +1686,40 @@ else:
                 st.success("Profile saved — it will load automatically next time.")
 
         with rcol:
-            flights_exist = any(r["Type"] == "FLIGHT" for r in parsed_rows)
+            # --- performed roster input (salary is based on the PERFORMED month, not the live roster) ---
+            if 'performed_roster' not in st.session_state:
+                st.session_state['performed_roster'] = load_performed_roster(st.session_state['username'])
+            perf_saved = st.session_state.get('performed_roster', '')
+            with st.expander("📋 Performed Roster (paste here)", expanded=not bool(perf_saved)):
+                st.markdown("<div class='muted' style='margin-bottom:6px;'>Salary is calculated on the <b>performed</b> roster for the month — paste it from the crew portal exactly like on the Dashboard. It's saved separately from your live roster.</div>", unsafe_allow_html=True)
+                perf_input = st.text_area("Performed roster text", value=perf_saved, height=160,
+                                          label_visibility="collapsed",
+                                          placeholder="Paste your performed roster for the month here...")
+                pb1, pb2 = st.columns([1, 1])
+                if pb1.button("⚙️ Process & Save", use_container_width=True, key="perf_save"):
+                    st.session_state['performed_roster'] = perf_input
+                    save_performed_roster(st.session_state['username'], perf_input)
+                    st.rerun()
+                if pb2.button("🗑 Clear", use_container_width=True, key="perf_clear"):
+                    st.session_state['performed_roster'] = ''
+                    save_performed_roster(st.session_state['username'], '')
+                    st.rerun()
+
+            perf_text = st.session_state.get('performed_roster', '')
+            perf_rows = parse_roster_text(perf_text) if perf_text.strip() else []
+            flights_exist = any(r["Type"] == "FLIGHT" for r in perf_rows)
             if not flights_exist:
-                st.info("Paste and process your roster on the Dashboard tab first — the calculator reads it automatically.")
+                st.info("Paste your performed roster above and hit Process & Save — the payslip is computed from it instantly.")
             else:
+                _pd = [r["DateObj"].date() for r in perf_rows if r.get("DateObj")]
+                if _pd:
+                    _n_f = sum(1 for r in perf_rows if r["Type"] == "FLIGHT")
+                    st.markdown(f"<div class='muted' style='margin-bottom:8px;'>✅ Performed roster loaded: <b>{_n_f} sectors</b> · {min(_pd).strftime('%d %b')} – {max(_pd).strftime('%d %b %Y')}</div>", unsafe_allow_html=True)
                 prof = {"cat": cat, "rate": usd_rate, "schblk_min": parse_hhmm_minutes(schblk),
                         "festival": festival, "basic": basic, "crge": crge, "fbpp": fbpp,
                         "transport": transport, "medical": medical, "fau": fau,
                         "stamp": stamp, "apiit": apiit, "epf_pct": epf_pct}
-                s = compute_salary(parsed_rows, prof)
+                s = compute_salary(perf_rows, prof)
 
                 h1, h2, h3 = st.columns(3)
                 h1.markdown(f"<div class='card' style='text-align:center;border-color:#4caf50;'><div class='muted'>NET SALARY (Rs)</div><div style='font-size:26px;font-weight:800;color:#4caf50;'>Rs {s['net']:,.0f}</div><div class='muted'>after tax & deductions</div></div>", unsafe_allow_html=True)
