@@ -2,6 +2,7 @@ import streamlit as st
 import sqlite3
 import hashlib
 import re
+import json
 import requests
 from datetime import datetime, timedelta, timezone
 
@@ -169,10 +170,12 @@ def parse_roster_text(raw_text):
 
     return parsed_rows
 
-# --- 3. FLIGHTRADAR24 LIVE TELEMETRY (KEYLESS, NO QUOTAS) ---
-# Uses FR24's public flight-list JSON feed. No API key, no registration,
-# no hard monthly quota. Results cached for 10 minutes per flight to be
-# polite and to keep Streamlit reruns instant.
+# --- 3. LIVE TELEMETRY: FLIGHTSTATS (CIRIUM) PRIMARY + FLIGHTRADAR24 FALLBACK ---
+# Both sources are keyless with no hard quota. FlightStats carries true
+# airline-filed disruption data (delays, cancellations, DIVERSIONS) that
+# FR24's free feed often misses or papers over with synthetic estimates
+# (any FR24 time ending in '*' is a historical-average guess, not real).
+# Results cached for 10 minutes per flight to be polite and keep reruns fast.
 
 FR24_URL = "https://api.flightradar24.com/common/v1/flight/list.json"
 FR24_HEADERS = {
@@ -181,6 +184,92 @@ FR24_HEADERS = {
                    "Chrome/124.0 Safari/537.36"),
     "Accept": "application/json",
 }
+
+@st.cache_data(ttl=600, show_spinner=False)
+def flightstats_fetch(carrier, number, year, month, day):
+    """
+    Scrape Cirium/FlightStats flight-tracker page: real airline-filed status
+    (delayed / cancelled / diverted) embedded as JSON in the page. Keyless.
+    Returns the 'flight' dict or None.
+    """
+    url = f"https://www.flightstats.com/v2/flight-tracker/{carrier}/{number}"
+    params = {"year": year, "month": month, "date": day}
+    resp = requests.get(url, params=params, headers=FR24_HEADERS, timeout=20)
+    resp.raise_for_status()
+    m = re.search(r'__NEXT_DATA__\s*=\s*(\{.*?\})\s*;?\s*</script>', resp.text, re.S)
+    if not m:
+        m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(\{.*?\})</script>', resp.text, re.S)
+    if not m:
+        return None
+    raw = m.group(1).split(";__NEXT_LOADED_PAGES__")[0]
+    data = json.loads(raw)
+    flight = (data.get("props", {}).get("initialState", {})
+                  .get("flightTracker", {}).get("flight")) or None
+    # A valid result has a schedule block; an empty shell means no data for that date
+    if flight and (flight.get("schedule") or {}).get("scheduledDeparture"):
+        return flight
+    return None
+
+def _fs_minutes_between(sched_iso, actual_iso):
+    try:
+        s = datetime.fromisoformat(sched_iso.replace("Z", "+00:00"))
+        a = datetime.fromisoformat(actual_iso.replace("Z", "+00:00"))
+        return int(round((a - s).total_seconds() / 60))
+    except Exception:
+        return 0
+
+def query_flightstats(flight_no, flight_date):
+    """Primary check: airline-filed status from Cirium/FlightStats."""
+    clean_fn = flight_no.replace(" ", "").upper()
+    m = re.match(r'([A-Z0-9]{2})\s*(\d+)', clean_fn)
+    if not m:
+        return None
+    carrier, number = m.group(1), m.group(2)
+    try:
+        fl = flightstats_fetch(carrier, number, flight_date.year, flight_date.month, flight_date.day)
+    except Exception:
+        return None
+    if not fl:
+        return None
+
+    status = fl.get("status", {}) or {}
+    schedule = fl.get("schedule", {}) or {}
+    code = (status.get("statusCode") or "").upper()          # S/A/L/C/D/R...
+    status_words = (status.get("status") or "").strip()      # e.g. "Diverted to CMB"
+    final_status = (status.get("finalStatus") or "").strip() # e.g. "Diverted"
+    color = (status.get("color") or "").lower()
+
+    is_cancelled = code == "C" or "cancel" in status_words.lower()
+    is_diverted = bool(status.get("diverted")) or code == "D" or "divert" in status_words.lower()
+
+    # Departure delay: airline-filed minutes first, else computed from times
+    delay_obj = ((status.get("delay") or {}).get("departure") or {})
+    dep_delay = int(delay_obj.get("minutes") or 0)
+    sched_utc = schedule.get("scheduledDepartureUTC")
+    act_utc = schedule.get("estimatedActualDepartureUTC")
+    if dep_delay == 0 and sched_utc and act_utc:
+        dep_delay = max(dep_delay, _fs_minutes_between(sched_utc, act_utc))
+    delay_wording = ((status.get("delayStatus") or {}).get("wording") or "").strip()
+    is_delayed = (not is_cancelled and not is_diverted
+                  and (dep_delay >= 15 or "delay" in status_words.lower()
+                       or "delay" in delay_wording.lower() or color == "red"))
+
+    sched_local = (schedule.get("scheduledDeparture") or "")[11:16] or "-"
+    act_local = (schedule.get("estimatedActualDeparture") or "")[11:16] or "-"
+
+    return {
+        "status_known": True,
+        "is_cancelled": is_cancelled,
+        "is_diverted": is_diverted,
+        "is_delayed": is_delayed,
+        "delay_minutes": dep_delay,
+        "status_words": status_words or final_status or "Scheduled",
+        "delay_wording": delay_wording,
+        "sched_dep_local": sched_local,
+        "est_dep_local": act_local,
+        "last_updated": status.get("lastUpdatedText", ""),
+        "source": "FlightStats (Cirium)",
+    }
 
 @st.cache_data(ttl=600, show_spinner=False)
 def fr24_fetch_flight_history(flight_no_compact):
@@ -211,11 +300,10 @@ def _fmt_local_time(epoch_utc, tz_offset_seconds):
     return (datetime.fromtimestamp(epoch_utc, tz=timezone.utc)
             + timedelta(seconds=tz_offset_seconds or 0)).strftime("%H:%M")
 
-def query_live_aviation_feed(flight_no, flight_date):
+def query_fr24(flight_no, flight_date):
     """
-    Look up a specific flight number on a specific ROSTER date via FR24.
+    Fallback / enrichment check via FR24's keyless list feed.
     flight_date: datetime.date of the departure (origin local time).
-    Returns a structured status dict.
     """
     clean_fn = flight_no.replace(" ", "").upper()
     try:
@@ -257,11 +345,16 @@ def query_live_aviation_feed(flight_no, flight_date):
     generic_text = (generic.get("text") or "").lower()
     is_live = bool(status_obj.get("live"))
 
+    # FR24 times ending in '*' are synthetic historical-average guesses,
+    # NOT real airline data — never treat them as verification of anything.
+    is_synthetic = "*" in status_text
+
     is_cancelled = "cancel" in generic_text or "cancel" in status_text.lower()
+    is_diverted = bool(generic.get("diverted")) or "divert" in status_text.lower()
 
     # Delay = estimated/actual departure later than schedule, or FR24 flags it.
     delay_mins = 0
-    ref_dep = real_dep or est_dep
+    ref_dep = real_dep or (None if is_synthetic else est_dep)
     if sched_dep and ref_dep and ref_dep > sched_dep:
         delay_mins = int(round((ref_dep - sched_dep) / 60))
     flagged_delayed = ("delay" in generic_text or "delay" in status_text.lower()
@@ -272,6 +365,8 @@ def query_live_aviation_feed(flight_no, flight_date):
         "status_known": True,
         "is_delayed": is_delayed,
         "is_cancelled": is_cancelled,
+        "is_diverted": is_diverted,
+        "is_synthetic": is_synthetic,
         "delay_minutes": delay_mins,
         "is_live": is_live,
         "fr24_status": status_text or generic_text.capitalize() or "Scheduled",
@@ -279,41 +374,74 @@ def query_live_aviation_feed(flight_no, flight_date):
         "est_dep_local": _fmt_local_time(ref_dep, tz_off) if ref_dep else "-",
         "aircraft": ((matched.get("aircraft") or {}).get("model") or {}).get("code") or "-",
         "registration": ((matched.get("aircraft") or {}).get("registration")) or "-",
-        "source": "Flightradar24 live feed",
+        "source": "Flightradar24",
     }
 
 def fetch_live_flight_telemetry(flight_no, flight_date, route, scheduled_dep):
-    """flight_date is a datetime.date object taken straight from the roster."""
-    live = query_live_aviation_feed(flight_no, flight_date)
-    date_label = flight_date.strftime("%d %b")
+    """
+    flight_date is a datetime.date object taken straight from the roster.
+    Strategy: FlightStats/Cirium (airline-filed disruptions) is authoritative;
+    FR24 is fallback + enrichment. A disruption reported by EITHER source
+    is alerted — never let one source's 'on time' mask the other's alert.
+    """
+    fs = query_flightstats(flight_no, flight_date)
+    fr = query_fr24(flight_no, flight_date)
+    fr_ok = fr.get("status_known", False)
 
-    if not live.get("status_known", False):
-        err = live.get("error", "Unknown error")
+    reg_bits = []
+    if fr_ok and fr.get("registration", "-") != "-":
+        reg_bits.append(fr["registration"])
+    if fr_ok and fr.get("aircraft", "-") != "-":
+        reg_bits.append(fr["aircraft"])
+    tail = f" · {' / '.join(reg_bits)}" if reg_bits else ""
+
+    if not fs and not fr_ok:
+        err = fr.get("error", "no data from FlightStats or FR24")
         return {"is_delayed": False, "severity": "unknown",
                 "status_message": f"ℹ️ {flight_no} ({route}) — {err}."}
 
-    reg_bits = []
-    if live.get("registration", "-") != "-":
-        reg_bits.append(live["registration"])
-    if live.get("aircraft", "-") != "-":
-        reg_bits.append(live["aircraft"])
-    tail = f" · {' / '.join(reg_bits)}" if reg_bits else ""
+    date_label = flight_date.strftime("%d %b")
 
-    if live.get("is_cancelled"):
+    # --- Merge disruption flags (either source can raise an alert) ---
+    cancelled = bool(fs and fs["is_cancelled"]) or bool(fr_ok and fr.get("is_cancelled"))
+    diverted = bool(fs and fs["is_diverted"]) or bool(fr_ok and fr.get("is_diverted"))
+    delayed = bool(fs and fs["is_delayed"]) or bool(fr_ok and fr.get("is_delayed"))
+    delay_mins = max(fs["delay_minutes"] if fs else 0,
+                     fr.get("delay_minutes", 0) if fr_ok else 0)
+
+    primary = fs if fs else fr
+    src = "FlightStats/Cirium" if fs else "Flightradar24"
+    sched = primary.get("sched_dep_local", scheduled_dep)
+    updated = f" ({fs['last_updated']})" if fs and fs.get("last_updated") else ""
+
+    if cancelled:
         return {"is_delayed": True, "severity": "cancelled",
-                "status_message": f"🚫 CANCELLED — FR24 reports {flight_no} on {date_label} is cancelled{tail}."}
+                "status_message": f"🚫 CANCELLED — {src} reports {flight_no} on {date_label} is cancelled{tail}.{updated}"}
 
-    if live.get("is_delayed"):
-        mins = live.get("delay_minutes", 0)
-        mins_str = f" by ~{mins} min" if mins > 0 else ""
-        est = live.get("est_dep_local", "-")
-        est_str = f" New est. departure {est}." if est != "-" else ""
+    if diverted:
+        det = fs["status_words"] if fs else fr.get("fr24_status", "Diverted")
+        return {"is_delayed": True, "severity": "diverted",
+                "status_message": f"🔀 DIVERTED — {src}: '{det}' for {flight_no} on {date_label} (sched dep {sched}){tail}.{updated}"}
+
+    if delayed:
+        mins_str = f" by ~{delay_mins} min" if delay_mins > 0 else ""
+        est = primary.get("est_dep_local", "-")
+        est_str = f" New est. departure {est}." if est not in ("-", sched) else ""
+        wording = f" {fs['delay_wording']}." if fs and fs.get("delay_wording") else ""
         return {"is_delayed": True, "severity": "delayed",
-                "status_message": f"⚠️ DELAYED{mins_str} — {flight_no} sched {live.get('sched_dep_local', scheduled_dep)}.{est_str}{tail}"}
+                "status_message": f"⚠️ DELAYED{mins_str} — {src}: {flight_no} sched {sched}.{est_str}{wording}{tail}{updated}"}
 
-    live_str = " (airborne now)" if live.get("is_live") else ""
+    # --- No disruption filed ---
+    if fs:
+        return {"is_delayed": False, "severity": "ok",
+                "status_message": f"✅ {fs['status_words']} — {flight_no} dep {sched}, no disruption filed (FlightStats/Cirium){tail}.{updated}"}
+
+    live_str = " (airborne now)" if fr.get("is_live") else ""
+    if fr.get("is_synthetic"):
+        return {"is_delayed": False, "severity": "ok",
+                "status_message": f"✅ No disruption filed — {flight_no} dep {sched}{live_str}. FR24 estimate is predictive only; will alert if a delay/cancellation is filed{tail}."}
     return {"is_delayed": False, "severity": "ok",
-            "status_message": f"✅ {live.get('fr24_status', 'On time')}{live_str} — {flight_no} dep {live.get('sched_dep_local', scheduled_dep)} verified via Flightradar24{tail}."}
+            "status_message": f"✅ {fr.get('fr24_status', 'On time')}{live_str} — {flight_no} dep {sched} verified via Flightradar24{tail}."}
 
 # --- 4. STREAMLIT CONFIG & UI ---
 st.set_page_config(page_title="Crew Companion", page_icon="✈️", layout="wide")
@@ -396,8 +524,8 @@ else:
 
     with nav_col2:
         with st.expander("🤖 AI Agent Status"):
-            st.write("Dynamic roster parser & Flightradar24 live-feed agent online. No API key or quota required.")
-            st.success("FR24 Engine: ACTIVE (keyless)")
+            st.write("Dynamic roster parser + dual-source disruption agent (FlightStats/Cirium primary, FR24 fallback). No API keys or quotas.")
+            st.success("Disruption Engine: ACTIVE (FlightStats + FR24, keyless)")
 
     with nav_col3:
         if st.button("Log Out", use_container_width=True):
@@ -543,7 +671,7 @@ else:
 
         flight_check_results = []
         if active_target_flights:
-            with st.spinner("Querying Flightradar24 live feed..."):
+            with st.spinner("Querying FlightStats & Flightradar24 live feeds..."):
                 for flight in active_target_flights:
                     telemetry = fetch_live_flight_telemetry(
                         flight["flight_no"],
@@ -564,12 +692,14 @@ else:
             checked_count = len(flight_check_results)
             st.markdown(
                 f"<div style='background-color: #17212b; border: 1px solid #232e3c; padding: 12px; border-radius: 8px; font-size: 12px; margin-top: 8px;'>"
-                f"<b style='color: #00bcd4;'>Agent Scan:</b> Verified {checked_count} flight(s) against Flightradar24 (keyless live feed, cached 10 min)."
+                f"<b style='color: #00bcd4;'>Agent Scan:</b> Verified {checked_count} flight(s) against FlightStats/Cirium + Flightradar24 (keyless, cached 10 min)."
                 f"</div>", unsafe_allow_html=True)
 
             for df in flight_check_results:
                 if df["severity"] == "cancelled":
                     border_color, bg_color, txt_color, icon = "#ff1744", "#331414", "#ff8a8a", "🚫"
+                elif df["severity"] == "diverted":
+                    border_color, bg_color, txt_color, icon = "#ff6d00", "#332414", "#ffb74d", "🔀"
                 elif df["severity"] == "delayed":
                     border_color, bg_color, txt_color, icon = "#ff5252", "#2c1f1f", "#ff8a8a", "⚠️"
                 elif df["severity"] == "unknown":
@@ -585,6 +715,7 @@ else:
 
             if st.button("🔄 Force Refresh Live Data", use_container_width=True):
                 fr24_fetch_flight_history.clear()
+                flightstats_fetch.clear()
                 st.rerun()
         else:
             st.markdown(
