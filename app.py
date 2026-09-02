@@ -25,6 +25,12 @@ def init_db():
             PRIMARY KEY (username)
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS profiles (
+            username TEXT PRIMARY KEY,
+            data TEXT
+        )
+    ''')
     conn.commit()
     conn.close()
 
@@ -63,6 +69,24 @@ def save_roster_to_db(username, text):
     c.execute('REPLACE INTO rosters (username, roster_text) VALUES (?, ?)', (username, text))
     conn.commit()
     conn.close()
+
+def save_profile(username, data):
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    c.execute('REPLACE INTO profiles (username, data) VALUES (?, ?)', (username, json.dumps(data)))
+    conn.commit()
+    conn.close()
+
+def load_profile(username):
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    c.execute('SELECT data FROM profiles WHERE username = ?', (username,))
+    d = c.fetchone()
+    conn.close()
+    try:
+        return json.loads(d[0]) if d else {}
+    except Exception:
+        return {}
 
 def load_roster_from_db(username):
     conn = sqlite3.connect('crew_companion.db')
@@ -135,7 +159,7 @@ def parse_roster_text(raw_text):
             except ValueError:
                 pass
 
-        if any(keyword in line_str for keyword in ["UL", "OFF", "HTL", "SB", "ROF", "TOF"]):
+        if any(keyword in line_str for keyword in ["UL", "OFF", "HTL", "SB", "ROF", "TOF", "ALV", "RLV", "ALP", "CLV"]):
             activity_type = "OTHER"
             flight_no = "-"
             checkin_time = "-"
@@ -150,6 +174,8 @@ def parse_roster_text(raw_text):
 
             if "OFF" in line_str or "ROF" in line_str or "TOF" in line_str:
                 activity_type = "DAY OFF"
+            elif any(c in line_str for c in ("ALV", "RLV", "ALP", "CLV")):
+                activity_type = "LEAVE"
             elif "HTL" in line_str:
                 activity_type = "LAYOVER"
             elif "SB" in line_str:
@@ -240,7 +266,7 @@ def parse_roster_text(raw_text):
                             co_dt = datetime.combine(arr_dt.date(), tco)
                             if co_dt < arr_dt:
                                 co_dt += timedelta(days=1)
-            elif activity_type == "STANDBY" and dt_stamps:
+            elif activity_type in ("STANDBY", "LAYOVER") and dt_stamps:
                 ci_dt, co_dt = min(dt_stamps), max(dt_stamps)
 
             parsed_rows.append({
@@ -1076,12 +1102,153 @@ def build_calendar_html(rows, span=None):
                 chips.append("<div class='chip chip-off'>🟢 OFF</div>")
             elif act["Type"] == "STANDBY":
                 chips.append("<div class='chip chip-sby'>⏱ SB</div>")
+            elif act["Type"] == "LEAVE":
+                chips.append("<div class='chip chip-lay'>🌴 Leave</div>")
         if in_period and (rmin <= d <= rmax) and not chips:
             chips.append("<div class='chip chip-none'>No duty</div>")
         cells.append(f"<div class='{cls}'><div class='cal-date'>{d.day} {d.strftime('%b') if d.day == 1 or d == start else ''}</div>{''.join(chips)}</div>")
         d += timedelta(days=1)
     cells.append("</div>")
     return "".join(cells)
+
+# --- 3.7 SALARY ENGINE (ported from the FAU sheet formulas + code.gs) ---
+HOURLY_PAY = {   # category: (hourly $ rate <75h, hourly $ rate >75h)
+    "PUR>10Yrs": (20.0, 38.0), "PUR(5-10Yrs)": (20.0, 38.0), "PUR<5Yrs": (20.0, 38.0),
+    "CS>5Yrs": (13.5, 32.0), "CS<5Yrs": (13.5, 32.0),
+    "C3": (8.5, 26.0), "C2": (6.5, 23.0), "C1": (6.5, 11.5), "C": (6.5, 11.5),
+}
+SPECIAL_PREMIUM = {"PUR>10Yrs": 35000, "PUR(5-10Yrs)": 30000, "PUR<5Yrs": 25000,
+                   "CS>5Yrs": 15000, "CS<5Yrs": 10000, "C3": 5000, "C2": 0, "C1": 0, "C": 0}
+OVERNIGHT_RATE_USD = {"PUR>10Yrs": 30, "PUR(5-10Yrs)": 30, "PUR<5Yrs": 30,
+                      "CS>5Yrs": 20, "CS<5Yrs": 20, "C3": 18, "C2": 15, "C1": 15, "C": 15}
+LEAVE_RATE_RS = {"PUR>10Yrs": 2000, "PUR(5-10Yrs)": 2000, "PUR<5Yrs": 2000,
+                 "CS>5Yrs": 1500, "CS<5Yrs": 1500, "C3": 1200, "C2": 800, "C1": 500, "C": 500}
+MEAL_RATE_USD = 25.0
+SPLIT_MIN = 4500          # 75h threshold in minutes
+MEAL_TRIGGERS = [(7, 30), (12, 30), (19, 30)]   # B / L / D trigger instants
+
+def apit_tax(t):
+    """Sri Lanka APIT slabs — identical to Breakdown!G16."""
+    if t <= 150000: return 0
+    if t <= 233333.34: return (t - 150000) * 0.06
+    if t <= 275000: return 5000 + (t - 233333.34) * 0.18
+    if t <= 316666.67: return 12500 + (t - 275000) * 0.24
+    if t <= 358333.34: return 22500 + (t - 316666.67) * 0.30
+    return 35000 + (t - 358333.34) * 0.36
+
+def parse_hhmm_minutes(s):
+    h = re.search(r'(\d+)\s*h', s or "")
+    m = re.search(r'(\d+)\s*m', s or "")
+    return (int(h.group(1)) if h else 0) * 60 + (int(m.group(1)) if m else 0)
+
+def _meal_counts(start, end):
+    """Count B/L/D trigger instants inside [start, end) — same as CALCULATE_MEALS."""
+    if not start or not end or end <= start:
+        return 0, 0, 0
+    out = [0, 0, 0]
+    d = start.date() - timedelta(days=1)
+    while d <= end.date():
+        for i, (h, m) in enumerate(MEAL_TRIGGERS):
+            t = datetime.combine(d, dtime(h, m))
+            if start <= t < end:
+                out[i] += 1
+        d += timedelta(days=1)
+    return tuple(out)
+
+def compute_salary(rows, prof):
+    """Full payslip from parsed roster + crew profile. Mirrors the sheet:
+    meal entitlements (P), on-board meal deduction (Q/OBOPMA), layover &
+    turnaround overnights, SCHBLK-guaranteed split-rate productivity, APIT."""
+    cat = prof["cat"]
+    rate = float(prof["rate"])
+    flights = [(i, r) for i, r in enumerate(rows) if r["Type"] == "FLIGHT"]
+
+    def win(r):
+        return (r.get("CIdt") or r.get("DEPdt")), (r.get("COdt") or r.get("ARRdt"))
+
+    def is_layover_paired(i):
+        return any(0 <= j < len(rows) and rows[j]["Type"] == "LAYOVER" for j in (i - 1, i + 1))
+
+    ent = [0, 0, 0]      # entitled meals B/L/D (sheet col P)
+    ob = [0, 0, 0]       # on-board meals (sheet col Q — deducted)
+    detail = []
+    for i, r in flights:
+        s, e = win(r)
+        if s and e and is_layover_paired(i):
+            b, l, d = _meal_counts(s, e)
+            for k, v in enumerate((b, l, d)):
+                ent[k] += v
+                ob[k] += v
+            detail.append((f"✈ {r['Flight / Code']} ({r['Route']})", f"{b}B {l}L {d}D", "on board"))
+
+    l_nights = 0
+    for i, r in enumerate(rows):
+        if r["Type"] != "LAYOVER":
+            continue
+        pf = next((rows[j] for j in range(i - 1, -1, -1) if rows[j]["Type"] == "FLIGHT"), None)
+        nf = next((rows[j] for j in range(i + 1, len(rows)) if rows[j]["Type"] == "FLIGHT"), None)
+        hs = r.get("CIdt") or ((pf.get("COdt") or pf.get("ARRdt")) if pf else None)
+        he = r.get("COdt") or ((nf.get("CIdt") or nf.get("DEPdt")) if nf else None)
+        pf_end = (pf.get("COdt") or pf.get("ARRdt")) if pf else None
+        ms = max(hs, pf_end) if (hs and pf_end) else (hs or pf_end)
+        if ms and he:
+            b, l, d = _meal_counts(ms, he)
+            for k, v in enumerate((b, l, d)):
+                ent[k] += v
+            detail.append((f"🏨 Layover {r['Route']}", f"{b}B {l}L {d}D", "hotel"))
+        if hs:
+            end_ref = (nf["ARRdt"].date() if (nf and nf.get("ARRdt"))
+                       else (r["EndDateObj"].date() if r.get("EndDateObj") else hs.date()))
+            l_nights += max(0, (end_ref - hs.date()).days)
+
+    t_on = 0
+    for i, r in flights:
+        if is_layover_paired(i):
+            continue
+        s, e = win(r)
+        if s and e and s.date() != e.date():
+            t_on += 1
+
+    block_min = sum(int((r["ARRdt"] - r["DEPdt"]).total_seconds() // 60)
+                    for _, r in flights if r.get("ARRdt") and r.get("DEPdt"))
+    leave_days = sum(1 for r in rows if r["Type"] == "LEAVE")
+
+    # --- productivity pay (Breakdown!B6/B7/B8/C15) ---
+    final_min = max(block_min, int(prof["schblk_min"]))
+    m75, mex = min(final_min, SPLIT_MIN), max(0, final_min - SPLIT_MIN)
+    r75, rex = HOURLY_PAY[cat]
+    ob_count = sum(ob)
+    ent_count = sum(ent)
+    ob_deduct_rs = ob_count * MEAL_RATE_USD * rate
+    productivity_rs = (m75 * r75 / 60 + mex * rex / 60) * rate - ob_deduct_rs
+
+    premium = SPECIAL_PREMIUM[cat]
+    leave_rs = leave_days * LEAVE_RATE_RS[cat]
+    earnings = (float(prof["basic"]) + premium + float(prof["crge"])
+                + productivity_rs + float(prof.get("fbpp", 0)) + leave_rs)
+
+    epf = round((float(prof["basic"]) + premium) * float(prof.get("epf_pct", 10)) / 100)
+    tax = apit_tax(earnings)
+    fest = 5000 if prof.get("festival") else 0
+    deductions = (epf + float(prof["transport"]) + float(prof["medical"]) + float(prof["fau"])
+                  + fest + float(prof.get("stamp", 0)) + float(prof.get("apiit", 0)) + tax)
+    net = earnings - deductions
+
+    meal_usd = ent_count * MEAL_RATE_USD
+    on_usd = l_nights * OVERNIGHT_RATE_USD[cat]
+    ta_on_usd = t_on * OVERNIGHT_RATE_USD[cat]
+    return {
+        "block_min": block_min, "final_min": final_min, "m75": m75, "mex": mex,
+        "ent": ent, "ent_count": ent_count, "ob_count": ob_count, "detail": detail,
+        "l_nights": l_nights, "t_on": t_on, "leave_days": leave_days,
+        "productivity_rs": productivity_rs, "ob_deduct_rs": ob_deduct_rs,
+        "premium": premium, "leave_rs": leave_rs,
+        "earnings": earnings, "epf": epf, "tax": tax, "festival": fest,
+        "deductions": deductions, "net": net,
+        "meal_usd": meal_usd, "on_usd": on_usd, "ta_on_usd": ta_on_usd,
+        "allow_usd_total": meal_usd + on_usd + ta_on_usd,
+        "allow_rs_total": (meal_usd + on_usd + ta_on_usd) * rate,
+    }
 
 # --- 4. STREAMLIT CONFIG & UI ---
 st.set_page_config(page_title="Crew Companion", page_icon="✈️", layout="wide")
@@ -1206,256 +1373,361 @@ else:
             st.session_state['logged_in'] = False
             st.rerun()
 
-    left_col, main_col, right_col = st.columns([1, 2.3, 1.3])
+    page_dash, page_salary = st.tabs(["📋 Dashboard", "💰 Salary Calculator"])
 
-    # ---------- LEFT: ANALYTICS & FATIGUE ----------
-    with left_col:
-        st.markdown("#### Analytics & Fatigue Tracker")
-        pct = analytics["block_hrs"] / analytics["block_target"] if analytics["block_target"] else 0
-        donut = donut_svg(pct, str(analytics["block_hrs"]), f"of {analytics['block_target']} hrs")
-        st.markdown(
-            f"<div class='card' style='text-align:center;'><h5>Cumulative Block Hours</h5>"
-            f"{donut}"
-            f"<div class='muted'>this roster ({pct*100:.0f}%) · {analytics['flights']} sectors</div></div>",
-            unsafe_allow_html=True)
-        spark = sparkline_svg([analytics['daily_min'].get(d, 0) for d in sorted(analytics['daily_min'])] or [0])
-        fat_color = "#4caf50" if analytics['fatigue'] < 4 else ("#ff9800" if analytics['fatigue'] < 7 else "#ff5252")
-        st.markdown(
-            f"<div class='card' style='text-align:center;'><h5>Fatigue Score</h5>"
-            f"{gauge_svg(analytics['fatigue'])}"
-            f"<div style='color:{fat_color};font-weight:700;font-size:14px;'>{analytics['fatigue_label']} ({analytics['fatigue']}/10)</div>"
-            f"<div style='margin-top:6px;'>{spark}</div>"
-            f"<div class='muted'>{analytics['redeyes']} red-eye dep · {analytics['max_streak']} consecutive duty days</div></div>",
-            unsafe_allow_html=True)
-        rows_html = "".join(f"<div class='bidrow'><span>{s} × {n} night(s)</span><span>${t}</span></div>"
-                            for s, n, r_, t in analytics['allowance_rows']) or "<div class='muted'>No layovers parsed.</div>"
-        st.markdown(
-            f"<div class='card'><h5>Estimated Allowances</h5>"
-            f"<div style='font-size:26px;font-weight:800;color:#4caf50;'>${analytics['allowance_total']:,} USD</div>"
-            f"<div class='muted' style='margin-bottom:6px;'>Total calculated per diem</div>{rows_html}</div>",
-            unsafe_allow_html=True)
+    with page_dash:
+        left_col, main_col, right_col = st.columns([1, 2.3, 1.3])
 
-    # ---------- CENTER: CALENDAR + LAYOVER INTEL ----------
-    with main_col:
-        st.markdown("#### Main Roster Calendar View")
-        with st.expander("📝 Paste Roster (Instant Parse)"):
-            roster_input = st.text_area("Paste Raw Roster Here", value=st.session_state['current_roster'], height=120)
-            if st.button("Auto-Process Roster"):
-                if roster_input.strip():
-                    save_roster_to_db(st.session_state['username'], roster_input)
-                    st.session_state['current_roster'] = roster_input
-                    st.success("Roster updated!")
-                    st.rerun()
-                else:
-                    st.warning("Please paste roster text.")
-
-        # 28-day roster period navigation (anchored to known 04Oct26-01Nov26 period)
-        if valid_dates_all:
-            pmin = roster_period_bounds(min(valid_dates_all))[0]
-            pmax = roster_period_bounds(max(valid_dates_all))[0]
-            periods, p = [], pmin
-            while p <= pmax:
-                periods.append((p, p + timedelta(days=ROSTER_PERIOD_DAYS)))
-                p += timedelta(days=ROSTER_PERIOD_DAYS)
-            starts = [x[0] for x in periods]
-            t0 = roster_period_bounds(datetime.now().date())[0]
-            if 'cal_period_idx' not in st.session_state or st.session_state['cal_period_idx'] >= len(periods):
-                st.session_state['cal_period_idx'] = starts.index(t0) if t0 in starts else 0
-            idx = st.session_state['cal_period_idx']
-            nav1, nav2, nav3 = st.columns([1, 4, 1])
-            with nav1:
-                if st.button("‹", use_container_width=True, disabled=idx == 0):
-                    st.session_state['cal_period_idx'] -= 1
-                    st.rerun()
-            with nav3:
-                if st.button("›", use_container_width=True, disabled=idx == len(periods) - 1):
-                    st.session_state['cal_period_idx'] += 1
-                    st.rerun()
-            with nav2:
-                p0, p1 = periods[idx]
-                st.markdown(f"<div style='text-align:center;font-weight:700;padding-top:6px;'>Roster Period: {p0.strftime('%d %b')} – {p1.strftime('%d %b %Y')}</div>", unsafe_allow_html=True)
-            sel_span = periods[idx]
-        else:
-            sel_span = None
-
-        st.markdown(f"<div class='card'>{build_calendar_html(parsed_rows, span=sel_span)}</div>", unsafe_allow_html=True)
-
-        # Layover Intel
-        layovers = [lv for lv in analytics["layovers"] if lv["station"]]
-        if layovers:
-            opts = list(range(len(layovers)))
-            today = datetime.now().date()
-            def_idx = next((i for i, lv in enumerate(layovers) if lv["date"] and lv["date"] >= today), 0)
-            sel = st.selectbox("Layover Intel:", opts, index=def_idx,
-                               format_func=lambda i: f"{STATION_INFO.get(layovers[i]['station'], (layovers[i]['station'],))[0]} ({layovers[i]['station']}) — {layovers[i]['date'].strftime('%d %b') if layovers[i]['date'] else '?'}")
-            lv = layovers[sel]
-            wx = fetch_station_weather(lv["station"])
-            info = STATION_INFO.get(lv["station"])
-            spots = (info[4] if info and info[4] else DEFAULT_SPOTS)
-            city = wx["city"] if wx else lv["station"]
-            wx_html = (f"{wx['icon']} {wx['temp']}°C · {wx['desc']}" if wx and wx["temp"] is not None else "n/a")
-            lt_html = f"{wx['local_time']} ({wx['gmt']})" if wx else "-"
-            gt_html = f"{lv['ground_hrs']} hrs" if lv["ground_hrs"] else "-"
-            spots_html = "".join(f"<span class='spot'>{s}</span>" for s in spots)
+        # ---------- LEFT: ANALYTICS & FATIGUE ----------
+        with left_col:
+            st.markdown("#### Analytics & Fatigue Tracker")
+            pct = analytics["block_hrs"] / analytics["block_target"] if analytics["block_target"] else 0
+            donut = donut_svg(pct, str(analytics["block_hrs"]), f"of {analytics['block_target']} hrs")
             st.markdown(
-                f"<div class='card' style='border-color:#00bcd4;'>"
-                f"<h5>🏨 Layover Intel: {city} ({lv['station']})" + (f" — {lv['date'].strftime('%d %b')}" if lv['date'] else "") + "</h5>"
-                f"<div style='display:flex;gap:28px;font-size:13px;margin-bottom:10px;'>"
-                f"<div><div class='muted'>Weather (live)</div>{wx_html}</div>"
-                f"<div><div class='muted'>Local Time</div>{lt_html}</div>"
-                f"<div><div class='muted'>Ground Time</div>{gt_html}</div></div>"
-                f"<div class='muted' style='margin-bottom:4px;'>Explore Spots</div>{spots_html}</div>",
+                f"<div class='card' style='text-align:center;'><h5>Cumulative Block Hours</h5>"
+                f"{donut}"
+                f"<div class='muted'>this roster ({pct*100:.0f}%) · {analytics['flights']} sectors</div></div>",
                 unsafe_allow_html=True)
-        elif active_text:
-            st.info("No layovers detected in roster for Layover Intel.")
-        else:
-            st.info("Paste your roster above to populate the calendar, analytics and layover intel.")
-
-        # ---------- ROSTER GUARDIAN: FAU SOFT-RULES AUDIT ----------
-        if parsed_rows:
-            st.markdown("#### 🛡 Roster Guardian — FAU Soft-Rules Audit")
-            findings = audit_roster(parsed_rows)
-            violations = [f for f in findings if f[0] == "violation"]
-            notes = [f for f in findings if f[0] == "note"]
-            if not findings:
-                st.markdown(
-                    "<div class='card' style='border-color:#4caf50;'><span style='color:#a5d6a7;'>✅ No soft-rule breaches detected in this roster "
-                    "(min rest, post-flight day-off entitlements, next-day assignment limits all OK).</span></div>",
-                    unsafe_allow_html=True)
-            else:
-                st.markdown(
-                    f"<div class='card' style='border-color:#ff5252;'><b style='color:#ff8a8a;'>{len(violations)} possible breach(es)</b>"
-                    + (f" · <span style='color:#ffb74d;'>{len(notes)} advisory note(s)</span>" if notes else "") +
-                    "<div class='muted' style='margin-top:4px;'>Cross-check with crew control before filing — parser-based audit, scheduled times only.</div></div>",
-                    unsafe_allow_html=True)
-                for sev, msg in findings:
-                    if sev == "violation":
-                        st.markdown(f"<div style='font-size:12.5px;background:#2c1f1f;border:1px solid #ff5252;color:#ff8a8a;padding:10px;border-radius:8px;margin-bottom:8px;'>⚠️ {msg}</div>", unsafe_allow_html=True)
-                    else:
-                        st.markdown(f"<div style='font-size:12.5px;background:#33260f;border:1px solid #ffc107;color:#ffd54f;padding:10px;border-radius:8px;margin-bottom:8px;'>ℹ️ {msg}</div>", unsafe_allow_html=True)
-            with st.expander("📖 FAU quick reference (standby insertion & rules summary)"):
-                st.markdown("""
-- **Min base rest:** 17h30 from chocks-on to next flight/ground-duty report (not ground→ground).
-- **DEL / BOM / KHI turnarounds** arriving 12:00–23:59 → next day: no turnaround before 23:00 report; 23:00–05:59 regional (<4h sector) only; anything after 06:00 on day 2.
-- **DEL / BOM / KHI turnarounds** arriving 00:01–11:59 → **24h rest** chocks-on to next report.
-- **Four-sector days** (arrival before 17:30) → next day: 1-sector layover after 18:00 only; same turnaround limits as above; SBY4 insertable.
-- **DXB / AUH / MCT turnarounds** → next day: 1-sector layover after 16:00 only; same turnaround limits; SBY4 insertable.
-- **UL231/232 (DXB)** → next day only SBY2 (06:00–18:00) or a flight within that window.
-- **LHR / FRA / CDG / FCO / MXP / NRT / SYD / MEL layovers & JED turnaround** → arrival day + **2 days off**.
-- **DOH / BAH / DMM turnarounds** → arrival day + **1 day off**.
-- **SIN / KUL / CGK morning turnarounds** → next-day flights report after 18:00, or SBY4.
-- **Standby insertion if your flight cancels:** morning T/A (report after 06:00) → SBY2 · morning T/A (report before 06:00) → SBY1 · Middle-East flight reporting before 18:00 → SBY3 · midnight flight reporting before midnight → SBY4 · midnight flight reporting after midnight → SBY1.
-- Duty leave counts as a duty day.
-                """)
-
-    # ---------- RIGHT: AGENT ALERTS + BIDDING ----------
-    with right_col:
-        st.markdown("#### Flight Monitoring Agent")
-        agent_on = st.toggle("Agent: Real-Time Flight Monitor", value=True)
-
-        available_roster_dates = sorted(set(valid_dates_all))
-        if available_roster_dates:
-            real_today = datetime.now().date()
-            if real_today in available_roster_dates:
-                default_idx = available_roster_dates.index(real_today)
-            else:
-                future = [d for d in available_roster_dates if d >= real_today]
-                default_idx = available_roster_dates.index(future[0]) if future else len(available_roster_dates) - 1
-            simulated_today = st.selectbox(
-                "Roster anchor day (auto-set to today):",
-                options=available_roster_dates, index=default_idx,
-                format_func=lambda x: x.strftime("%d %b %Y") + ("  ← today" if x == real_today else ""))
-        else:
-            simulated_today = datetime.now().date()
-        simulated_tomorrow = simulated_today + timedelta(days=1)
-
-        active_target_flights, seen = [], set()
-        for row in parsed_rows:
-            if row["Type"] == "FLIGHT" and row["DateObj"] is not None:
-                fd = row["DateObj"].date()
-                if fd in [simulated_today, simulated_tomorrow]:
-                    key = (row["Flight / Code"], fd)
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    active_target_flights.append({"flight_no": row["Flight / Code"], "date_obj": fd,
-                                                  "route": row["Route"], "dep_time": row["Departure"]})
-
-        flight_check_results = []
-        if agent_on and active_target_flights:
-            with st.spinner("Querying FlightStats & Flightradar24 live feeds..."):
-                for flight in active_target_flights:
-                    telemetry = fetch_live_flight_telemetry(flight["flight_no"], flight["date_obj"],
-                                                            flight["route"], flight["dep_time"])
-                    # Rest-period impact for delayed/diverted flights
-                    rest_note = None
-                    if telemetry.get("severity") in ("delayed", "diverted"):
-                        delay_guess = None
-                        m = re.search(r'by ~(\d+) min', telemetry.get("status_message", ""))
-                        if m:
-                            delay_guess = int(m.group(1))
-                        rest_note = rest_impact_note(parsed_rows, flight["flight_no"],
-                                                     flight["date_obj"], delay_guess or 0)
-                    flight_check_results.append({"flight": flight["flight_no"], "route": flight["route"],
-                                                 "date": flight["date_obj"].strftime("%d %b %Y"),
-                                                 "delayed": telemetry["is_delayed"],
-                                                 "severity": telemetry.get("severity", "ok"),
-                                                 "status": telemetry["status_message"],
-                                                 "inbound_note": telemetry.get("inbound_note"),
-                                                 "inbound_risk": telemetry.get("inbound_risk", False),
-                                                 "rest_note": rest_note})
-        st.session_state['alert_count'] = sum(
-            1 for f in flight_check_results
-            if (f["severity"] in ("delayed", "cancelled", "diverted") or f["inbound_risk"])
-            and (f["flight"], f["date"]) not in st.session_state['acked'])
-
-        if not agent_on:
-            st.markdown("<div class='card muted'>Real-time monitor paused.</div>", unsafe_allow_html=True)
-        elif flight_check_results:
+            spark = sparkline_svg([analytics['daily_min'].get(d, 0) for d in sorted(analytics['daily_min'])] or [0])
+            fat_color = "#4caf50" if analytics['fatigue'] < 4 else ("#ff9800" if analytics['fatigue'] < 7 else "#ff5252")
             st.markdown(
-                f"<div class='card' style='font-size:12px;'><b style='color:#00bcd4;'>Agent Scan:</b> "
-                f"Verified {len(flight_check_results)} flight(s) via FlightStats/Cirium + FR24 (keyless, cached 10 min).</div>",
+                f"<div class='card' style='text-align:center;'><h5>Fatigue Score</h5>"
+                f"{gauge_svg(analytics['fatigue'])}"
+                f"<div style='color:{fat_color};font-weight:700;font-size:14px;'>{analytics['fatigue_label']} ({analytics['fatigue']}/10)</div>"
+                f"<div style='margin-top:6px;'>{spark}</div>"
+                f"<div class='muted'>{analytics['redeyes']} red-eye dep · {analytics['max_streak']} consecutive duty days</div></div>",
                 unsafe_allow_html=True)
-            for df in flight_check_results:
-                key = (df["flight"], df["date"])
-                acked = key in st.session_state['acked']
-                if df["severity"] == "cancelled":
-                    bc, bg, tc, icon = "#ff1744", "#331414", "#ff8a8a", "🚫"
-                elif df["severity"] == "diverted":
-                    bc, bg, tc, icon = "#ff6d00", "#332414", "#ffb74d", "🔀"
-                elif df["severity"] == "delayed":
-                    bc, bg, tc, icon = "#ff5252", "#2c1f1f", "#ff8a8a", "⚠️"
-                elif df["severity"] == "unknown":
-                    bc, bg, tc, icon = "#607d8b", "#1c2429", "#b0bec5", "ℹ️"
-                else:
-                    bc, bg, tc, icon = "#4caf50", "#12301f", "#a5d6a7", "✈️"
-                op = "opacity:.5;" if acked else ""
-                extra = ""
-                if df.get("inbound_note"):
-                    inb_bc = "#ff6d00" if df["inbound_risk"] else "#ffc107"
-                    extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#2b2413;"
-                              f"border:1px solid {inb_bc};color:#ffd54f;font-size:11.5px;'>{df['inbound_note']}</div>")
-                if df.get("rest_note"):
-                    rest_bad = "BELOW" in df["rest_note"]
-                    r_bc = "#ff5252" if rest_bad else "#4caf50"
-                    r_tc = "#ff8a8a" if rest_bad else "#a5d6a7"
-                    extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#131f2b;"
-                              f"border:1px solid {r_bc};color:{r_tc};font-size:11.5px;'>{df['rest_note']}</div>")
-                st.markdown(
-                    f"<div style='font-size:13px;background:{bg};padding:12px;border-radius:8px;margin-top:10px;border:1px solid {bc};{op}'>"
-                    f"{icon} <b style='font-size:14px;'>{df['flight']}</b> ({df['route']}) — <span style='color:#ccc;'><i>{df['date']}</i></span>"
-                    f"<div style='margin-top:5px;color:{tc};font-size:12px;'>{df['status']}</div>{extra}</div>",
-                    unsafe_allow_html=True)
-                if (df["severity"] in ("delayed", "cancelled", "diverted") or df["inbound_risk"]) and not acked:
-                    if st.button("Acknowledge", key=f"ack_{df['flight']}_{df['date']}", use_container_width=True):
-                        st.session_state['acked'].add(key)
+            rows_html = "".join(f"<div class='bidrow'><span>{s} × {n} night(s)</span><span>${t}</span></div>"
+                                for s, n, r_, t in analytics['allowance_rows']) or "<div class='muted'>No layovers parsed.</div>"
+            st.markdown(
+                f"<div class='card'><h5>Estimated Allowances</h5>"
+                f"<div style='font-size:26px;font-weight:800;color:#4caf50;'>${analytics['allowance_total']:,} USD</div>"
+                f"<div class='muted' style='margin-bottom:6px;'>Total calculated per diem</div>{rows_html}</div>",
+                unsafe_allow_html=True)
+
+        # ---------- CENTER: CALENDAR + LAYOVER INTEL ----------
+        with main_col:
+            st.markdown("#### Main Roster Calendar View")
+            with st.expander("📝 Paste Roster (Instant Parse)"):
+                roster_input = st.text_area("Paste Raw Roster Here", value=st.session_state['current_roster'], height=120)
+                if st.button("Auto-Process Roster"):
+                    if roster_input.strip():
+                        save_roster_to_db(st.session_state['username'], roster_input)
+                        st.session_state['current_roster'] = roster_input
+                        st.success("Roster updated!")
                         st.rerun()
-            if st.button("🔄 Force Refresh Live Data", use_container_width=True):
-                fr24_fetch_flight_history.clear()
-                flightstats_fetch.clear()
-                fr24_fetch_by_reg.clear()
-                st.rerun()
-        else:
-            st.markdown(
-                f"<div class='card muted'>No flights found for {simulated_today.strftime('%d %b')} or {simulated_tomorrow.strftime('%d %b')}.</div>",
-                unsafe_allow_html=True)
+                    else:
+                        st.warning("Please paste roster text.")
+
+            # 28-day roster period navigation (anchored to known 04Oct26-01Nov26 period)
+            if valid_dates_all:
+                pmin = roster_period_bounds(min(valid_dates_all))[0]
+                pmax = roster_period_bounds(max(valid_dates_all))[0]
+                periods, p = [], pmin
+                while p <= pmax:
+                    periods.append((p, p + timedelta(days=ROSTER_PERIOD_DAYS)))
+                    p += timedelta(days=ROSTER_PERIOD_DAYS)
+                starts = [x[0] for x in periods]
+                t0 = roster_period_bounds(datetime.now().date())[0]
+                if 'cal_period_idx' not in st.session_state or st.session_state['cal_period_idx'] >= len(periods):
+                    st.session_state['cal_period_idx'] = starts.index(t0) if t0 in starts else 0
+                idx = st.session_state['cal_period_idx']
+                nav1, nav2, nav3 = st.columns([1, 4, 1])
+                with nav1:
+                    if st.button("‹", use_container_width=True, disabled=idx == 0):
+                        st.session_state['cal_period_idx'] -= 1
+                        st.rerun()
+                with nav3:
+                    if st.button("›", use_container_width=True, disabled=idx == len(periods) - 1):
+                        st.session_state['cal_period_idx'] += 1
+                        st.rerun()
+                with nav2:
+                    p0, p1 = periods[idx]
+                    st.markdown(f"<div style='text-align:center;font-weight:700;padding-top:6px;'>Roster Period: {p0.strftime('%d %b')} – {p1.strftime('%d %b %Y')}</div>", unsafe_allow_html=True)
+                sel_span = periods[idx]
+            else:
+                sel_span = None
+
+            st.markdown(f"<div class='card'>{build_calendar_html(parsed_rows, span=sel_span)}</div>", unsafe_allow_html=True)
+
+            # Layover Intel
+            layovers = [lv for lv in analytics["layovers"] if lv["station"]]
+            if layovers:
+                opts = list(range(len(layovers)))
+                today = datetime.now().date()
+                def_idx = next((i for i, lv in enumerate(layovers) if lv["date"] and lv["date"] >= today), 0)
+                sel = st.selectbox("Layover Intel:", opts, index=def_idx,
+                                   format_func=lambda i: f"{STATION_INFO.get(layovers[i]['station'], (layovers[i]['station'],))[0]} ({layovers[i]['station']}) — {layovers[i]['date'].strftime('%d %b') if layovers[i]['date'] else '?'}")
+                lv = layovers[sel]
+                wx = fetch_station_weather(lv["station"])
+                info = STATION_INFO.get(lv["station"])
+                spots = (info[4] if info and info[4] else DEFAULT_SPOTS)
+                city = wx["city"] if wx else lv["station"]
+                wx_html = (f"{wx['icon']} {wx['temp']}°C · {wx['desc']}" if wx and wx["temp"] is not None else "n/a")
+                lt_html = f"{wx['local_time']} ({wx['gmt']})" if wx else "-"
+                gt_html = f"{lv['ground_hrs']} hrs" if lv["ground_hrs"] else "-"
+                spots_html = "".join(f"<span class='spot'>{s}</span>" for s in spots)
+                st.markdown(
+                    f"<div class='card' style='border-color:#00bcd4;'>"
+                    f"<h5>🏨 Layover Intel: {city} ({lv['station']})" + (f" — {lv['date'].strftime('%d %b')}" if lv['date'] else "") + "</h5>"
+                    f"<div style='display:flex;gap:28px;font-size:13px;margin-bottom:10px;'>"
+                    f"<div><div class='muted'>Weather (live)</div>{wx_html}</div>"
+                    f"<div><div class='muted'>Local Time</div>{lt_html}</div>"
+                    f"<div><div class='muted'>Ground Time</div>{gt_html}</div></div>"
+                    f"<div class='muted' style='margin-bottom:4px;'>Explore Spots</div>{spots_html}</div>",
+                    unsafe_allow_html=True)
+            elif active_text:
+                st.info("No layovers detected in roster for Layover Intel.")
+            else:
+                st.info("Paste your roster above to populate the calendar, analytics and layover intel.")
+
+            # ---------- ROSTER GUARDIAN: FAU SOFT-RULES AUDIT ----------
+            if parsed_rows:
+                st.markdown("#### 🛡 Roster Guardian — FAU Soft-Rules Audit")
+                findings = audit_roster(parsed_rows)
+                violations = [f for f in findings if f[0] == "violation"]
+                notes = [f for f in findings if f[0] == "note"]
+                if not findings:
+                    st.markdown(
+                        "<div class='card' style='border-color:#4caf50;'><span style='color:#a5d6a7;'>✅ No soft-rule breaches detected in this roster "
+                        "(min rest, post-flight day-off entitlements, next-day assignment limits all OK).</span></div>",
+                        unsafe_allow_html=True)
+                else:
+                    st.markdown(
+                        f"<div class='card' style='border-color:#ff5252;'><b style='color:#ff8a8a;'>{len(violations)} possible breach(es)</b>"
+                        + (f" · <span style='color:#ffb74d;'>{len(notes)} advisory note(s)</span>" if notes else "") +
+                        "<div class='muted' style='margin-top:4px;'>Cross-check with crew control before filing — parser-based audit, scheduled times only.</div></div>",
+                        unsafe_allow_html=True)
+                    for sev, msg in findings:
+                        if sev == "violation":
+                            st.markdown(f"<div style='font-size:12.5px;background:#2c1f1f;border:1px solid #ff5252;color:#ff8a8a;padding:10px;border-radius:8px;margin-bottom:8px;'>⚠️ {msg}</div>", unsafe_allow_html=True)
+                        else:
+                            st.markdown(f"<div style='font-size:12.5px;background:#33260f;border:1px solid #ffc107;color:#ffd54f;padding:10px;border-radius:8px;margin-bottom:8px;'>ℹ️ {msg}</div>", unsafe_allow_html=True)
+                with st.expander("📖 FAU quick reference (standby insertion & rules summary)"):
+                    st.markdown("""
+    - **Min base rest:** 17h30 from chocks-on to next flight/ground-duty report (not ground→ground).
+    - **DEL / BOM / KHI turnarounds** arriving 12:00–23:59 → next day: no turnaround before 23:00 report; 23:00–05:59 regional (<4h sector) only; anything after 06:00 on day 2.
+    - **DEL / BOM / KHI turnarounds** arriving 00:01–11:59 → **24h rest** chocks-on to next report.
+    - **Four-sector days** (arrival before 17:30) → next day: 1-sector layover after 18:00 only; same turnaround limits as above; SBY4 insertable.
+    - **DXB / AUH / MCT turnarounds** → next day: 1-sector layover after 16:00 only; same turnaround limits; SBY4 insertable.
+    - **UL231/232 (DXB)** → next day only SBY2 (06:00–18:00) or a flight within that window.
+    - **LHR / FRA / CDG / FCO / MXP / NRT / SYD / MEL layovers & JED turnaround** → arrival day + **2 days off**.
+    - **DOH / BAH / DMM turnarounds** → arrival day + **1 day off**.
+    - **SIN / KUL / CGK morning turnarounds** → next-day flights report after 18:00, or SBY4.
+    - **Standby insertion if your flight cancels:** morning T/A (report after 06:00) → SBY2 · morning T/A (report before 06:00) → SBY1 · Middle-East flight reporting before 18:00 → SBY3 · midnight flight reporting before midnight → SBY4 · midnight flight reporting after midnight → SBY1.
+    - Duty leave counts as a duty day.
+                    """)
+
+        # ---------- RIGHT: AGENT ALERTS + BIDDING ----------
+        with right_col:
+            st.markdown("#### Flight Monitoring Agent")
+            agent_on = st.toggle("Agent: Real-Time Flight Monitor", value=True)
+
+            available_roster_dates = sorted(set(valid_dates_all))
+            if available_roster_dates:
+                real_today = datetime.now().date()
+                if real_today in available_roster_dates:
+                    default_idx = available_roster_dates.index(real_today)
+                else:
+                    future = [d for d in available_roster_dates if d >= real_today]
+                    default_idx = available_roster_dates.index(future[0]) if future else len(available_roster_dates) - 1
+                simulated_today = st.selectbox(
+                    "Roster anchor day (auto-set to today):",
+                    options=available_roster_dates, index=default_idx,
+                    format_func=lambda x: x.strftime("%d %b %Y") + ("  ← today" if x == real_today else ""))
+            else:
+                simulated_today = datetime.now().date()
+            simulated_tomorrow = simulated_today + timedelta(days=1)
+
+            active_target_flights, seen = [], set()
+            for row in parsed_rows:
+                if row["Type"] == "FLIGHT" and row["DateObj"] is not None:
+                    fd = row["DateObj"].date()
+                    if fd in [simulated_today, simulated_tomorrow]:
+                        key = (row["Flight / Code"], fd)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        active_target_flights.append({"flight_no": row["Flight / Code"], "date_obj": fd,
+                                                      "route": row["Route"], "dep_time": row["Departure"]})
+
+            flight_check_results = []
+            if agent_on and active_target_flights:
+                with st.spinner("Querying FlightStats & Flightradar24 live feeds..."):
+                    for flight in active_target_flights:
+                        telemetry = fetch_live_flight_telemetry(flight["flight_no"], flight["date_obj"],
+                                                                flight["route"], flight["dep_time"])
+                        # Rest-period impact for delayed/diverted flights
+                        rest_note = None
+                        if telemetry.get("severity") in ("delayed", "diverted"):
+                            delay_guess = None
+                            m = re.search(r'by ~(\d+) min', telemetry.get("status_message", ""))
+                            if m:
+                                delay_guess = int(m.group(1))
+                            rest_note = rest_impact_note(parsed_rows, flight["flight_no"],
+                                                         flight["date_obj"], delay_guess or 0)
+                        flight_check_results.append({"flight": flight["flight_no"], "route": flight["route"],
+                                                     "date": flight["date_obj"].strftime("%d %b %Y"),
+                                                     "delayed": telemetry["is_delayed"],
+                                                     "severity": telemetry.get("severity", "ok"),
+                                                     "status": telemetry["status_message"],
+                                                     "inbound_note": telemetry.get("inbound_note"),
+                                                     "inbound_risk": telemetry.get("inbound_risk", False),
+                                                     "rest_note": rest_note})
+            st.session_state['alert_count'] = sum(
+                1 for f in flight_check_results
+                if (f["severity"] in ("delayed", "cancelled", "diverted") or f["inbound_risk"])
+                and (f["flight"], f["date"]) not in st.session_state['acked'])
+
+            if not agent_on:
+                st.markdown("<div class='card muted'>Real-time monitor paused.</div>", unsafe_allow_html=True)
+            elif flight_check_results:
+                st.markdown(
+                    f"<div class='card' style='font-size:12px;'><b style='color:#00bcd4;'>Agent Scan:</b> "
+                    f"Verified {len(flight_check_results)} flight(s) via FlightStats/Cirium + FR24 (keyless, cached 10 min).</div>",
+                    unsafe_allow_html=True)
+                for df in flight_check_results:
+                    key = (df["flight"], df["date"])
+                    acked = key in st.session_state['acked']
+                    if df["severity"] == "cancelled":
+                        bc, bg, tc, icon = "#ff1744", "#331414", "#ff8a8a", "🚫"
+                    elif df["severity"] == "diverted":
+                        bc, bg, tc, icon = "#ff6d00", "#332414", "#ffb74d", "🔀"
+                    elif df["severity"] == "delayed":
+                        bc, bg, tc, icon = "#ff5252", "#2c1f1f", "#ff8a8a", "⚠️"
+                    elif df["severity"] == "unknown":
+                        bc, bg, tc, icon = "#607d8b", "#1c2429", "#b0bec5", "ℹ️"
+                    else:
+                        bc, bg, tc, icon = "#4caf50", "#12301f", "#a5d6a7", "✈️"
+                    op = "opacity:.5;" if acked else ""
+                    extra = ""
+                    if df.get("inbound_note"):
+                        inb_bc = "#ff6d00" if df["inbound_risk"] else "#ffc107"
+                        extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#2b2413;"
+                                  f"border:1px solid {inb_bc};color:#ffd54f;font-size:11.5px;'>{df['inbound_note']}</div>")
+                    if df.get("rest_note"):
+                        rest_bad = "BELOW" in df["rest_note"]
+                        r_bc = "#ff5252" if rest_bad else "#4caf50"
+                        r_tc = "#ff8a8a" if rest_bad else "#a5d6a7"
+                        extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#131f2b;"
+                                  f"border:1px solid {r_bc};color:{r_tc};font-size:11.5px;'>{df['rest_note']}</div>")
+                    st.markdown(
+                        f"<div style='font-size:13px;background:{bg};padding:12px;border-radius:8px;margin-top:10px;border:1px solid {bc};{op}'>"
+                        f"{icon} <b style='font-size:14px;'>{df['flight']}</b> ({df['route']}) — <span style='color:#ccc;'><i>{df['date']}</i></span>"
+                        f"<div style='margin-top:5px;color:{tc};font-size:12px;'>{df['status']}</div>{extra}</div>",
+                        unsafe_allow_html=True)
+                    if (df["severity"] in ("delayed", "cancelled", "diverted") or df["inbound_risk"]) and not acked:
+                        if st.button("Acknowledge", key=f"ack_{df['flight']}_{df['date']}", use_container_width=True):
+                            st.session_state['acked'].add(key)
+                            st.rerun()
+                if st.button("🔄 Force Refresh Live Data", use_container_width=True):
+                    fr24_fetch_flight_history.clear()
+                    flightstats_fetch.clear()
+                    fr24_fetch_by_reg.clear()
+                    st.rerun()
+            else:
+                st.markdown(
+                    f"<div class='card muted'>No flights found for {simulated_today.strftime('%d %b')} or {simulated_tomorrow.strftime('%d %b')}.</div>",
+                    unsafe_allow_html=True)
+
+
+    # ================= 💰 SALARY CALCULATOR PAGE =================
+    with page_salary:
+        st.markdown("#### 💰 Salary Calculator")
+        st.markdown("<div class='muted' style='margin-bottom:10px;'>Computed from your saved roster — same engine as the FAU sheet (meals, overnights, SCHBLK guarantee, 75h split, APIT). Set your profile once; everything else is automatic.</div>", unsafe_allow_html=True)
+
+        saved = load_profile(st.session_state['username'])
+        pcol, rcol = st.columns([1, 2.2])
+
+        with pcol:
+            st.markdown("##### Crew Profile")
+            cats = list(HOURLY_PAY.keys())
+            cat = st.selectbox("Category", cats, index=cats.index(saved.get("cat", "C3")) if saved.get("cat", "C3") in cats else 5)
+            usd_rate = st.number_input("USD → LKR rate", value=float(saved.get("rate", 318.56)), step=0.01, format="%.2f")
+            schblk = st.text_input("SCHBLK (scheduled block hrs)", value=saved.get("schblk", "70h 00m"))
+            festival = st.toggle("Festival Advance taken (Rs 5,000)", value=bool(saved.get("festival", False)))
+            with st.expander("⚙️ Advanced (salary components & deductions)"):
+                basic = st.number_input("Basic Salary (Rs)", value=float(saved.get("basic", 0.0)), step=500.0)
+                crge = st.number_input("CRGE (Rs)", value=float(saved.get("crge", 10000.0)), step=500.0)
+                fbpp = st.number_input("Flt Base Pro Pay (Rs)", value=float(saved.get("fbpp", 0.0)), step=100.0)
+                transport = st.number_input("Transport deduction (Rs)", value=float(saved.get("transport", 1000.0)), step=100.0)
+                medical = st.number_input("Medical contribution (Rs)", value=float(saved.get("medical", 500.0)), step=100.0)
+                fau = st.number_input("FAU subs (Rs)", value=float(saved.get("fau", 2100.0)), step=100.0)
+                stamp = st.number_input("Stamp duty (Rs)", value=float(saved.get("stamp", 0.0)), step=5.0)
+                apiit = st.number_input("APIIT (Rs)", value=float(saved.get("apiit", 0.0)), step=100.0)
+                epf_pct = st.number_input("EPF %", value=float(saved.get("epf_pct", 10.0)), step=1.0)
+            if st.button("💾 Save Profile", use_container_width=True):
+                save_profile(st.session_state['username'],
+                             {"cat": cat, "rate": usd_rate, "schblk": schblk, "festival": festival,
+                              "basic": basic, "crge": crge, "fbpp": fbpp, "transport": transport,
+                              "medical": medical, "fau": fau, "stamp": stamp, "apiit": apiit,
+                              "epf_pct": epf_pct})
+                st.success("Profile saved — it will load automatically next time.")
+
+        with rcol:
+            flights_exist = any(r["Type"] == "FLIGHT" for r in parsed_rows)
+            if not flights_exist:
+                st.info("Paste and process your roster on the Dashboard tab first — the calculator reads it automatically.")
+            else:
+                prof = {"cat": cat, "rate": usd_rate, "schblk_min": parse_hhmm_minutes(schblk),
+                        "festival": festival, "basic": basic, "crge": crge, "fbpp": fbpp,
+                        "transport": transport, "medical": medical, "fau": fau,
+                        "stamp": stamp, "apiit": apiit, "epf_pct": epf_pct}
+                s = compute_salary(parsed_rows, prof)
+
+                h1, h2, h3 = st.columns(3)
+                h1.markdown(f"<div class='card' style='text-align:center;border-color:#4caf50;'><div class='muted'>NET SALARY (Rs)</div><div style='font-size:26px;font-weight:800;color:#4caf50;'>Rs {s['net']:,.0f}</div><div class='muted'>after tax & deductions</div></div>", unsafe_allow_html=True)
+                h2.markdown(f"<div class='card' style='text-align:center;'><div class='muted'>ALLOWANCES (USD)</div><div style='font-size:26px;font-weight:800;color:#00bcd4;'>${s['allow_usd_total']:,.0f}</div><div class='muted'>≈ Rs {s['allow_rs_total']:,.0f}</div></div>", unsafe_allow_html=True)
+                h3.markdown(f"<div class='card' style='text-align:center;'><div class='muted'>TOTAL TAKE-HOME</div><div style='font-size:26px;font-weight:800;color:#ffb74d;'>Rs {s['net'] + s['allow_rs_total']:,.0f}</div><div class='muted'>salary + allowances</div></div>", unsafe_allow_html=True)
+
+                # earnings composition bar
+                parts = [("Productivity", max(s['productivity_rs'], 0), "#00bcd4"),
+                         ("Premium", s['premium'], "#8bc34a"),
+                         ("CRGE", float(crge), "#ffb74d"),
+                         ("Basic", float(basic), "#b39ddb"),
+                         ("Leave", s['leave_rs'], "#4dd0e1")]
+                tot = sum(p[1] for p in parts) or 1
+                seg = "".join(f"<div style='width:{100*v/tot:.1f}%;background:{c};height:14px;'></div>" for _, v, c in parts if v > 0)
+                leg = " ".join(f"<span style='font-size:11px;color:{c};'>■ {n}</span>" for n, v, c in parts if v > 0)
+                st.markdown(f"<div class='card'><div class='muted' style='margin-bottom:6px;'>Earnings composition — Rs {s['earnings']:,.0f} total</div><div style='display:flex;border-radius:6px;overflow:hidden;'>{seg}</div><div style='margin-top:6px;'>{leg}</div></div>", unsafe_allow_html=True)
+
+                b1, b2 = st.columns(2)
+                with b1:
+                    st.markdown(
+                        "<div class='card'><h5>Earnings (Rs)</h5>"
+                        + f"<div class='bidrow'><span>Basic Salary</span><span>{basic:,.0f}</span></div>"
+                        + f"<div class='bidrow'><span>Special Premium ({cat})</span><span>{s['premium']:,.0f}</span></div>"
+                        + f"<div class='bidrow'><span>CRGE</span><span>{crge:,.0f}</span></div>"
+                        + f"<div class='bidrow'><span>Productivity Pay*</span><span>{s['productivity_rs']:,.1f}</span></div>"
+                        + f"<div class='bidrow'><span>Flt Base Pro Pay</span><span>{fbpp:,.0f}</span></div>"
+                        + f"<div class='bidrow'><span>Leave Pay ({s['leave_days']}d)</span><span>{s['leave_rs']:,.0f}</span></div>"
+                        + f"<div class='bidrow'><b>Total Earnings</b><b>{s['earnings']:,.1f}</b></div>"
+                        + f"<div class='muted' style='margin-top:6px;'>*{s['final_min']//60}h {s['final_min']%60}m paid ({s['m75']}min ≤75h + {s['mex']}min >75h), minus {s['ob_count']} on-board meals (−Rs {s['ob_deduct_rs']:,.0f}). Flown: {s['block_min']//60}h {s['block_min']%60}m.</div>"
+                        + "</div>", unsafe_allow_html=True)
+                with b2:
+                    st.markdown(
+                        "<div class='card'><h5>Deductions (Rs)</h5>"
+                        + f"<div class='bidrow'><span>EPF ({epf_pct:.0f}%)</span><span>{s['epf']:,.0f}</span></div>"
+                        + f"<div class='bidrow'><span>Transport</span><span>{transport:,.0f}</span></div>"
+                        + f"<div class='bidrow'><span>Medical</span><span>{medical:,.0f}</span></div>"
+                        + f"<div class='bidrow'><span>FAU Subs</span><span>{fau:,.0f}</span></div>"
+                        + f"<div class='bidrow'><span>Festival Advance</span><span>{s['festival']:,.0f}</span></div>"
+                        + f"<div class='bidrow'><span>Stamp / APIIT</span><span>{stamp + apiit:,.0f}</span></div>"
+                        + f"<div class='bidrow'><span>APIT Tax</span><span>{s['tax']:,.1f}</span></div>"
+                        + f"<div class='bidrow'><b>Total Deductions</b><b>{s['deductions']:,.1f}</b></div>"
+                        + "</div>", unsafe_allow_html=True)
+
+                st.markdown(
+                    "<div class='card'><h5>Allowances (USD — paid separately)</h5>"
+                    + f"<div class='bidrow'><span>Meals: {s['ent'][0]}B {s['ent'][1]}L {s['ent'][2]}D ({s['ent_count']} × $25)</span><span>${s['meal_usd']:,.0f}</span></div>"
+                    + f"<div class='bidrow'><span>Layover overnights ({s['l_nights']} × ${OVERNIGHT_RATE_USD[cat]})</span><span>${s['on_usd']:,.0f}</span></div>"
+                    + f"<div class='bidrow'><span>Turnaround overnights ({s['t_on']} × ${OVERNIGHT_RATE_USD[cat]})</span><span>${s['ta_on_usd']:,.0f}</span></div>"
+                    + f"<div class='bidrow'><b>Total</b><b>${s['allow_usd_total']:,.0f} ≈ Rs {s['allow_rs_total']:,.0f}</b></div>"
+                    + "</div>", unsafe_allow_html=True)
+
+                with st.expander("🍽 Meal entitlement detail (per duty)"):
+                    for name, meals, kind in s["detail"]:
+                        tag = "deducted from salary" if kind == "on board" else "hotel allowance"
+                        st.markdown(f"<div class='bidrow'><span>{name}</span><span>{meals} <span class='muted'>({tag})</span></span></div>", unsafe_allow_html=True)
+
+                st.markdown("<div class='muted' style='margin-top:8px;'>⚠️ Independent estimate for personal guidance only — refer to your official payslip for final figures.</div>", unsafe_allow_html=True)
