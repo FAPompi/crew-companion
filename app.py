@@ -1147,6 +1147,19 @@ LEAVE_RATE_RS = {"PUR>10Yrs": 2000, "PUR(5-10Yrs)": 2000, "PUR<5Yrs": 2000,
 MEAL_RATE_USD = 25.0
 SPLIT_MIN = 4500          # 75h threshold in minutes
 MEAL_TRIGGERS = [(7, 30), (12, 30), (19, 30)]   # B / L / D trigger instants
+# FBPP — Flt Base Pro Pay: paid once per TURNAROUND, on the sector arriving CMB
+# whose previous roster row is not HTL. $28 if scheduled duration > 4h, else $21.
+FBPP_OVER4_USD, FBPP_UNDER4_USD, FBPP_SPLIT_MIN = 28, 21, 240
+UL_SCHED_MIN = {  # scheduled durations (minutes) from the sheet's "UL #" tab
+    "UL102": 170, "UL104": 170, "UL116": 170, "UL1174": 175, "UL120": 230,
+    "UL122": 170, "UL124": 170, "UL128": 170, "UL132": 120, "UL134": 120,
+    "UL138": 110, "UL140": 110, "UL142": 300, "UL144": 305, "UL152": 430,
+    "UL154": 470, "UL162": 120, "UL166": 145, "UL168": 145, "UL172": 175,
+    "UL174": 175, "UL178": 230, "UL182": 445, "UL184": 430, "UL186": 470,
+    "UL190": 390, "UL192": 430, "UL196": 430, "UL208": 550, "UL218": 590,
+    "UL226": 550, "UL232": 549, "UL264": 615, "UL266": 655, "UL303": 480,
+    "UL309": 480, "UL315": 445, "UL365": 555, "UL405": 415, "UL604": 1235,
+}
 
 def apit_tax(t):
     """Sri Lanka APIT slabs — identical to Breakdown!G16."""
@@ -1234,6 +1247,32 @@ def compute_salary(rows, prof):
                     for _, r in flights if r.get("ARRdt") and r.get("DEPdt"))
     leave_days = sum(1 for r in rows if r["Type"] == "LEAVE")
 
+    # --- FBPP: turnaround allowance (H&O col O formula) ---
+    # Inbound sector to CMB, previous roster row not HTL → $28 if scheduled
+    # duration > 4h else $21. Scheduled time from UL # table; falls back to
+    # actual block time for flight numbers not in the table.
+    fbpp_usd = 0.0
+    fbpp_items = []
+    for i, r in flights:
+        _o, _d = _route_od(r["Route"])
+        if _d != "CMB":
+            continue
+        if i - 1 >= 0 and rows[i - 1]["Type"] == "LAYOVER":
+            continue  # returning from a layover — not a turnaround
+        fl = str(r["Flight / Code"]).replace(" ", "").upper()
+        sched = UL_SCHED_MIN.get(fl)
+        approx = False
+        if sched is None:
+            if r.get("ARRdt") and r.get("DEPdt"):
+                sched = int((r["ARRdt"] - r["DEPdt"]).total_seconds() // 60)
+                approx = True
+            else:
+                continue
+        amt = FBPP_OVER4_USD if sched > FBPP_SPLIT_MIN else FBPP_UNDER4_USD
+        fbpp_usd += amt
+        fbpp_items.append((f"{fl} {_o}➔CMB", sched, amt, approx))
+    fbpp_rs = fbpp_usd * rate
+
     # --- productivity pay (Breakdown!B6/B7/B8/C15) ---
     final_min = max(block_min, int(prof["schblk_min"]))
     m75, mex = min(final_min, SPLIT_MIN), max(0, final_min - SPLIT_MIN)
@@ -1246,7 +1285,7 @@ def compute_salary(rows, prof):
     premium = SPECIAL_PREMIUM[cat]
     leave_rs = leave_days * LEAVE_RATE_RS[cat]
     earnings = (float(prof["basic"]) + premium + float(prof["crge"])
-                + productivity_rs + float(prof.get("fbpp", 0)) + leave_rs)
+                + productivity_rs + fbpp_rs + leave_rs)
 
     epf = round((float(prof["basic"]) + premium) * float(prof.get("epf_pct", 10)) / 100)
     tax = apit_tax(earnings)
@@ -1263,6 +1302,7 @@ def compute_salary(rows, prof):
         "ent": ent, "ent_count": ent_count, "ob_count": ob_count, "detail": detail,
         "l_nights": l_nights, "t_on": t_on, "leave_days": leave_days,
         "productivity_rs": productivity_rs, "ob_deduct_rs": ob_deduct_rs,
+        "fbpp_usd": fbpp_usd, "fbpp_rs": fbpp_rs, "fbpp_items": fbpp_items,
         "premium": premium, "leave_rs": leave_rs,
         "earnings": earnings, "epf": epf, "tax": tax, "festival": fest,
         "deductions": deductions, "net": net,
@@ -1670,7 +1710,6 @@ else:
             with st.expander("⚙️ Advanced (salary components & deductions)"):
                 basic = st.number_input("Basic Salary (Rs)", value=float(saved.get("basic", 0.0)), step=500.0)
                 crge = st.number_input("CRGE (Rs)", value=float(saved.get("crge", 10000.0)), step=500.0)
-                fbpp = st.number_input("Flt Base Pro Pay (Rs)", value=float(saved.get("fbpp", 0.0)), step=100.0)
                 transport = st.number_input("Transport deduction (Rs)", value=float(saved.get("transport", 1000.0)), step=100.0)
                 medical = st.number_input("Medical contribution (Rs)", value=float(saved.get("medical", 500.0)), step=100.0)
                 fau = st.number_input("FAU subs (Rs)", value=float(saved.get("fau", 2100.0)), step=100.0)
@@ -1680,7 +1719,7 @@ else:
             if st.button("💾 Save Profile", use_container_width=True):
                 save_profile(st.session_state['username'],
                              {"cat": cat, "rate": usd_rate, "schblk": schblk, "festival": festival,
-                              "basic": basic, "crge": crge, "fbpp": fbpp, "transport": transport,
+                              "basic": basic, "crge": crge, "transport": transport,
                               "medical": medical, "fau": fau, "stamp": stamp, "apiit": apiit,
                               "epf_pct": epf_pct})
                 st.success("Profile saved — it will load automatically next time.")
@@ -1691,7 +1730,7 @@ else:
                 st.session_state['performed_roster'] = load_performed_roster(st.session_state['username'])
             perf_saved = st.session_state.get('performed_roster', '')
             with st.expander("📋 Performed Roster (paste here)", expanded=not bool(perf_saved)):
-                st.markdown("<div class='muted' style='margin-bottom:6px;'>Salary is calculated on the <b>performed</b> roster for the month — paste it from the crew portal exactly like on the Dashboard. It's saved separately from your live roster.</div>", unsafe_allow_html=True)
+                st.markdown("<div class='muted' style='margin-bottom:6px;'>Salary is calculated per <b>calendar month (1st – end)</b>. Paste your <b>performed</b> roster from the crew portal — it can span two months / roster periods; you'll pick the salary month below. Saved separately from your live roster.</div>", unsafe_allow_html=True)
                 perf_input = st.text_area("Performed roster text", value=perf_saved, height=160,
                                           label_visibility="collapsed",
                                           placeholder="Paste your performed roster for the month here...")
@@ -1706,7 +1745,25 @@ else:
                     st.rerun()
 
             perf_text = st.session_state.get('performed_roster', '')
-            perf_rows = parse_roster_text(perf_text) if perf_text.strip() else []
+            perf_rows_all = parse_roster_text(perf_text) if perf_text.strip() else []
+            # Salary is per CALENDAR MONTH (1st–end), while rosters run in 28-day
+            # periods that straddle months — so filter duties to the chosen month.
+            months = sorted({(r["DateObj"].year, r["DateObj"].month)
+                             for r in perf_rows_all if r.get("DateObj")})
+            perf_rows = perf_rows_all
+            sel_month = None
+            if months:
+                def _mcount(ym):
+                    return sum(1 for r in perf_rows_all if r.get("DateObj")
+                               and (r["DateObj"].year, r["DateObj"].month) == ym
+                               and r["Type"] == "FLIGHT")
+                default_ym = max(months, key=lambda ym: (_mcount(ym), ym))
+                labels = [datetime(y, m, 1).strftime("%B %Y") for y, m in months]
+                pick = st.selectbox("Salary month (1st – end of month)", labels,
+                                    index=months.index(default_ym))
+                sel_month = months[labels.index(pick)]
+                perf_rows = [r for r in perf_rows_all if r.get("DateObj")
+                             and (r["DateObj"].year, r["DateObj"].month) == sel_month]
             flights_exist = any(r["Type"] == "FLIGHT" for r in perf_rows)
             if not flights_exist:
                 st.info("Paste your performed roster above and hit Process & Save — the payslip is computed from it instantly.")
@@ -1714,9 +1771,10 @@ else:
                 _pd = [r["DateObj"].date() for r in perf_rows if r.get("DateObj")]
                 if _pd:
                     _n_f = sum(1 for r in perf_rows if r["Type"] == "FLIGHT")
-                    st.markdown(f"<div class='muted' style='margin-bottom:8px;'>✅ Performed roster loaded: <b>{_n_f} sectors</b> · {min(_pd).strftime('%d %b')} – {max(_pd).strftime('%d %b %Y')}</div>", unsafe_allow_html=True)
+                    _mlabel = datetime(sel_month[0], sel_month[1], 1).strftime("%B %Y") if sel_month else ""
+                    st.markdown(f"<div class='muted' style='margin-bottom:8px;'>✅ Computing <b>{_mlabel}</b>: <b>{_n_f} sectors</b> · duties {min(_pd).strftime('%d %b')} – {max(_pd).strftime('%d %b')}</div>", unsafe_allow_html=True)
                 prof = {"cat": cat, "rate": usd_rate, "schblk_min": parse_hhmm_minutes(schblk),
-                        "festival": festival, "basic": basic, "crge": crge, "fbpp": fbpp,
+                        "festival": festival, "basic": basic, "crge": crge,
                         "transport": transport, "medical": medical, "fau": fau,
                         "stamp": stamp, "apiit": apiit, "epf_pct": epf_pct}
                 s = compute_salary(perf_rows, prof)
@@ -1731,6 +1789,7 @@ else:
                          ("Premium", s['premium'], "#8bc34a"),
                          ("CRGE", float(crge), "#ffb74d"),
                          ("Basic", float(basic), "#b39ddb"),
+                         ("FBPP", s['fbpp_rs'], "#f06292"),
                          ("Leave", s['leave_rs'], "#4dd0e1")]
                 tot = sum(p[1] for p in parts) or 1
                 seg = "".join(f"<div style='width:{100*v/tot:.1f}%;background:{c};height:14px;'></div>" for _, v, c in parts if v > 0)
@@ -1745,7 +1804,7 @@ else:
                         + f"<div class='bidrow'><span>Special Premium ({cat})</span><span>{s['premium']:,.0f}</span></div>"
                         + f"<div class='bidrow'><span>CRGE</span><span>{crge:,.0f}</span></div>"
                         + f"<div class='bidrow'><span>Productivity Pay*</span><span>{s['productivity_rs']:,.1f}</span></div>"
-                        + f"<div class='bidrow'><span>Flt Base Pro Pay</span><span>{fbpp:,.0f}</span></div>"
+                        + f"<div class='bidrow'><span>Flt Base Pro Pay ({len(s['fbpp_items'])} T/A · ${s['fbpp_usd']:,.0f})</span><span>{s['fbpp_rs']:,.1f}</span></div>"
                         + f"<div class='bidrow'><span>Leave Pay ({s['leave_days']}d)</span><span>{s['leave_rs']:,.0f}</span></div>"
                         + f"<div class='bidrow'><b>Total Earnings</b><b>{s['earnings']:,.1f}</b></div>"
                         + f"<div class='muted' style='margin-top:6px;'>*{s['final_min']//60}h {s['final_min']%60}m paid ({s['m75']}min ≤75h + {s['mex']}min >75h), minus {s['ob_count']} on-board meals (−Rs {s['ob_deduct_rs']:,.0f}). Flown: {s['block_min']//60}h {s['block_min']%60}m.</div>"
@@ -1775,5 +1834,12 @@ else:
                     for name, meals, kind in s["detail"]:
                         tag = "deducted from salary" if kind == "on board" else "hotel allowance"
                         st.markdown(f"<div class='bidrow'><span>{name}</span><span>{meals} <span class='muted'>({tag})</span></span></div>", unsafe_allow_html=True)
+
+                if s["fbpp_items"]:
+                    with st.expander(f"✈ FBPP turnaround detail ({len(s['fbpp_items'])} × T/A = ${s['fbpp_usd']:,.0f})"):
+                        for name, sched, amt, approx in s["fbpp_items"]:
+                            band = ">4h" if sched > FBPP_SPLIT_MIN else "≤4h"
+                            note = " · sched time est. from actual (flight not in UL table)" if approx else ""
+                            st.markdown(f"<div class='bidrow'><span>{name} <span class='muted'>({sched//60}h {sched%60:02d}m {band}{note})</span></span><span>${amt}</span></div>", unsafe_allow_html=True)
 
                 st.markdown("<div class='muted' style='margin-top:8px;'>⚠️ Independent estimate for personal guidance only — refer to your official payslip for final figures.</div>", unsafe_allow_html=True)
