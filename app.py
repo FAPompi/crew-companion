@@ -443,24 +443,291 @@ def fetch_live_flight_telemetry(flight_no, flight_date, route, scheduled_dep):
     return {"is_delayed": False, "severity": "ok",
             "status_message": f"✅ {fr.get('fr24_status', 'On time')}{live_str} — {flight_no} dep {sched} verified via Flightradar24{tail}."}
 
+# --- 3.5 ANALYTICS, STATION INTEL & WEATHER (KEYLESS) ---
+import math
+
+STATION_INFO = {
+    # iata: (city, country, lat, lon, [spots] or None)
+    "CMB": ("Colombo", "Sri Lanka", 6.9271, 79.8612, ["☕ Barefoot Garden Cafe", "🌊 Galle Face Green Walk", "🍛 Ministry of Crab"]),
+    "DXB": ("Dubai", "UAE", 25.2532, 55.3657, ["🌆 Dubai Marina Walk", "🛍 Gold Souk", "🍽 Al Seef Waterfront"]),
+    "AUH": ("Abu Dhabi", "UAE", 24.4539, 54.3773, None),
+    "DOH": ("Doha", "Qatar", 25.2854, 51.5310, ["🏛 Museum of Islamic Art", "🛍 Souq Waqif", "🌊 Corniche Walk"]),
+    "RUH": ("Riyadh", "Saudi Arabia", 24.7136, 46.6753, None),
+    "DMM": ("Dammam", "Saudi Arabia", 26.4207, 50.0888, None),
+    "JED": ("Jeddah", "Saudi Arabia", 21.4858, 39.1925, None),
+    "KWI": ("Kuwait City", "Kuwait", 29.3759, 47.9774, None),
+    "BAH": ("Manama", "Bahrain", 26.2285, 50.5860, None),
+    "MCT": ("Muscat", "Oman", 23.5880, 58.3829, None),
+    "BKK": ("Bangkok", "Thailand", 13.7563, 100.5018, ["🛕 Wat Arun (Sunset)", "🍜 Chinatown Street Food", "🛍 Chatuchak Market"]),
+    "SIN": ("Singapore", "Singapore", 1.3521, 103.8198, ["🌳 Gardens by the Bay", "🍜 Maxwell Hawker Centre", "🌆 Marina Bay Walk"]),
+    "KUL": ("Kuala Lumpur", "Malaysia", 3.1390, 101.6869, ["🌆 Petronas Towers", "🍜 Jalan Alor Food Street", "🛕 Batu Caves"]),
+    "CGK": ("Jakarta", "Indonesia", -6.2088, 106.8456, None),
+    "HKG": ("Hong Kong", "China", 22.3193, 114.1694, None),
+    "CAN": ("Guangzhou", "China", 23.1291, 113.2644, None),
+    "PVG": ("Shanghai", "China", 31.2304, 121.4737, None),
+    "PEK": ("Beijing", "China", 39.9042, 116.4074, None),
+    "ICN": ("Seoul", "South Korea", 37.5665, 126.9780, ["🏯 Gyeongbokgung Palace", "🍜 Myeongdong Street Food", "🌆 N Seoul Tower"]),
+    "NRT": ("Tokyo", "Japan", 35.6762, 139.6503, ["⛩ Senso-ji Temple", "🍣 Tsukiji Outer Market", "🌆 Shibuya Crossing"]),
+    "KIX": ("Osaka", "Japan", 34.6937, 135.5023, None),
+    "MLE": ("Malé", "Maldives", 4.1755, 73.5093, ["🏖 Artificial Beach", "🐟 Fish Market", "☕ Seagull Cafe"]),
+    "GAN": ("Gan Island", "Maldives", -0.6936, 73.1556, None),
+    "MAA": ("Chennai", "India", 13.0827, 80.2707, ["🏖 Marina Beach", "🛕 Kapaleeshwarar Temple", "🍛 Murugan Idli Shop"]),
+    "DEL": ("New Delhi", "India", 28.6139, 77.2090, ["🏛 Humayun's Tomb", "🛍 Khan Market", "🍛 Karim's Old Delhi"]),
+    "BLR": ("Bengaluru", "India", 12.9716, 77.5946, None),
+    "BOM": ("Mumbai", "India", 19.0760, 72.8777, None),
+    "HYD": ("Hyderabad", "India", 17.3850, 78.4867, None),
+    "CCU": ("Kolkata", "India", 22.5726, 88.3639, None),
+    "COK": ("Kochi", "India", 9.9312, 76.2673, None),
+    "TRV": ("Thiruvananthapuram", "India", 8.5241, 76.9366, None),
+    "TRZ": ("Tiruchirappalli", "India", 10.7905, 78.7047, None),
+    "DAC": ("Dhaka", "Bangladesh", 23.8103, 90.4125, None),
+    "KHI": ("Karachi", "Pakistan", 24.8607, 67.0011, None),
+    "LHE": ("Lahore", "Pakistan", 31.5204, 74.3587, None),
+    "SEZ": ("Mahé", "Seychelles", -4.6796, 55.4920, None),
+    "LHR": ("London", "UK", 51.5074, -0.1278, ["🎡 South Bank Walk", "🛍 Borough Market", "🏛 British Museum"]),
+    "CDG": ("Paris", "France", 48.8566, 2.3522, ["🗼 Eiffel Tower", "☕ Le Marais Cafes", "🖼 Louvre"]),
+    "FRA": ("Frankfurt", "Germany", 50.1109, 8.6821, None),
+    "ZRH": ("Zurich", "Switzerland", 47.3769, 8.5417, None),
+    "IST": ("Istanbul", "Turkey", 41.0082, 28.9784, None),
+    "SYD": ("Sydney", "Australia", -33.8688, 151.2093, ["☕ Single O Surry Hills", "🌳 Royal Botanic Garden", "🍽 Opera Bar (Harbour Views)"]),
+    "MEL": ("Melbourne", "Australia", -37.8136, 144.9631, ["☕ Degraves Street Lanes", "🌳 Fitzroy Gardens", "🍽 Queen Vic Market"]),
+}
+DEFAULT_SPOTS = ["☕ Top-rated cafe near crew hotel", "🌳 City walk / park", "🍜 Local food spot"]
+
+PER_DIEM = {"LHR": 120, "CDG": 115, "FRA": 110, "ZRH": 130, "SYD": 110, "MEL": 105,
+            "NRT": 110, "KIX": 105, "ICN": 100, "HKG": 100, "SIN": 95, "DXB": 90,
+            "AUH": 88, "DOH": 88, "MLE": 85, "BKK": 70, "KUL": 65, "CGK": 65,
+            "BOM": 65, "DEL": 60, "BLR": 60, "MAA": 55}
+PER_DIEM_DEFAULT = 70
+
+def wx_label(code):
+    if code == 0: return "☀️", "Clear"
+    if code in (1,): return "🌤", "Mostly Clear"
+    if code in (2,): return "⛅", "Partly Cloudy"
+    if code in (3,): return "☁️", "Overcast"
+    if code in (45, 48): return "🌫", "Fog"
+    if 51 <= code <= 67: return "🌧", "Rain"
+    if 71 <= code <= 77: return "🌨", "Snow"
+    if 80 <= code <= 82: return "🌦", "Showers"
+    if code >= 95: return "⛈", "Thunderstorm"
+    return "🌡", "—"
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_station_weather(iata):
+    """Live weather + local time via Open-Meteo (free, keyless, no limits)."""
+    info = STATION_INFO.get(iata)
+    if not info:
+        return None
+    city, country, lat, lon, _ = info
+    try:
+        r = requests.get("https://api.open-meteo.com/v1/forecast",
+                         params={"latitude": lat, "longitude": lon,
+                                 "current": "temperature_2m,weather_code",
+                                 "timezone": "auto"}, timeout=10)
+        r.raise_for_status()
+        j = r.json()
+        cur = j.get("current", {})
+        icon, desc = wx_label(int(cur.get("weather_code", -1)))
+        off = int(j.get("utc_offset_seconds", 0))
+        local = datetime.now(timezone.utc) + timedelta(seconds=off)
+        gmt = f"GMT{'+' if off >= 0 else '-'}{abs(off)//3600}" + (f":{(abs(off)%3600)//60:02d}" if off % 3600 else "")
+        return {"city": city, "country": country, "icon": icon, "desc": desc,
+                "temp": round(cur.get("temperature_2m", 0)),
+                "local_time": local.strftime("%I:%M %p").lstrip("0"), "gmt": gmt}
+    except Exception:
+        return {"city": city, "country": country, "icon": "🌡", "desc": "n/a",
+                "temp": None, "local_time": "-", "gmt": ""}
+
+def _mins_between(dep_str, arr_str):
+    try:
+        d = datetime.strptime(dep_str, "%H:%M")
+        a = datetime.strptime(arr_str, "%H:%M")
+        if a <= d:
+            a += timedelta(days=1)
+        return int((a - d).total_seconds() // 60)
+    except Exception:
+        return 0
+
+def compute_analytics(rows):
+    block_min, redeyes, n_flights = 0, 0, 0
+    duty_days, daily_min = set(), {}
+    layovers = enrich_layovers(rows)
+    for r in rows:
+        if r["Type"] == "FLIGHT" and r["Departure"] != "-" and r["Arrival"] != "-":
+            m = _mins_between(r["Departure"], r["Arrival"])
+            block_min += m
+            n_flights += 1
+            try:
+                h = int(r["Departure"][:2])
+                if h >= 22 or h < 6:
+                    redeyes += 1
+            except Exception:
+                pass
+            if r["DateObj"]:
+                d = r["DateObj"].date()
+                duty_days.add(d)
+                daily_min[d] = daily_min.get(d, 0) + m
+    days = sorted(duty_days)
+    max_streak = streak = 1 if days else 0
+    for i in range(1, len(days)):
+        streak = streak + 1 if (days[i] - days[i-1]).days == 1 else 1
+        max_streak = max(max_streak, streak)
+    block_hrs = block_min / 60
+    fatigue = min(10.0, round(1.5 + redeyes * 1.4 + max_streak * 0.7 + (block_hrs / 85) * 3.0, 1))
+    fat_label = "Low" if fatigue < 4 else ("Moderate" if fatigue < 7 else "High")
+    allow_rows = []
+    for lv in layovers:
+        stn = lv["station"] or "?"
+        nights = max(1, int((lv["ground_hrs"] or 24) // 24)) if lv["ground_hrs"] else 1
+        rate = PER_DIEM.get(stn, PER_DIEM_DEFAULT)
+        allow_rows.append((stn, nights, rate, nights * rate))
+    return {"block_hrs": round(block_hrs, 1), "block_target": 85, "flights": n_flights,
+            "redeyes": redeyes, "max_streak": max_streak, "fatigue": fatigue,
+            "fatigue_label": fat_label, "daily_min": daily_min,
+            "allowance_rows": allow_rows, "allowance_total": sum(a[3] for a in allow_rows),
+            "layovers": layovers}
+
+def enrich_layovers(rows):
+    out, n = [], len(rows)
+    for i, r in enumerate(rows):
+        if r["Type"] != "LAYOVER":
+            continue
+        station, arr_dt, dep_dt = None, None, None
+        for j in range(i - 1, -1, -1):
+            if rows[j]["Type"] == "FLIGHT":
+                codes = re.findall(r'[A-Z]{3}', rows[j]["Route"])
+                if len(codes) >= 2:
+                    station = codes[1]
+                if rows[j]["DateObj"] and rows[j]["Arrival"] != "-":
+                    try:
+                        t = datetime.strptime(rows[j]["Arrival"], "%H:%M").time()
+                        arr_dt = datetime.combine(rows[j]["DateObj"].date(), t)
+                        if rows[j]["Departure"] != "-" and rows[j]["Arrival"] < rows[j]["Departure"]:
+                            arr_dt += timedelta(days=1)
+                    except Exception:
+                        pass
+                break
+        for j in range(i + 1, n):
+            if rows[j]["Type"] == "FLIGHT" and rows[j]["DateObj"]:
+                tstr = rows[j]["Check-In"] if rows[j]["Check-In"] != "-" else rows[j]["Departure"]
+                if tstr != "-":
+                    try:
+                        dep_dt = datetime.combine(rows[j]["DateObj"].date(),
+                                                  datetime.strptime(tstr, "%H:%M").time())
+                    except Exception:
+                        pass
+                break
+        ground = None
+        if arr_dt and dep_dt and dep_dt > arr_dt:
+            ground = round((dep_dt - arr_dt).total_seconds() / 3600, 1)
+        out.append({"date": r["DateObj"].date() if r["DateObj"] else None,
+                    "station": station, "ground_hrs": ground})
+    return out
+
+# --- SVG WIDGETS (no chart libraries needed) ---
+def donut_svg(pct, center, sub, color="#00bcd4"):
+    pct = max(0.0, min(1.0, pct))
+    r, c = 44, 2 * math.pi * 44
+    return (f"<svg width='120' height='120' viewBox='0 0 120 120'>"
+            f"<circle cx='60' cy='60' r='{r}' fill='none' stroke='#1f2b3a' stroke-width='11'/>"
+            f"<circle cx='60' cy='60' r='{r}' fill='none' stroke='{color}' stroke-width='11' "
+            f"stroke-linecap='round' stroke-dasharray='{c*pct:.1f} {c:.1f}' transform='rotate(-90 60 60)'/>"
+            f"<text x='60' y='58' text-anchor='middle' fill='#fff' font-size='19' font-weight='700'>{center}</text>"
+            f"<text x='60' y='76' text-anchor='middle' fill='#7e8ba0' font-size='10'>{sub}</text></svg>")
+
+def _arc(cx, cy, r, a0, a1):
+    x0, y0 = cx + r * math.cos(math.radians(a0)), cy + r * math.sin(math.radians(a0))
+    x1, y1 = cx + r * math.cos(math.radians(a1)), cy + r * math.sin(math.radians(a1))
+    return f"M {x0:.1f} {y0:.1f} A {r} {r} 0 0 1 {x1:.1f} {y1:.1f}"
+
+def gauge_svg(score):
+    segs, out = [("#4caf50", 180, 225), ("#8bc34a", 225, 270), ("#ffc107", 270, 315), ("#ff5252", 315, 360)], []
+    for color, a0, a1 in segs:
+        out.append(f"<path d='{_arc(70, 66, 48, a0, a1)}' stroke='{color}' stroke-width='10' fill='none' stroke-linecap='round'/>")
+    ang = 180 + (max(0, min(10, score)) / 10) * 180
+    nx, ny = 70 + 36 * math.cos(math.radians(ang)), 66 + 36 * math.sin(math.radians(ang))
+    out.append(f"<line x1='70' y1='66' x2='{nx:.1f}' y2='{ny:.1f}' stroke='#fff' stroke-width='3' stroke-linecap='round'/>")
+    out.append("<circle cx='70' cy='66' r='4.5' fill='#fff'/>")
+    return f"<svg width='140' height='80' viewBox='0 0 140 80'>{''.join(out)}</svg>"
+
+def sparkline_svg(values, color="#ff5252"):
+    if not values:
+        return ""
+    w, h, mx = 150, 34, max(values) or 1
+    step = w / max(1, len(values) - 1) if len(values) > 1 else w
+    pts = " ".join(f"{i*step:.1f},{h - 4 - (v/mx)*(h-8):.1f}" for i, v in enumerate(values))
+    return (f"<svg width='{w}' height='{h}' viewBox='0 0 {w} {h}'>"
+            f"<polyline points='{pts}' fill='none' stroke='{color}' stroke-width='2'/></svg>")
+
+def build_calendar_html(rows, anchor_day=None):
+    valid = [r for r in rows if r["DateObj"] is not None]
+    if not valid:
+        return "<div style='color:#7e8ba0;font-size:13px;'>No dated duties parsed.</div>"
+    rmap = {}
+    for r in rows:
+        if r["DateObj"]:
+            rmap.setdefault(r["DateObj"].date(), []).append(r)
+    dmin = min(r["DateObj"] for r in valid).date()
+    dmax = max(r["DateObj"] for r in valid).date()
+    start = dmin - timedelta(days=dmin.weekday())
+    end = dmax + timedelta(days=6 - dmax.weekday())
+    today = datetime.now().date()
+    cells = ["<div class='cal'>"]
+    for wd in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]:
+        cells.append(f"<div class='cal-hd'>{wd}</div>")
+    d = start
+    while d <= end:
+        in_range = dmin <= d <= dmax
+        cls = "cal-cell" + ("" if in_range else " cal-dim") + (" cal-today" if d == today else "")
+        chips = []
+        for act in rmap.get(d, []):
+            if act["Type"] == "FLIGHT":
+                dep = act["Departure"] if act["Departure"] != "-" else ""
+                chips.append(f"<div class='chip chip-flt'>✈ <b>{act['Flight / Code']}</b><br><span>{act['Route']} {dep}</span></div>")
+            elif act["Type"] == "LAYOVER":
+                chips.append("<div class='chip chip-lay'>🏨 Layover</div>")
+            elif act["Type"] == "DAY OFF":
+                chips.append("<div class='chip chip-off'>🟢 OFF</div>")
+            elif act["Type"] == "STANDBY":
+                chips.append("<div class='chip chip-sby'>⏱ Standby</div>")
+        if in_range and not chips:
+            chips.append("<div class='chip chip-none'>No duty</div>")
+        cells.append(f"<div class='{cls}'><div class='cal-date'>{d.day} {d.strftime('%b') if d.day == 1 or d == start else ''}</div>{''.join(chips)}</div>")
+        d += timedelta(days=1)
+    cells.append("</div>")
+    return "".join(cells)
+
 # --- 4. STREAMLIT CONFIG & UI ---
 st.set_page_config(page_title="Crew Companion", page_icon="✈️", layout="wide")
 init_db()
 
 st.markdown("""
     <style>
-    .stApp {
-        background-color: #0e1621;
-        color: #ffffff;
-    }
-    .metric-card {
-        background-color: #17212b;
-        border: 1px solid #232e3c;
-        padding: 15px;
-        border-radius: 8px;
-        text-align: center;
-        margin-bottom: 10px;
-    }
+    .stApp { background-color: #0b1420; color: #ffffff; }
+    .block-container { padding-top: 1.2rem; }
+    .card { background:#121e2c; border:1px solid #1f2b3a; border-radius:12px; padding:16px; margin-bottom:14px; }
+    .card h5 { margin:0 0 10px 0; font-size:14px; color:#e8eef7; }
+    .muted { color:#7e8ba0; font-size:11px; }
+    .cal { display:grid; grid-template-columns:repeat(7,1fr); gap:6px; }
+    .cal-hd { text-align:center; color:#7e8ba0; font-size:11px; padding:4px 0; }
+    .cal-cell { background:#0f1926; border:1px solid #1f2b3a; border-radius:8px; min-height:78px; padding:5px 6px; }
+    .cal-dim { opacity:.35; }
+    .cal-today { border-color:#00bcd4; box-shadow:0 0 0 1px #00bcd4 inset; }
+    .cal-date { font-size:10px; color:#7e8ba0; margin-bottom:3px; }
+    .chip { border-radius:5px; padding:3px 5px; font-size:9.5px; line-height:1.25; margin-bottom:3px; }
+    .chip span { color:#9fb3c8; font-size:8.5px; }
+    .chip-flt { background:#0d3340; color:#4dd0e1; }
+    .chip-lay { background:#33260f; color:#ffb74d; }
+    .chip-off { background:#12301f; color:#66bb6a; }
+    .chip-sby { background:#251a38; color:#b39ddb; }
+    .chip-none { background:transparent; color:#3b4a5e; }
+    .hbar { display:flex; align-items:center; justify-content:space-between; background:#121e2c;
+            border:1px solid #1f2b3a; border-radius:12px; padding:10px 18px; margin-bottom:14px; }
+    .avatar { width:38px; height:38px; border-radius:50%; background:#0d3340; color:#4dd0e1;
+              display:inline-flex; align-items:center; justify-content:center; font-weight:700; margin-right:10px; }
+    .spot { background:#0f1926; border:1px solid #1f2b3a; border-radius:8px; padding:9px 11px;
+            font-size:12px; margin:4px 6px 4px 0; display:inline-block; }
+    .bidrow { display:flex; justify-content:space-between; font-size:12px; padding:7px 4px; border-bottom:1px solid #1f2b3a; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -469,6 +736,8 @@ if 'logged_in' not in st.session_state:
     st.session_state['username'] = ''
     st.session_state['full_name'] = ''
     st.session_state['rank'] = ''
+if 'acked' not in st.session_state:
+    st.session_state['acked'] = set()
 
 # --- AUTHENTICATION SCREEN ---
 if not st.session_state['logged_in']:
@@ -518,216 +787,204 @@ if not st.session_state['logged_in']:
                     st.error("Username already taken.")
 
 else:
-    nav_col1, nav_col2, nav_col3 = st.columns([3, 2, 1])
-    with nav_col1:
-        st.markdown("### 🌲 CrewAI Roster Companion")
+    # ---------- DATA PREP ----------
+    if 'current_roster' not in st.session_state:
+        st.session_state['current_roster'] = load_roster_from_db(st.session_state['username'])
+    active_text = st.session_state.get('current_roster', '')
+    parsed_rows = parse_roster_text(active_text) if active_text else []
+    analytics = compute_analytics(parsed_rows)
+    valid_dates_all = [r["DateObj"].date() for r in parsed_rows if r["DateObj"] is not None]
+    month_label = min(valid_dates_all).strftime("%B %Y") if valid_dates_all else datetime.now().strftime("%B %Y")
 
-    with nav_col2:
-        with st.expander("🤖 AI Agent Status"):
-            st.write("Dynamic roster parser + dual-source disruption agent (FlightStats/Cirium primary, FR24 fallback). No API keys or quotas.")
-            st.success("Disruption Engine: ACTIVE (FlightStats + FR24, keyless)")
-
-    with nav_col3:
+    # ---------- HEADER ----------
+    initials = "".join(w[0] for w in st.session_state['full_name'].split()[:2]).upper() or "?"
+    n_alerts = st.session_state.get('alert_count', 0)
+    bell = f"🔔 <span style='color:#ff5252;font-weight:700;'>{n_alerts}</span>" if n_alerts else "🔔"
+    hcol1, hcol2 = st.columns([6, 1])
+    with hcol1:
+        st.markdown(
+            f"<div class='hbar'>"
+            f"<div style='font-size:18px;font-weight:800;'>🌲 CrewAI &nbsp;<span style='font-weight:400;color:#9fb3c8;'>| Roster Companion — {month_label}</span></div>"
+            f"<div style='display:flex;align-items:center;'>"
+            f"<span style='margin-right:18px;font-size:16px;'>{bell}</span>"
+            f"<span class='avatar'>{initials}</span>"
+            f"<span style='font-size:13px;'>{st.session_state['full_name']}<br><span class='muted'>({st.session_state['rank']})</span></span>"
+            f"</div></div>", unsafe_allow_html=True)
+    with hcol2:
         if st.button("Log Out", use_container_width=True):
             st.session_state['logged_in'] = False
             st.rerun()
 
-    st.markdown("---")
+    left_col, main_col, right_col = st.columns([1, 2.3, 1.3])
 
-    left_col, main_col, right_col = st.columns([1, 2.2, 1.2])
-
+    # ---------- LEFT: ANALYTICS & FATIGUE ----------
     with left_col:
-        st.markdown("#### Analytics & Fatigue")
-        st.markdown("<div class='metric-card'><b>Cumulative Block Hours</b><h2 style='color:#00bcd4;'>78 / 85</h2><small>hrs (91%)</small></div>", unsafe_allow_html=True)
-        st.markdown("<div class='metric-card'><b>Fatigue Score</b><h3 style='color:#ff9800;'>Moderate (6.4/10)</h3><small>Recent red-eye flights detected</small></div>", unsafe_allow_html=True)
-        st.markdown("<div class='metric-card'><b>Estimated Allowances</b><h3 style='color:#4caf50;'>$1,450 USD</h3><small>Total calculated per diem</small></div>", unsafe_allow_html=True)
+        st.markdown("#### Analytics & Fatigue Tracker")
+        pct = analytics["block_hrs"] / analytics["block_target"] if analytics["block_target"] else 0
+        donut = donut_svg(pct, str(analytics["block_hrs"]), f"of {analytics['block_target']} hrs")
+        st.markdown(
+            f"<div class='card' style='text-align:center;'><h5>Cumulative Block Hours</h5>"
+            f"{donut}"
+            f"<div class='muted'>this roster ({pct*100:.0f}%) · {analytics['flights']} sectors</div></div>",
+            unsafe_allow_html=True)
+        spark = sparkline_svg([analytics['daily_min'].get(d, 0) for d in sorted(analytics['daily_min'])] or [0])
+        fat_color = "#4caf50" if analytics['fatigue'] < 4 else ("#ff9800" if analytics['fatigue'] < 7 else "#ff5252")
+        st.markdown(
+            f"<div class='card' style='text-align:center;'><h5>Fatigue Score</h5>"
+            f"{gauge_svg(analytics['fatigue'])}"
+            f"<div style='color:{fat_color};font-weight:700;font-size:14px;'>{analytics['fatigue_label']} ({analytics['fatigue']}/10)</div>"
+            f"<div style='margin-top:6px;'>{spark}</div>"
+            f"<div class='muted'>{analytics['redeyes']} red-eye dep · {analytics['max_streak']} consecutive duty days</div></div>",
+            unsafe_allow_html=True)
+        rows_html = "".join(f"<div class='bidrow'><span>{s} × {n} night(s)</span><span>${t}</span></div>"
+                            for s, n, r_, t in analytics['allowance_rows']) or "<div class='muted'>No layovers parsed.</div>"
+        st.markdown(
+            f"<div class='card'><h5>Estimated Allowances</h5>"
+            f"<div style='font-size:26px;font-weight:800;color:#4caf50;'>${analytics['allowance_total']:,} USD</div>"
+            f"<div class='muted' style='margin-bottom:6px;'>Total calculated per diem</div>{rows_html}</div>",
+            unsafe_allow_html=True)
 
+    # ---------- CENTER: CALENDAR + LAYOVER INTEL ----------
     with main_col:
         st.markdown("#### Main Roster Calendar View")
-
-        if 'current_roster' not in st.session_state:
-            st.session_state['current_roster'] = load_roster_from_db(st.session_state['username'])
-
-        with st.expander("📝 Paste Roster & Voila (Instant Parse)"):
+        with st.expander("📝 Paste Roster (Instant Parse)"):
             roster_input = st.text_area("Paste Raw Roster Here", value=st.session_state['current_roster'], height=120)
             if st.button("Auto-Process Roster"):
                 if roster_input.strip():
                     save_roster_to_db(st.session_state['username'], roster_input)
                     st.session_state['current_roster'] = roster_input
-                    st.success("Roster updated and processed instantly!")
+                    st.success("Roster updated!")
                     st.rerun()
                 else:
                     st.warning("Please paste roster text.")
 
-        active_text = st.session_state.get('current_roster', '')
-        if active_text:
-            rows = parse_roster_text(active_text)
-            if rows:
-                roster_map = {}
-                for r in rows:
-                    d_str = r["Date"]
-                    if d_str not in roster_map:
-                        roster_map[d_str] = []
-                    roster_map[d_str].append(r)
+        st.markdown(f"<div class='card'>{build_calendar_html(parsed_rows)}</div>", unsafe_allow_html=True)
 
-                valid_dates = [r["DateObj"] for r in rows if r["DateObj"] is not None]
-
-                if valid_dates:
-                    min_date = min(valid_dates)
-                    max_date = max(valid_dates)
-                    delta = (max_date - min_date).days
-                    rolling_days = [min_date + timedelta(days=i) for i in range(delta + 1)]
-
-                    start_weekday = min_date.weekday()
-                    weekdays = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
-
-                    h_cols = st.columns(7)
-                    for idx, day_name in enumerate(weekdays):
-                        h_cols[idx].markdown(f"<div style='text-align: center; font-size:13px; color: #888;'>{day_name}</div>", unsafe_allow_html=True)
-
-                    st.markdown("<hr style='margin:5px 0;'>", unsafe_allow_html=True)
-
-                    grid_cols = st.columns(7)
-                    current_slot = start_weekday
-
-                    for _ in range(start_weekday):
-                        with grid_cols[_]:
-                            st.write("")
-
-                    for dt in rolling_days:
-                        d_str = dt.strftime("%d%b%y").upper()
-                        display_date_label = dt.strftime("%d %b")
-
-                        with grid_cols[current_slot]:
-                            st.markdown(f"<span style='font-size:11px; color:#aaa;'>{display_date_label}</span>", unsafe_allow_html=True)
-                            if d_str in roster_map:
-                                for act in roster_map[d_str]:
-                                    if act["Type"] == "DAY OFF":
-                                        st.markdown("<div style='background:#1b362d; padding:4px; border-radius:4px; font-size:10px; color:#4caf50; margin-bottom:2px;'>🟢 OFF</div>", unsafe_allow_html=True)
-                                    elif act["Type"] == "LAYOVER":
-                                        st.markdown(f"<div style='background:#1c2d37; padding:4px; border-radius:4px; font-size:10px; color:#2196f3; margin-bottom:2px;'>🏨 {act['Route']}</div>", unsafe_allow_html=True)
-                                    else:
-                                        dep = f"Dep: {act['Departure']}" if act['Departure'] != "-" else ""
-                                        st.markdown(f"<div style='background:#2d3723; padding:4px; border-radius:4px; font-size:10px; color:#8bc34a; margin-bottom:2px;'>✈️ <b>{act['Flight / Code']}</b><br>{act['Route']}<br><small>{dep}</small></div>", unsafe_allow_html=True)
-                            else:
-                                st.markdown("<span style='font-size:10px; color:#555;'>No duty</span>", unsafe_allow_html=True)
-
-                        current_slot += 1
-                        if current_slot >= 7:
-                            current_slot = 0
-                            grid_cols = st.columns(7)
-                else:
-                    st.info("No dated duties parsed.")
-            else:
-                st.info("Paste roster text to populate grid.")
+        # Layover Intel
+        layovers = [lv for lv in analytics["layovers"] if lv["station"]]
+        if layovers:
+            opts = list(range(len(layovers)))
+            today = datetime.now().date()
+            def_idx = next((i for i, lv in enumerate(layovers) if lv["date"] and lv["date"] >= today), 0)
+            sel = st.selectbox("Layover Intel:", opts, index=def_idx,
+                               format_func=lambda i: f"{STATION_INFO.get(layovers[i]['station'], (layovers[i]['station'],))[0]} ({layovers[i]['station']}) — {layovers[i]['date'].strftime('%d %b') if layovers[i]['date'] else '?'}")
+            lv = layovers[sel]
+            wx = fetch_station_weather(lv["station"])
+            info = STATION_INFO.get(lv["station"])
+            spots = (info[4] if info and info[4] else DEFAULT_SPOTS)
+            city = wx["city"] if wx else lv["station"]
+            wx_html = (f"{wx['icon']} {wx['temp']}°C · {wx['desc']}" if wx and wx["temp"] is not None else "n/a")
+            lt_html = f"{wx['local_time']} ({wx['gmt']})" if wx else "-"
+            gt_html = f"{lv['ground_hrs']} hrs" if lv["ground_hrs"] else "-"
+            spots_html = "".join(f"<span class='spot'>{s}</span>" for s in spots)
+            st.markdown(
+                f"<div class='card' style='border-color:#00bcd4;'>"
+                f"<h5>🏨 Layover Intel: {city} ({lv['station']})" + (f" — {lv['date'].strftime('%d %b')}" if lv['date'] else "") + "</h5>"
+                f"<div style='display:flex;gap:28px;font-size:13px;margin-bottom:10px;'>"
+                f"<div><div class='muted'>Weather (live)</div>{wx_html}</div>"
+                f"<div><div class='muted'>Local Time</div>{lt_html}</div>"
+                f"<div><div class='muted'>Ground Time</div>{gt_html}</div></div>"
+                f"<div class='muted' style='margin-bottom:4px;'>Explore Spots</div>{spots_html}</div>",
+                unsafe_allow_html=True)
+        elif active_text:
+            st.info("No layovers detected in roster for Layover Intel.")
         else:
-            st.info("Paste your roster text above to instantly populate your calendar grid.")
+            st.info("Paste your roster above to populate the calendar, analytics and layover intel.")
 
+    # ---------- RIGHT: AGENT ALERTS + BIDDING ----------
     with right_col:
-        st.markdown("#### Live Roster Flight Monitor")
+        st.markdown("#### Flight Monitoring Agent")
+        agent_on = st.toggle("Agent: Real-Time Flight Monitor", value=True)
 
-        parsed_rows = parse_roster_text(active_text) if active_text else []
-
-        available_roster_dates = sorted(list(set([r["DateObj"].date() for r in parsed_rows if r["DateObj"] is not None])))
-
+        available_roster_dates = sorted(set(valid_dates_all))
         if available_roster_dates:
-            # Smart anchor: real 'today' if it falls inside the roster window,
-            # otherwise the nearest upcoming roster day (so as days go on the
-            # monitor always tracks the correct duties automatically).
             real_today = datetime.now().date()
             if real_today in available_roster_dates:
                 default_idx = available_roster_dates.index(real_today)
             else:
                 future = [d for d in available_roster_dates if d >= real_today]
                 default_idx = available_roster_dates.index(future[0]) if future else len(available_roster_dates) - 1
-
             simulated_today = st.selectbox(
                 "Roster anchor day (auto-set to today):",
-                options=available_roster_dates,
-                index=default_idx,
-                format_func=lambda x: x.strftime("%d %b %Y") + ("  ← today" if x == real_today else "")
-            )
+                options=available_roster_dates, index=default_idx,
+                format_func=lambda x: x.strftime("%d %b %Y") + ("  ← today" if x == real_today else ""))
         else:
             simulated_today = datetime.now().date()
-
         simulated_tomorrow = simulated_today + timedelta(days=1)
 
-        active_target_flights = []
-        seen = set()
+        active_target_flights, seen = [], set()
         for row in parsed_rows:
             if row["Type"] == "FLIGHT" and row["DateObj"] is not None:
-                flight_date = row["DateObj"].date()
-                if flight_date in [simulated_today, simulated_tomorrow]:
-                    key = (row["Flight / Code"], flight_date)
+                fd = row["DateObj"].date()
+                if fd in [simulated_today, simulated_tomorrow]:
+                    key = (row["Flight / Code"], fd)
                     if key in seen:
                         continue
                     seen.add(key)
-                    active_target_flights.append({
-                        "flight_no": row["Flight / Code"],
-                        "date_obj": flight_date,
-                        "route": row["Route"],
-                        "dep_time": row["Departure"]
-                    })
+                    active_target_flights.append({"flight_no": row["Flight / Code"], "date_obj": fd,
+                                                  "route": row["Route"], "dep_time": row["Departure"]})
 
         flight_check_results = []
-        if active_target_flights:
+        if agent_on and active_target_flights:
             with st.spinner("Querying FlightStats & Flightradar24 live feeds..."):
                 for flight in active_target_flights:
-                    telemetry = fetch_live_flight_telemetry(
-                        flight["flight_no"],
-                        flight["date_obj"],
-                        flight["route"],
-                        flight["dep_time"]
-                    )
-                    flight_check_results.append({
-                        "flight": flight["flight_no"],
-                        "route": flight["route"],
-                        "date": flight["date_obj"].strftime("%d %b %Y"),
-                        "delayed": telemetry["is_delayed"],
-                        "severity": telemetry.get("severity", "ok"),
-                        "status": telemetry["status_message"]
-                    })
+                    telemetry = fetch_live_flight_telemetry(flight["flight_no"], flight["date_obj"],
+                                                            flight["route"], flight["dep_time"])
+                    flight_check_results.append({"flight": flight["flight_no"], "route": flight["route"],
+                                                 "date": flight["date_obj"].strftime("%d %b %Y"),
+                                                 "delayed": telemetry["is_delayed"],
+                                                 "severity": telemetry.get("severity", "ok"),
+                                                 "status": telemetry["status_message"]})
+        st.session_state['alert_count'] = sum(
+            1 for f in flight_check_results
+            if f["severity"] in ("delayed", "cancelled", "diverted") and (f["flight"], f["date"]) not in st.session_state['acked'])
 
-        if flight_check_results:
-            checked_count = len(flight_check_results)
+        if not agent_on:
+            st.markdown("<div class='card muted'>Real-time monitor paused.</div>", unsafe_allow_html=True)
+        elif flight_check_results:
             st.markdown(
-                f"<div style='background-color: #17212b; border: 1px solid #232e3c; padding: 12px; border-radius: 8px; font-size: 12px; margin-top: 8px;'>"
-                f"<b style='color: #00bcd4;'>Agent Scan:</b> Verified {checked_count} flight(s) against FlightStats/Cirium + Flightradar24 (keyless, cached 10 min)."
-                f"</div>", unsafe_allow_html=True)
-
+                f"<div class='card' style='font-size:12px;'><b style='color:#00bcd4;'>Agent Scan:</b> "
+                f"Verified {len(flight_check_results)} flight(s) via FlightStats/Cirium + FR24 (keyless, cached 10 min).</div>",
+                unsafe_allow_html=True)
             for df in flight_check_results:
+                key = (df["flight"], df["date"])
+                acked = key in st.session_state['acked']
                 if df["severity"] == "cancelled":
-                    border_color, bg_color, txt_color, icon = "#ff1744", "#331414", "#ff8a8a", "🚫"
+                    bc, bg, tc, icon = "#ff1744", "#331414", "#ff8a8a", "🚫"
                 elif df["severity"] == "diverted":
-                    border_color, bg_color, txt_color, icon = "#ff6d00", "#332414", "#ffb74d", "🔀"
+                    bc, bg, tc, icon = "#ff6d00", "#332414", "#ffb74d", "🔀"
                 elif df["severity"] == "delayed":
-                    border_color, bg_color, txt_color, icon = "#ff5252", "#2c1f1f", "#ff8a8a", "⚠️"
+                    bc, bg, tc, icon = "#ff5252", "#2c1f1f", "#ff8a8a", "⚠️"
                 elif df["severity"] == "unknown":
-                    border_color, bg_color, txt_color, icon = "#607d8b", "#1c2429", "#b0bec5", "ℹ️"
+                    bc, bg, tc, icon = "#607d8b", "#1c2429", "#b0bec5", "ℹ️"
                 else:
-                    border_color, bg_color, txt_color, icon = "#4caf50", "#1b362d", "#a5d6a7", "✈️"
-
+                    bc, bg, tc, icon = "#4caf50", "#12301f", "#a5d6a7", "✈️"
+                op = "opacity:.5;" if acked else ""
                 st.markdown(
-                    f"<div style='font-size: 13px; background-color: {bg_color}; padding: 12px; border-radius: 6px; margin-top: 10px; border: 1px solid {border_color};'>"
-                    f"{icon} <b style='font-size: 14px;'>{df['flight']}</b> ({df['route']}) — <span style='color: #ccc;'><i>{df['date']}</i></span>"
-                    f"<div style='margin-top: 5px; color: {txt_color}; font-size: 12px;'>{df['status']}</div>"
-                    f"</div>", unsafe_allow_html=True)
-
+                    f"<div style='font-size:13px;background:{bg};padding:12px;border-radius:8px;margin-top:10px;border:1px solid {bc};{op}'>"
+                    f"{icon} <b style='font-size:14px;'>{df['flight']}</b> ({df['route']}) — <span style='color:#ccc;'><i>{df['date']}</i></span>"
+                    f"<div style='margin-top:5px;color:{tc};font-size:12px;'>{df['status']}</div></div>",
+                    unsafe_allow_html=True)
+                if df["severity"] in ("delayed", "cancelled", "diverted") and not acked:
+                    if st.button("Acknowledge", key=f"ack_{df['flight']}_{df['date']}", use_container_width=True):
+                        st.session_state['acked'].add(key)
+                        st.rerun()
             if st.button("🔄 Force Refresh Live Data", use_container_width=True):
                 fr24_fetch_flight_history.clear()
                 flightstats_fetch.clear()
                 st.rerun()
         else:
             st.markdown(
-                f"<div style='background-color: #17212b; border: 1px solid #232e3c; padding: 14px; border-radius: 8px; font-size: 13px; margin-top: 8px;'>"
-                f"<b style='color: #888;'>No flights found for {simulated_today.strftime('%d %b')} or {simulated_tomorrow.strftime('%d %b')}.</b>"
-                f"</div>", unsafe_allow_html=True)
+                f"<div class='card muted'>No flights found for {simulated_today.strftime('%d %b')} or {simulated_tomorrow.strftime('%d %b')}.</div>",
+                unsafe_allow_html=True)
 
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.markdown("#### Tactical Bidding")
+        st.markdown("#### Agent: Tactical Bidding")
         st.text_input("Search pairing...", placeholder="Find me a Sydney long stay", label_visibility="collapsed")
         st.markdown(
-            "<div style='background-color: #17212b; border: 1px solid #232e3c; padding: 10px; border-radius: 8px; font-size:12px;'>"
-            "<b>SYD-04</b> | Layover: <code>34h 00m</code><br>"
-            "<span style='color: #ff9800;'>5 Requests [Low] ⭐ Recommended</span>"
+            "<div class='card'>"
+            "<div class='bidrow muted'><span>Pairing</span><span>Layover</span><span>Competition</span></div>"
+            "<div class='bidrow'><span><b>SYD-01</b></span><span>24h 30m</span><span style='color:#ff5252;'>18 Req [High]</span></div>"
+            "<div class='bidrow'><span><b>SYD-04</b> ⭐</span><span>34h 00m</span><span style='color:#ff9800;'>5 Req [Low]</span></div>"
+            "<div class='bidrow'><span><b>SYD-09</b></span><span>48h 00m</span><span style='color:#ff5252;'>22 Req [V.High]</span></div>"
             "</div>", unsafe_allow_html=True)
+        st.button("Request SYD-04", use_container_width=True)
