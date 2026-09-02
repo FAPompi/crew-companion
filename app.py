@@ -73,8 +73,32 @@ def load_roster_from_db(username):
     return data[0] if data else ""
 
 # --- 2. ROBUST ROSTER PARSER ---
+ROSTER_ANCHOR = datetime(2026, 10, 4).date()   # known roster period start (04Oct26-01Nov26)
+ROSTER_PERIOD_DAYS = 28
+
+def roster_period_bounds(d):
+    """Return (start, end) of the 28-day roster period containing date d,
+    derived from the known anchor period. Works for past and future periods."""
+    k = (d - ROSTER_ANCHOR).days // ROSTER_PERIOD_DAYS
+    start = ROSTER_ANCHOR + timedelta(days=ROSTER_PERIOD_DAYS * k)
+    # Airline convention: the period label ends on the NEXT period's start
+    # day (e.g. 04 Oct - 01 Nov), so the displayed span is 28 days + 1.
+    return start, start + timedelta(days=ROSTER_PERIOD_DAYS)
+
+def preprocess_roster_text(raw_text):
+    """
+    Crew-portal exports often arrive as one long concatenated string.
+    Split it into one duty per line: break before HTL blocks and before any
+    'DDMMMYY HH:MM' stamp that directly starts a UL / SB / OFF duty.
+    Harmless for rosters that already have proper line breaks.
+    """
+    t = raw_text.replace("\r", "\n")
+    t = re.sub(r'[ \t]*HTL', '\nHTL', t)
+    t = re.sub(r'(\d{2}[A-Z]{3}\d{2}\s*\d{2}:\d{2})\s*(?=UL\s*\d|SB|OFF|ROF|TOF)', r'\n\1', t)
+    return t
+
 def parse_roster_text(raw_text):
-    lines = raw_text.split('\n')
+    lines = preprocess_roster_text(raw_text).split('\n')
     parsed_rows = []
     current_date_str = "-"
     current_dt_obj = None
@@ -89,6 +113,14 @@ def parse_roster_text(raw_text):
             current_date_str = date_match.group(1)
             try:
                 current_dt_obj = datetime.strptime(current_date_str, "%d%b%y")
+            except ValueError:
+                pass
+
+        # Every full 'DDMMMYY HH:MM' stamp on the line (portal format)
+        dt_stamps = []
+        for ds, ts in re.findall(r'(\d{2}[A-Z]{3}\d{2})\s*(\d{2}:\d{2})', line_str):
+            try:
+                dt_stamps.append(datetime.strptime(ds + ts, "%d%b%y%H:%M"))
             except ValueError:
                 pass
 
@@ -112,6 +144,7 @@ def parse_roster_text(raw_text):
             arr_time = "-"
             checkout_time = "-"
             ac_type = "-"
+            end_dt_obj = None
 
             time_matches = re.findall(r'(\d{2}:\d{2})', line_str)
 
@@ -123,14 +156,36 @@ def parse_roster_text(raw_text):
                 activity_type = "STANDBY"
             elif "UL" in line_str:
                 activity_type = "FLIGHT"
-                match = re.search(r'(UL\s*\d+)', line_str)
-                if match:
-                    raw_fn = match.group(1).replace(" ", "")
-                    num_part = re.search(r'\d+', raw_fn).group(0)
-                    flight_no = f"UL {num_part}"
+                # Bounded so 'UL60622SEP26' parses as UL606 + date, not UL60622
+                m = re.search(r'UL\s*(\d{1,4}?)(?=\d{2}[A-Z]{3}\d{2}|\D|$)', line_str)
+                if m:
+                    flight_no = f"UL {m.group(1)}"
 
+            # Multi-day span support (layover/standby/off blocks with start+end stamps)
+            if dt_stamps:
+                start_dt, end_dt = min(dt_stamps), max(dt_stamps)
+                if activity_type in ("LAYOVER", "STANDBY", "DAY OFF"):
+                    row_dt_obj = datetime.combine(start_dt.date(), datetime.min.time())
+                    row_date_str = start_dt.strftime("%d%b%y").upper()
+                    if end_dt.date() > start_dt.date():
+                        end_dt_obj = datetime.combine(end_dt.date(), datetime.min.time())
+                elif activity_type == "FLIGHT" and len(dt_stamps) >= 2:
+                    # Calendar chip belongs on the DEPARTURE date (2nd stamp),
+                    # not the check-in date (1st stamp, may be previous evening)
+                    dep_date = dt_stamps[1].date()
+                    row_dt_obj = datetime.combine(dep_date, datetime.min.time())
+                    row_date_str = dep_date.strftime("%d%b%y").upper()
+
+            # Route: spaced 'CMB SYD' or concatenated 'CMBSYD'
             route_match = re.search(r'([A-Z]{3})\s+([A-Z]{3})', line_str)
-            if route_match:
+            if not route_match:
+                stripped = re.sub(r'\d{2}[A-Z]{3}\d{2}', ' ', line_str)
+                route_match = re.search(r'(?<![A-Z])([A-Z]{3})([A-Z]{3})(?![A-Z])', stripped)
+            if activity_type == "LAYOVER":
+                stripped = re.sub(r'\d{2}[A-Z]{3}\d{2}', ' ', line_str)
+                toks = [t for t in re.findall(r'[A-Z]{3}', stripped) if t != "HTL"]
+                route = toks[0] if toks else "-"
+            elif route_match:
                 route = f"{route_match.group(1)} ➔ {route_match.group(2)}"
 
             if time_matches:
@@ -158,6 +213,7 @@ def parse_roster_text(raw_text):
             parsed_rows.append({
                 "Date": row_date_str,
                 "DateObj": row_dt_obj,
+                "EndDateObj": end_dt_obj,
                 "Type": activity_type,
                 "Flight / Code": flight_no if flight_no != "-" else activity_type,
                 "Check-In": checkin_time,
@@ -693,7 +749,7 @@ def compute_analytics(rows):
     allow_rows = []
     for lv in layovers:
         stn = lv["station"] or "?"
-        nights = max(1, int((lv["ground_hrs"] or 24) // 24)) if lv["ground_hrs"] else 1
+        nights = lv.get("nights") or (max(1, int((lv["ground_hrs"] or 24) // 24)) if lv["ground_hrs"] else 1)
         rate = PER_DIEM.get(stn, PER_DIEM_DEFAULT)
         allow_rows.append((stn, nights, rate, nights * rate))
     return {"block_hrs": round(block_hrs, 1), "block_target": 85, "flights": n_flights,
@@ -707,11 +763,12 @@ def enrich_layovers(rows):
     for i, r in enumerate(rows):
         if r["Type"] != "LAYOVER":
             continue
-        station, arr_dt, dep_dt = None, None, None
+        station = r["Route"] if r.get("Route") and r["Route"] != "-" and len(r["Route"]) == 3 else None
+        arr_dt, dep_dt = None, None
         for j in range(i - 1, -1, -1):
             if rows[j]["Type"] == "FLIGHT":
                 codes = re.findall(r'[A-Z]{3}', rows[j]["Route"])
-                if len(codes) >= 2:
+                if station is None and len(codes) >= 2:
                     station = codes[1]
                 if rows[j]["DateObj"] and rows[j]["Arrival"] != "-":
                     try:
@@ -735,8 +792,11 @@ def enrich_layovers(rows):
         ground = None
         if arr_dt and dep_dt and dep_dt > arr_dt:
             ground = round((dep_dt - arr_dt).total_seconds() / 3600, 1)
+        nights = None
+        if r.get("EndDateObj") and r["DateObj"]:
+            nights = max(1, (r["EndDateObj"].date() - r["DateObj"].date()).days)
         out.append({"date": r["DateObj"].date() if r["DateObj"] else None,
-                    "station": station, "ground_hrs": ground})
+                    "station": station, "ground_hrs": ground, "nights": nights})
     return out
 
 # --- SVG WIDGETS (no chart libraries needed) ---
@@ -774,20 +834,25 @@ def sparkline_svg(values, color="#ff5252"):
     return (f"<svg width='{w}' height='{h}' viewBox='0 0 {w} {h}'>"
             f"<polyline points='{pts}' fill='none' stroke='{color}' stroke-width='2'/></svg>")
 
-def build_calendar_html(rows, month=None):
+def build_calendar_html(rows, span=None):
     valid = [r for r in rows if r["DateObj"] is not None]
     if not valid:
-        return "<div style='color:#7e8ba0;font-size:13px;'>No dated duties parsed.</div>"
+        return "<div style='color:#7e8ba0;font-size:14px;'>No dated duties parsed.</div>"
+    # map each activity onto EVERY day it covers (multi-day HTL / SB / OFF)
     rmap = {}
     for r in rows:
-        if r["DateObj"]:
-            rmap.setdefault(r["DateObj"].date(), []).append(r)
+        if not r["DateObj"]:
+            continue
+        d0 = r["DateObj"].date()
+        d1 = r["EndDateObj"].date() if r.get("EndDateObj") else d0
+        d = d0
+        while d <= d1:
+            rmap.setdefault(d, []).append(r)
+            d += timedelta(days=1)
     rmin = min(r["DateObj"] for r in valid).date()
-    rmax = max(r["DateObj"] for r in valid).date()
-    if month:
-        y, m = month
-        dmin = datetime(y, m, 1).date()
-        dmax = (datetime(y + (m == 12), (m % 12) + 1, 1) - timedelta(days=1)).date()
+    rmax = max((r["EndDateObj"] or r["DateObj"]) for r in valid).date()
+    if span:
+        dmin, dmax = span
     else:
         dmin, dmax = rmin, rmax
     start = dmin - timedelta(days=dmin.weekday())
@@ -798,21 +863,21 @@ def build_calendar_html(rows, month=None):
         cells.append(f"<div class='cal-hd'>{wd}</div>")
     d = start
     while d <= end:
-        in_month = dmin <= d <= dmax
-        in_roster = rmin <= d <= rmax
-        cls = "cal-cell" + ("" if (in_month and in_roster) else " cal-dim") + (" cal-today" if d == today else "")
+        in_period = dmin <= d <= dmax
+        cls = "cal-cell" + ("" if in_period else " cal-dim") + (" cal-today" if d == today else "")
         chips = []
         for act in rmap.get(d, []):
             if act["Type"] == "FLIGHT":
                 dep = act["Departure"] if act["Departure"] != "-" else ""
                 chips.append(f"<div class='chip chip-flt'>✈ <b>{act['Flight / Code']}</b><br><span>{act['Route']} {dep}</span></div>")
             elif act["Type"] == "LAYOVER":
-                chips.append("<div class='chip chip-lay'>🏨 Layover</div>")
+                stn = act["Route"] if act["Route"] != "-" else "Layover"
+                chips.append(f"<div class='chip chip-lay'>🏨 {stn}</div>")
             elif act["Type"] == "DAY OFF":
                 chips.append("<div class='chip chip-off'>🟢 OFF</div>")
             elif act["Type"] == "STANDBY":
-                chips.append("<div class='chip chip-sby'>⏱ Standby</div>")
-        if (in_month and in_roster) and not chips:
+                chips.append("<div class='chip chip-sby'>⏱ SB</div>")
+        if in_period and (rmin <= d <= rmax) and not chips:
             chips.append("<div class='chip chip-none'>No duty</div>")
         cells.append(f"<div class='{cls}'><div class='cal-date'>{d.day} {d.strftime('%b') if d.day == 1 or d == start else ''}</div>{''.join(chips)}</div>")
         d += timedelta(days=1)
@@ -831,13 +896,13 @@ st.markdown("""
     .card h5 { margin:0 0 10px 0; font-size:14px; color:#e8eef7; }
     .muted { color:#7e8ba0; font-size:11px; }
     .cal { display:grid; grid-template-columns:repeat(7,1fr); gap:6px; }
-    .cal-hd { text-align:center; color:#7e8ba0; font-size:11px; padding:4px 0; }
-    .cal-cell { background:#0f1926; border:1px solid #1f2b3a; border-radius:8px; min-height:78px; padding:5px 6px; }
+    .cal-hd { text-align:center; color:#7e8ba0; font-size:14px; padding:4px 0; }
+    .cal-cell { background:#0f1926; border:1px solid #1f2b3a; border-radius:8px; min-height:96px; padding:6px 7px; }
     .cal-dim { opacity:.35; }
     .cal-today { border-color:#00bcd4; box-shadow:0 0 0 1px #00bcd4 inset; }
-    .cal-date { font-size:10px; color:#7e8ba0; margin-bottom:3px; }
-    .chip { border-radius:5px; padding:3px 5px; font-size:9.5px; line-height:1.25; margin-bottom:3px; }
-    .chip span { color:#9fb3c8; font-size:8.5px; }
+    .cal-date { font-size:13px; color:#9fb3c8; margin-bottom:4px; font-weight:600; }
+    .chip { border-radius:6px; padding:4px 6px; font-size:12.5px; line-height:1.3; margin-bottom:4px; }
+    .chip span { color:#9fb3c8; font-size:11px; }
     .chip-flt { background:#0d3340; color:#4dd0e1; }
     .chip-lay { background:#33260f; color:#ffb74d; }
     .chip-off { background:#12301f; color:#66bb6a; }
@@ -916,7 +981,12 @@ else:
     parsed_rows = parse_roster_text(active_text) if active_text else []
     analytics = compute_analytics(parsed_rows)
     valid_dates_all = [r["DateObj"].date() for r in parsed_rows if r["DateObj"] is not None]
-    month_label = min(valid_dates_all).strftime("%B %Y") if valid_dates_all else datetime.now().strftime("%B %Y")
+    if valid_dates_all:
+        _p0, _p1 = roster_period_bounds(min(valid_dates_all))
+        month_label = f"Roster {_p0.strftime('%d %b')} – {_p1.strftime('%d %b %Y')}"
+    else:
+        _p0, _p1 = roster_period_bounds(datetime.now().date())
+        month_label = f"Roster {_p0.strftime('%d %b')} – {_p1.strftime('%d %b %Y')}"
 
     # ---------- HEADER ----------
     initials = "".join(w[0] for w in st.session_state['full_name'].split()[:2]).upper() or "?"
@@ -980,30 +1050,36 @@ else:
                 else:
                     st.warning("Please paste roster text.")
 
-        # Month navigation (appears when the roster spans multiple months)
-        months = sorted({(d.year, d.month) for d in valid_dates_all})
-        if months:
-            if 'cal_month_idx' not in st.session_state or st.session_state['cal_month_idx'] >= len(months):
-                today_ym = (datetime.now().year, datetime.now().month)
-                st.session_state['cal_month_idx'] = months.index(today_ym) if today_ym in months else 0
-            if len(months) > 1:
-                nav1, nav2, nav3 = st.columns([1, 4, 1])
-                with nav1:
-                    if st.button("‹", use_container_width=True, disabled=st.session_state['cal_month_idx'] == 0):
-                        st.session_state['cal_month_idx'] -= 1
-                        st.rerun()
-                with nav3:
-                    if st.button("›", use_container_width=True, disabled=st.session_state['cal_month_idx'] == len(months) - 1):
-                        st.session_state['cal_month_idx'] += 1
-                        st.rerun()
-                with nav2:
-                    y, m = months[st.session_state['cal_month_idx']]
-                    st.markdown(f"<div style='text-align:center;font-weight:700;padding-top:6px;'>{datetime(y, m, 1).strftime('%B %Y')}</div>", unsafe_allow_html=True)
-            sel_month = months[st.session_state['cal_month_idx']]
+        # 28-day roster period navigation (anchored to known 04Oct26-01Nov26 period)
+        if valid_dates_all:
+            pmin = roster_period_bounds(min(valid_dates_all))[0]
+            pmax = roster_period_bounds(max(valid_dates_all))[0]
+            periods, p = [], pmin
+            while p <= pmax:
+                periods.append((p, p + timedelta(days=ROSTER_PERIOD_DAYS)))
+                p += timedelta(days=ROSTER_PERIOD_DAYS)
+            starts = [x[0] for x in periods]
+            t0 = roster_period_bounds(datetime.now().date())[0]
+            if 'cal_period_idx' not in st.session_state or st.session_state['cal_period_idx'] >= len(periods):
+                st.session_state['cal_period_idx'] = starts.index(t0) if t0 in starts else 0
+            idx = st.session_state['cal_period_idx']
+            nav1, nav2, nav3 = st.columns([1, 4, 1])
+            with nav1:
+                if st.button("‹", use_container_width=True, disabled=idx == 0):
+                    st.session_state['cal_period_idx'] -= 1
+                    st.rerun()
+            with nav3:
+                if st.button("›", use_container_width=True, disabled=idx == len(periods) - 1):
+                    st.session_state['cal_period_idx'] += 1
+                    st.rerun()
+            with nav2:
+                p0, p1 = periods[idx]
+                st.markdown(f"<div style='text-align:center;font-weight:700;padding-top:6px;'>Roster Period: {p0.strftime('%d %b')} – {p1.strftime('%d %b %Y')}</div>", unsafe_allow_html=True)
+            sel_span = periods[idx]
         else:
-            sel_month = None
+            sel_span = None
 
-        st.markdown(f"<div class='card'>{build_calendar_html(parsed_rows, month=sel_month)}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='card'>{build_calendar_html(parsed_rows, span=sel_span)}</div>", unsafe_allow_html=True)
 
         # Layover Intel
         layovers = [lv for lv in analytics["layovers"] if lv["station"]]
