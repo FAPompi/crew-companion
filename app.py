@@ -4,7 +4,7 @@ import hashlib
 import re
 import json
 import requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dtime
 
 # --- 1. DATABASE SETUP ---
 def init_db():
@@ -210,6 +210,39 @@ def parse_roster_text(raw_text):
                 if len(p) == 3 and p.isalnum() and p not in ["FA", "J28", "CMB", "CAN", "BKK", "TRZ", "MAA", "MLE", "DMM", "BLR", "DXB", "RUH", "LHE", "ICN", "DEL", "PUR"]:
                     ac_type = p
 
+            # Exact datetimes for the rules engine (portal stamps preferred,
+            # heuristic day-rollover reconstruction for spaced rosters)
+            ci_dt = dep_dt = arr_dt = co_dt = None
+            if activity_type == "FLIGHT":
+                if len(dt_stamps) >= 4:
+                    ci_dt, dep_dt, arr_dt, co_dt = dt_stamps[0], dt_stamps[1], dt_stamps[2], dt_stamps[3]
+                elif len(dt_stamps) == 3:
+                    ci_dt, dep_dt, arr_dt = dt_stamps[0], dt_stamps[1], dt_stamps[2]
+                elif row_dt_obj is not None:
+                    bd = row_dt_obj.date()
+                    def _t(s):
+                        try:
+                            return datetime.strptime(s, "%H:%M").time()
+                        except ValueError:
+                            return None
+                    tci, tdep, tarr, tco = _t(checkin_time), _t(dep_time), _t(arr_time), _t(checkout_time)
+                    if tdep:
+                        dep_dt = datetime.combine(bd, tdep)
+                        if tci:
+                            ci_dt = datetime.combine(bd, tci)
+                            if ci_dt > dep_dt:
+                                ci_dt -= timedelta(days=1)
+                        if tarr:
+                            arr_dt = datetime.combine(bd, tarr)
+                            if arr_dt < dep_dt:
+                                arr_dt += timedelta(days=1)
+                        if tco and arr_dt:
+                            co_dt = datetime.combine(arr_dt.date(), tco)
+                            if co_dt < arr_dt:
+                                co_dt += timedelta(days=1)
+            elif activity_type == "STANDBY" and dt_stamps:
+                ci_dt, co_dt = min(dt_stamps), max(dt_stamps)
+
             parsed_rows.append({
                 "Date": row_date_str,
                 "DateObj": row_dt_obj,
@@ -221,10 +254,176 @@ def parse_roster_text(raw_text):
                 "Route": route,
                 "Arrival": arr_time,
                 "Checkout": checkout_time,
-                "Aircraft": ac_type
+                "Aircraft": ac_type,
+                "CIdt": ci_dt, "DEPdt": dep_dt, "ARRdt": arr_dt, "COdt": co_dt
             })
 
     return parsed_rows
+
+# --- 2.5 FAU SOFT-RULES AUDIT ENGINE (Roster Guardian) ---
+LONGHAUL_2OFF_LAYOVER = {"LHR", "FRA", "CDG", "FCO", "MXP", "NRT", "HND", "SYD", "MEL"}
+TWO_OFF_TURNAROUND = {"JED"}
+ONE_OFF_TURNAROUND = {"DOH", "BAH", "DMM"}
+SOUTHASIA_TA = {"DEL", "BOM", "KHI"}
+MIDEAST_TA = {"DXB", "AUH", "MCT"}
+SEASIA_MORNING_TA = {"SIN", "KUL", "CGK"}
+MIN_BASE_REST_H = 17.5          # 17h30m chocks-on -> next report at base
+REGIONAL_MAX_SECTOR_H = 4.0     # 'regional' = sector length under 4 hours
+
+def _route_od(route):
+    if route and "➔" in route:
+        p = [x.strip() for x in route.split("➔")]
+        if len(p) == 2:
+            return p[0], p[1]
+    return None, None
+
+def build_duties(rows):
+    """Group individual sectors into duty periods (gap at a station <= 4h)."""
+    fl = sorted([r for r in rows if r["Type"] == "FLIGHT" and r.get("DEPdt") and r.get("ARRdt")],
+                key=lambda r: r["DEPdt"])
+    duties = []
+    for r in fl:
+        o, d = _route_od(r["Route"])
+        sec = {"flight": r["Flight / Code"], "o": o, "d": d, "dep": r["DEPdt"], "arr": r["ARRdt"],
+               "ci": r.get("CIdt"), "block_h": (r["ARRdt"] - r["DEPdt"]).total_seconds() / 3600}
+        if duties and (sec["dep"] - duties[-1]["chocks_on"]).total_seconds() <= 4 * 3600 \
+                and duties[-1]["dest"] == o:
+            duties[-1]["sectors"].append(sec)
+            duties[-1]["chocks_on"] = sec["arr"]
+            duties[-1]["dest"] = d
+        else:
+            duties.append({"report": sec["ci"] or (sec["dep"] - timedelta(hours=1, minutes=30)),
+                           "sectors": [sec], "chocks_on": sec["arr"], "origin": o, "dest": d})
+    for du in duties:
+        du["n"] = len(du["sectors"])
+        du["stations"] = [s["d"] for s in du["sectors"] if s["d"]]
+        du["is_turnaround"] = du["origin"] == "CMB" and du["dest"] == "CMB" and du["n"] >= 2
+        du["max_sector_h"] = max(s["block_h"] for s in du["sectors"])
+        du["label"] = " / ".join(s["flight"] for s in du["sectors"])
+        du["numbers"] = {s["flight"].replace(" ", "") for s in du["sectors"]}
+    return duties
+
+def audit_roster(rows):
+    """Audit the parsed roster against FAU soft rules. Returns findings list
+    of (severity, message) where severity is 'violation' or 'note'."""
+    findings = []
+    duties = build_duties(rows)
+
+    # All future report events (flight duties + standby starts)
+    events = [{"dt": du["report"], "kind": "FLIGHT", "duty": du, "label": du["label"]} for du in duties]
+    for sb in [r for r in rows if r["Type"] == "STANDBY"]:
+        sdt = sb.get("CIdt")
+        if not sdt and sb["DateObj"] is not None and sb["Departure"] != "-":
+            try:
+                sdt = datetime.combine(sb["DateObj"].date(), datetime.strptime(sb["Departure"], "%H:%M").time())
+            except ValueError:
+                sdt = None
+        if sdt:
+            events.append({"dt": sdt, "kind": "STANDBY", "duty": None, "label": "Standby"})
+    events.sort(key=lambda e: e["dt"])
+    duty_day_map = {}
+    for e in events:
+        duty_day_map.setdefault(e["dt"].date(), []).append(e)
+
+    def check_next_day_restrictions(du, arr, rule_name, layover_ok_after=None, layover_strict=False):
+        """Common pattern: following-day turnaround/layover reporting limits."""
+        day1 = arr.date() + timedelta(days=1)
+        day2 = arr.date() + timedelta(days=2)
+        for e in duty_day_map.get(day1, []) + duty_day_map.get(day2, []):
+            if e["kind"] != "FLIGHT":
+                continue  # standby insertion is allowed by the guidelines
+            rep = e["dt"]
+            nd = e["duty"]
+            in_night_window = ((rep.date() == day1 and rep.time() >= dtime(23, 0)) or
+                               (rep.date() == day2 and rep.time() <= dtime(5, 59)))
+            if rep.date() == day2 and rep.time() >= dtime(6, 0):
+                continue  # anything allowed after 06:00 on the second day
+            if nd["is_turnaround"]:
+                if rep.date() == day1 and rep.time() < dtime(23, 0):
+                    findings.append(("violation", f"{rule_name}: after {du['label']} (arr {arr:%d %b %H:%M}) no turnaround may report before 23:00 next day — {nd['label']} reports {rep:%d %b %H:%M}."))
+                elif in_night_window and nd["max_sector_h"] >= REGIONAL_MAX_SECTOR_H:
+                    findings.append(("violation", f"{rule_name}: between 23:00–05:59 only a regional turnaround (<{REGIONAL_MAX_SECTOR_H:.0f}h sector) is allowed — {nd['label']} ({nd['max_sector_h']:.1f}h sector) reports {rep:%d %b %H:%M}."))
+            else:
+                if rep.date() == day1 and layover_ok_after and rep.time() < layover_ok_after:
+                    findings.append(("violation", f"{rule_name}: a one-sector layover may only report after {layover_ok_after:%H:%M} the following day — {nd['label']} reports {rep:%d %b %H:%M}."))
+                elif rep.date() == day1 and layover_strict and rep.time() < dtime(23, 0):
+                    findings.append(("note", f"{rule_name}: {nd['label']} reports {rep:%d %b %H:%M} the day after {du['label']} — guideline restricts assignments before 23:00 (check with crew control)."))
+
+    def require_days_off(arr, n_days, why):
+        for k in range(1, n_days + 1):
+            d = arr.date() + timedelta(days=k)
+            for e in duty_day_map.get(d, []):
+                findings.append(("violation", f"{why}: {arr.date():%d %b} arrival entitles arrival day + {n_days} day(s) off — but {e['label']} is rostered on {d:%d %b}."))
+
+    for du in duties:
+        arr = du["chocks_on"]
+        nxt = [e for e in events if e["dt"] > arr]
+
+        # R1 — 17h30 minimum rest at base
+        if du["dest"] == "CMB" and nxt:
+            rest = (nxt[0]["dt"] - arr).total_seconds() / 3600
+            if rest < MIN_BASE_REST_H:
+                findings.append(("violation", f"Min base rest: only {rest:.1f}h between {du['label']} chocks-on ({arr:%d %b %H:%M}) and next report ({nxt[0]['dt']:%d %b %H:%M}, {nxt[0]['label']}) — minimum is 17h30m."))
+
+        if du["is_turnaround"]:
+            hit_sa = set(du["stations"]) & SOUTHASIA_TA
+            # R3 — 24h rest after DEL/BOM/KHI arriving 00:01–11:59
+            if hit_sa and dtime(0, 1) <= arr.time() <= dtime(11, 59) and nxt:
+                rest = (nxt[0]["dt"] - arr).total_seconds() / 3600
+                if rest < 24:
+                    findings.append(("violation", f"24h rest rule: {du['label']} ({'/'.join(hit_sa)}) arrived {arr:%d %b %H:%M} (00:01–11:59 window) — needs 24h to next report, got {rest:.1f}h ({nxt[0]['label']} at {nxt[0]['dt']:%d %b %H:%M})."))
+            # R2 — DEL/BOM/KHI arriving 12:00–23:59 → next-day restrictions
+            if hit_sa and arr.time() >= dtime(12, 0):
+                check_next_day_restrictions(du, arr, "DEL/BOM/KHI rule", layover_strict=True)
+            # R5 — DXB/AUH/MCT turnarounds
+            if set(du["stations"]) & MIDEAST_TA:
+                check_next_day_restrictions(du, arr, "DXB/AUH/MCT rule", layover_ok_after=dtime(16, 0))
+            # UL231/232 special: next day only SBY2 / duty within 06:00–18:00
+            if du["numbers"] & {"UL231", "UL232"}:
+                d1 = arr.date() + timedelta(days=1)
+                for e in duty_day_map.get(d1, []):
+                    if not (dtime(6, 0) <= e["dt"].time() <= dtime(18, 0)):
+                        findings.append(("violation", f"UL231/232 rule: following-day duty must fall within 06:00–18:00 (SBY2 window) — {e['label']} reports {e['dt']:%d %b %H:%M}."))
+            # R8 — DOH/BAH/DMM turnaround: arrival day + 1 day off
+            hit_1off = set(du["stations"]) & ONE_OFF_TURNAROUND
+            if hit_1off:
+                require_days_off(arr, 1, f"{'/'.join(hit_1off)} turnaround")
+            # JED turnaround: arrival day + 2 days off
+            hit_jed = set(du["stations"]) & TWO_OFF_TURNAROUND
+            if hit_jed:
+                require_days_off(arr, 2, "JED turnaround")
+            # R9 — SIN/KUL/CGK morning turnaround → next-day flights after 18:00 only
+            hit_sea = set(du["stations"]) & SEASIA_MORNING_TA
+            if hit_sea and du["report"].time() <= dtime(12, 0):
+                d1 = arr.date() + timedelta(days=1)
+                for e in duty_day_map.get(d1, []):
+                    if e["kind"] == "FLIGHT" and e["dt"].time() < dtime(18, 0):
+                        findings.append(("violation", f"{'/'.join(hit_sea)} morning turnaround rule: next-day flights may only report after 18:00 — {e['label']} reports {e['dt']:%d %b %H:%M}."))
+        # R4 — four-sector days arriving before 17:30
+        if du["n"] >= 4 and arr.time() <= dtime(17, 30):
+            check_next_day_restrictions(du, arr, "Four-sector day rule", layover_ok_after=dtime(18, 0))
+
+    # R7 — long-haul layover stations: arrival day + 2 days off after return
+    for i, du in enumerate(duties):
+        hit = set(du["stations"]) & LONGHAUL_2OFF_LAYOVER
+        if hit and du["dest"] == "CMB":
+            # this duty RETURNS from a long-haul station (e.g. SYD ➔ CMB)
+            origins = {s["o"] for s in du["sectors"]}
+            if origins & LONGHAUL_2OFF_LAYOVER:
+                require_days_off(du["chocks_on"], 2, f"{'/'.join(origins & LONGHAUL_2OFF_LAYOVER)} layover")
+        elif du["dest"] == "CMB":
+            origins = {s["o"] for s in du["sectors"] if s["o"]}
+            lh = origins & LONGHAUL_2OFF_LAYOVER
+            if lh:
+                require_days_off(du["chocks_on"], 2, f"{'/'.join(lh)} layover")
+
+    # de-duplicate
+    seen, out = set(), []
+    for sev, msg in findings:
+        if msg not in seen:
+            seen.add(msg)
+            out.append((sev, msg))
+    return out
 
 # --- 3. LIVE TELEMETRY: FLIGHTSTATS (CIRIUM) PRIMARY + FLIGHTRADAR24 FALLBACK ---
 # Both sources are keyless with no hard quota. FlightStats carries true
@@ -551,7 +750,7 @@ def _telemetry_core(flight_no, flight_date, route, scheduled_dep):
 
 
 MIN_TURNAROUND_MIN = 60   # minimum realistic turnaround for the aircraft
-MIN_REST_HOURS = 10       # minimum legal rest before next duty (adjust to your OM-A)
+MIN_REST_HOURS = 17.5     # FAU: 17h30m chocks-on to next report at base
 
 def fetch_live_flight_telemetry(flight_no, flight_date, route, scheduled_dep):
     """Core dual-source status + inbound-aircraft watch on top."""
@@ -608,9 +807,9 @@ def rest_impact_note(rows, flight_no, fdate, delay_mins):
                     nxt = nr["Flight / Code"]
                     if new_rest >= MIN_REST_HOURS:
                         return (f"🛏 Rest impact: {rest0:.1f}h → {new_rest:.1f}h before {nxt} — "
-                                f"rest NOT affected (min {MIN_REST_HOURS}h).")
+                                f"rest NOT affected (min 17h30m).")
                     return (f"🛏 Rest impact: {rest0:.1f}h → {new_rest:.1f}h before {nxt} — "
-                            f"BELOW {MIN_REST_HOURS}h MINIMUM. Contact crew control; report/pickup time must shift.")
+                            f"BELOW the 17h30m FAU MINIMUM. Contact crew control; report/pickup time must shift.")
             return None
     return None
 
@@ -1111,6 +1310,43 @@ else:
             st.info("No layovers detected in roster for Layover Intel.")
         else:
             st.info("Paste your roster above to populate the calendar, analytics and layover intel.")
+
+        # ---------- ROSTER GUARDIAN: FAU SOFT-RULES AUDIT ----------
+        if parsed_rows:
+            st.markdown("#### 🛡 Roster Guardian — FAU Soft-Rules Audit")
+            findings = audit_roster(parsed_rows)
+            violations = [f for f in findings if f[0] == "violation"]
+            notes = [f for f in findings if f[0] == "note"]
+            if not findings:
+                st.markdown(
+                    "<div class='card' style='border-color:#4caf50;'><span style='color:#a5d6a7;'>✅ No soft-rule breaches detected in this roster "
+                    "(min rest, post-flight day-off entitlements, next-day assignment limits all OK).</span></div>",
+                    unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    f"<div class='card' style='border-color:#ff5252;'><b style='color:#ff8a8a;'>{len(violations)} possible breach(es)</b>"
+                    + (f" · <span style='color:#ffb74d;'>{len(notes)} advisory note(s)</span>" if notes else "") +
+                    "<div class='muted' style='margin-top:4px;'>Cross-check with crew control before filing — parser-based audit, scheduled times only.</div></div>",
+                    unsafe_allow_html=True)
+                for sev, msg in findings:
+                    if sev == "violation":
+                        st.markdown(f"<div style='font-size:12.5px;background:#2c1f1f;border:1px solid #ff5252;color:#ff8a8a;padding:10px;border-radius:8px;margin-bottom:8px;'>⚠️ {msg}</div>", unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"<div style='font-size:12.5px;background:#33260f;border:1px solid #ffc107;color:#ffd54f;padding:10px;border-radius:8px;margin-bottom:8px;'>ℹ️ {msg}</div>", unsafe_allow_html=True)
+            with st.expander("📖 FAU quick reference (standby insertion & rules summary)"):
+                st.markdown("""
+- **Min base rest:** 17h30 from chocks-on to next flight/ground-duty report (not ground→ground).
+- **DEL / BOM / KHI turnarounds** arriving 12:00–23:59 → next day: no turnaround before 23:00 report; 23:00–05:59 regional (<4h sector) only; anything after 06:00 on day 2.
+- **DEL / BOM / KHI turnarounds** arriving 00:01–11:59 → **24h rest** chocks-on to next report.
+- **Four-sector days** (arrival before 17:30) → next day: 1-sector layover after 18:00 only; same turnaround limits as above; SBY4 insertable.
+- **DXB / AUH / MCT turnarounds** → next day: 1-sector layover after 16:00 only; same turnaround limits; SBY4 insertable.
+- **UL231/232 (DXB)** → next day only SBY2 (06:00–18:00) or a flight within that window.
+- **LHR / FRA / CDG / FCO / MXP / NRT / SYD / MEL layovers & JED turnaround** → arrival day + **2 days off**.
+- **DOH / BAH / DMM turnarounds** → arrival day + **1 day off**.
+- **SIN / KUL / CGK morning turnarounds** → next-day flights report after 18:00, or SBY4.
+- **Standby insertion if your flight cancels:** morning T/A (report after 06:00) → SBY2 · morning T/A (report before 06:00) → SBY1 · Middle-East flight reporting before 18:00 → SBY3 · midnight flight reporting before midnight → SBY4 · midnight flight reporting after midnight → SBY1.
+- Duty leave counts as a duty day.
+                """)
 
     # ---------- RIGHT: AGENT ALERTS + BIDDING ----------
     with right_col:
