@@ -374,10 +374,60 @@ def query_fr24(flight_no, flight_date):
         "est_dep_local": _fmt_local_time(ref_dep, tz_off) if ref_dep else "-",
         "aircraft": ((matched.get("aircraft") or {}).get("model") or {}).get("code") or "-",
         "registration": ((matched.get("aircraft") or {}).get("registration")) or "-",
+        "sched_dep_epoch": sched_dep,
+        "origin_iata": ((origin.get("code") or {}) or {}).get("iata"),
+        "has_departed": bool(real_dep),
         "source": "Flightradar24",
     }
 
-def fetch_live_flight_telemetry(flight_no, flight_date, route, scheduled_dep):
+# --- INBOUND AIRCRAFT TRACKER (tail-number watch via FR24, keyless) ---
+@st.cache_data(ttl=600, show_spinner=False)
+def fr24_fetch_by_reg(reg):
+    """All recent/upcoming sectors flown by a specific tail number."""
+    params = {"query": reg, "fetchBy": "reg", "limit": 25, "page": 1}
+    resp = requests.get(FR24_URL, params=params, headers=FR24_HEADERS, timeout=15)
+    resp.raise_for_status()
+    payload = resp.json()
+    return (payload.get("result", {}).get("response", {}).get("data", None)) or []
+
+def analyze_inbound(reg, origin_iata, our_sched_dep_epoch):
+    """
+    Find the sector this exact aircraft flies INTO our departure airport
+    right before our flight, and measure how late it is running.
+    """
+    if not reg or reg == "-" or not origin_iata or not our_sched_dep_epoch:
+        return None
+    try:
+        entries = fr24_fetch_by_reg(reg)
+    except Exception:
+        return None
+    best, best_sa = None, 0
+    for e in entries:
+        dest = ((((e.get("airport") or {}).get("destination") or {}).get("code")) or {}).get("iata")
+        sa = (((e.get("time") or {}).get("scheduled")) or {}).get("arrival")
+        if dest == origin_iata and sa and sa <= our_sched_dep_epoch + 1800 and sa > best_sa:
+            best, best_sa = e, sa
+    if best is None:
+        return None
+    t = best.get("time", {}) or {}
+    sa = (t.get("scheduled") or {}).get("arrival")
+    ea = (t.get("estimated") or {}).get("arrival")
+    ra = (t.get("real") or {}).get("arrival")
+    st_obj = best.get("status", {}) or {}
+    status_text = (st_obj.get("text") or "").strip()
+    synthetic = "*" in status_text
+    ref = ra or (None if synthetic else ea)
+    delay = int((ref - sa) / 60) if (ref and sa and ref > sa) else 0
+    dtz = ((((best.get("airport") or {}).get("destination") or {}).get("timezone")) or {}).get("offset") or 0
+    num = (((best.get("identification") or {}).get("number") or {}).get("default")) or "?"
+    from_iata = ((((best.get("airport") or {}).get("origin") or {}).get("code")) or {}).get("iata") or "?"
+    return {"flight_no": num, "from": from_iata,
+            "delay_mins": delay, "landed": bool(ra), "live": bool(st_obj.get("live")),
+            "sched_arr_local": _fmt_local_time(sa, dtz),
+            "est_arr_local": _fmt_local_time(ref, dtz) if ref else "-",
+            "turnaround_min": int((our_sched_dep_epoch - sa) / 60) if sa else None}
+
+def _telemetry_core(flight_no, flight_date, route, scheduled_dep):
     """
     flight_date is a datetime.date object taken straight from the roster.
     Strategy: FlightStats/Cirium (airline-filed disruptions) is authoritative;
@@ -442,6 +492,71 @@ def fetch_live_flight_telemetry(flight_no, flight_date, route, scheduled_dep):
                 "status_message": f"✅ No disruption filed — {flight_no} dep {sched}{live_str}. FR24 estimate is predictive only; will alert if a delay/cancellation is filed{tail}."}
     return {"is_delayed": False, "severity": "ok",
             "status_message": f"✅ {fr.get('fr24_status', 'On time')}{live_str} — {flight_no} dep {sched} verified via Flightradar24{tail}."}
+
+
+MIN_TURNAROUND_MIN = 60   # minimum realistic turnaround for the aircraft
+MIN_REST_HOURS = 10       # minimum legal rest before next duty (adjust to your OM-A)
+
+def fetch_live_flight_telemetry(flight_no, flight_date, route, scheduled_dep):
+    """Core dual-source status + inbound-aircraft watch on top."""
+    res = _telemetry_core(flight_no, flight_date, route, scheduled_dep)
+    res.setdefault("inbound_note", None)
+    res.setdefault("inbound_risk", False)
+    fr = query_fr24(flight_no, flight_date)   # cached — no extra network cost
+    if (fr.get("status_known") and not fr.get("has_departed")
+            and res.get("severity") in ("ok", "delayed", "unknown")):
+        inb = analyze_inbound(fr.get("registration"), fr.get("origin_iata"), fr.get("sched_dep_epoch"))
+        if inb and inb["delay_mins"] >= 15:
+            remaining = (inb["turnaround_min"] or 0) - inb["delay_mins"]
+            risk = remaining < MIN_TURNAROUND_MIN
+            arr_word = "landed" if inb["landed"] else ("ETA" if inb["est_arr_local"] != "-" else "due")
+            res["inbound_note"] = (
+                f"🛬 Inbound aircraft {inb['flight_no']} ({inb['from']} ➔ {fr.get('origin_iata')}) "
+                f"running ~{inb['delay_mins']} min late ({arr_word} {inb['est_arr_local']}, sched {inb['sched_arr_local']}). "
+                f"Turnaround buffer left: {max(remaining, 0)} min — "
+                + ("DEPARTURE AT RISK. Expect a delay call." if risk else "your departure should hold."))
+            res["inbound_risk"] = risk
+    return res
+
+def rest_impact_note(rows, flight_no, fdate, delay_mins):
+    """
+    If a monitored flight is running late, recompute the rest period before
+    the NEXT duty in the roster and flag if it drops below MIN_REST_HOURS.
+    """
+    if not delay_mins or delay_mins <= 0:
+        return None
+    for i, r in enumerate(rows):
+        if (r["Flight / Code"] == flight_no and r["DateObj"] is not None
+                and r["DateObj"].date() == fdate and r["Arrival"] != "-"):
+            try:
+                arr_t = datetime.strptime(r["Arrival"], "%H:%M").time()
+                arr_dt = datetime.combine(fdate, arr_t)
+                if r["Departure"] != "-" and r["Arrival"] < r["Departure"]:
+                    arr_dt += timedelta(days=1)
+            except Exception:
+                return None
+            for j in range(i + 1, len(rows)):
+                nr = rows[j]
+                if nr["Type"] in ("FLIGHT", "STANDBY") and nr["DateObj"] is not None:
+                    tstr = nr["Check-In"] if nr["Check-In"] != "-" else nr["Departure"]
+                    if tstr == "-":
+                        return None
+                    try:
+                        ci_dt = datetime.combine(nr["DateObj"].date(), datetime.strptime(tstr, "%H:%M").time())
+                    except Exception:
+                        return None
+                    rest0 = (ci_dt - arr_dt).total_seconds() / 3600
+                    if rest0 <= 0:
+                        return None
+                    new_rest = rest0 - delay_mins / 60
+                    nxt = nr["Flight / Code"]
+                    if new_rest >= MIN_REST_HOURS:
+                        return (f"🛏 Rest impact: {rest0:.1f}h → {new_rest:.1f}h before {nxt} — "
+                                f"rest NOT affected (min {MIN_REST_HOURS}h).")
+                    return (f"🛏 Rest impact: {rest0:.1f}h → {new_rest:.1f}h before {nxt} — "
+                            f"BELOW {MIN_REST_HOURS}h MINIMUM. Contact crew control; report/pickup time must shift.")
+            return None
+    return None
 
 # --- 3.5 ANALYTICS, STATION INTEL & WEATHER (KEYLESS) ---
 import math
@@ -659,7 +774,7 @@ def sparkline_svg(values, color="#ff5252"):
     return (f"<svg width='{w}' height='{h}' viewBox='0 0 {w} {h}'>"
             f"<polyline points='{pts}' fill='none' stroke='{color}' stroke-width='2'/></svg>")
 
-def build_calendar_html(rows, anchor_day=None):
+def build_calendar_html(rows, month=None):
     valid = [r for r in rows if r["DateObj"] is not None]
     if not valid:
         return "<div style='color:#7e8ba0;font-size:13px;'>No dated duties parsed.</div>"
@@ -667,8 +782,14 @@ def build_calendar_html(rows, anchor_day=None):
     for r in rows:
         if r["DateObj"]:
             rmap.setdefault(r["DateObj"].date(), []).append(r)
-    dmin = min(r["DateObj"] for r in valid).date()
-    dmax = max(r["DateObj"] for r in valid).date()
+    rmin = min(r["DateObj"] for r in valid).date()
+    rmax = max(r["DateObj"] for r in valid).date()
+    if month:
+        y, m = month
+        dmin = datetime(y, m, 1).date()
+        dmax = (datetime(y + (m == 12), (m % 12) + 1, 1) - timedelta(days=1)).date()
+    else:
+        dmin, dmax = rmin, rmax
     start = dmin - timedelta(days=dmin.weekday())
     end = dmax + timedelta(days=6 - dmax.weekday())
     today = datetime.now().date()
@@ -677,8 +798,9 @@ def build_calendar_html(rows, anchor_day=None):
         cells.append(f"<div class='cal-hd'>{wd}</div>")
     d = start
     while d <= end:
-        in_range = dmin <= d <= dmax
-        cls = "cal-cell" + ("" if in_range else " cal-dim") + (" cal-today" if d == today else "")
+        in_month = dmin <= d <= dmax
+        in_roster = rmin <= d <= rmax
+        cls = "cal-cell" + ("" if (in_month and in_roster) else " cal-dim") + (" cal-today" if d == today else "")
         chips = []
         for act in rmap.get(d, []):
             if act["Type"] == "FLIGHT":
@@ -690,7 +812,7 @@ def build_calendar_html(rows, anchor_day=None):
                 chips.append("<div class='chip chip-off'>🟢 OFF</div>")
             elif act["Type"] == "STANDBY":
                 chips.append("<div class='chip chip-sby'>⏱ Standby</div>")
-        if in_range and not chips:
+        if (in_month and in_roster) and not chips:
             chips.append("<div class='chip chip-none'>No duty</div>")
         cells.append(f"<div class='{cls}'><div class='cal-date'>{d.day} {d.strftime('%b') if d.day == 1 or d == start else ''}</div>{''.join(chips)}</div>")
         d += timedelta(days=1)
@@ -858,7 +980,30 @@ else:
                 else:
                     st.warning("Please paste roster text.")
 
-        st.markdown(f"<div class='card'>{build_calendar_html(parsed_rows)}</div>", unsafe_allow_html=True)
+        # Month navigation (appears when the roster spans multiple months)
+        months = sorted({(d.year, d.month) for d in valid_dates_all})
+        if months:
+            if 'cal_month_idx' not in st.session_state or st.session_state['cal_month_idx'] >= len(months):
+                today_ym = (datetime.now().year, datetime.now().month)
+                st.session_state['cal_month_idx'] = months.index(today_ym) if today_ym in months else 0
+            if len(months) > 1:
+                nav1, nav2, nav3 = st.columns([1, 4, 1])
+                with nav1:
+                    if st.button("‹", use_container_width=True, disabled=st.session_state['cal_month_idx'] == 0):
+                        st.session_state['cal_month_idx'] -= 1
+                        st.rerun()
+                with nav3:
+                    if st.button("›", use_container_width=True, disabled=st.session_state['cal_month_idx'] == len(months) - 1):
+                        st.session_state['cal_month_idx'] += 1
+                        st.rerun()
+                with nav2:
+                    y, m = months[st.session_state['cal_month_idx']]
+                    st.markdown(f"<div style='text-align:center;font-weight:700;padding-top:6px;'>{datetime(y, m, 1).strftime('%B %Y')}</div>", unsafe_allow_html=True)
+            sel_month = months[st.session_state['cal_month_idx']]
+        else:
+            sel_month = None
+
+        st.markdown(f"<div class='card'>{build_calendar_html(parsed_rows, month=sel_month)}</div>", unsafe_allow_html=True)
 
         # Layover Intel
         layovers = [lv for lv in analytics["layovers"] if lv["station"]]
@@ -930,14 +1075,27 @@ else:
                 for flight in active_target_flights:
                     telemetry = fetch_live_flight_telemetry(flight["flight_no"], flight["date_obj"],
                                                             flight["route"], flight["dep_time"])
+                    # Rest-period impact for delayed/diverted flights
+                    rest_note = None
+                    if telemetry.get("severity") in ("delayed", "diverted"):
+                        delay_guess = None
+                        m = re.search(r'by ~(\d+) min', telemetry.get("status_message", ""))
+                        if m:
+                            delay_guess = int(m.group(1))
+                        rest_note = rest_impact_note(parsed_rows, flight["flight_no"],
+                                                     flight["date_obj"], delay_guess or 0)
                     flight_check_results.append({"flight": flight["flight_no"], "route": flight["route"],
                                                  "date": flight["date_obj"].strftime("%d %b %Y"),
                                                  "delayed": telemetry["is_delayed"],
                                                  "severity": telemetry.get("severity", "ok"),
-                                                 "status": telemetry["status_message"]})
+                                                 "status": telemetry["status_message"],
+                                                 "inbound_note": telemetry.get("inbound_note"),
+                                                 "inbound_risk": telemetry.get("inbound_risk", False),
+                                                 "rest_note": rest_note})
         st.session_state['alert_count'] = sum(
             1 for f in flight_check_results
-            if f["severity"] in ("delayed", "cancelled", "diverted") and (f["flight"], f["date"]) not in st.session_state['acked'])
+            if (f["severity"] in ("delayed", "cancelled", "diverted") or f["inbound_risk"])
+            and (f["flight"], f["date"]) not in st.session_state['acked'])
 
         if not agent_on:
             st.markdown("<div class='card muted'>Real-time monitor paused.</div>", unsafe_allow_html=True)
@@ -960,31 +1118,32 @@ else:
                 else:
                     bc, bg, tc, icon = "#4caf50", "#12301f", "#a5d6a7", "✈️"
                 op = "opacity:.5;" if acked else ""
+                extra = ""
+                if df.get("inbound_note"):
+                    inb_bc = "#ff6d00" if df["inbound_risk"] else "#ffc107"
+                    extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#2b2413;"
+                              f"border:1px solid {inb_bc};color:#ffd54f;font-size:11.5px;'>{df['inbound_note']}</div>")
+                if df.get("rest_note"):
+                    rest_bad = "BELOW" in df["rest_note"]
+                    r_bc = "#ff5252" if rest_bad else "#4caf50"
+                    r_tc = "#ff8a8a" if rest_bad else "#a5d6a7"
+                    extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#131f2b;"
+                              f"border:1px solid {r_bc};color:{r_tc};font-size:11.5px;'>{df['rest_note']}</div>")
                 st.markdown(
                     f"<div style='font-size:13px;background:{bg};padding:12px;border-radius:8px;margin-top:10px;border:1px solid {bc};{op}'>"
                     f"{icon} <b style='font-size:14px;'>{df['flight']}</b> ({df['route']}) — <span style='color:#ccc;'><i>{df['date']}</i></span>"
-                    f"<div style='margin-top:5px;color:{tc};font-size:12px;'>{df['status']}</div></div>",
+                    f"<div style='margin-top:5px;color:{tc};font-size:12px;'>{df['status']}</div>{extra}</div>",
                     unsafe_allow_html=True)
-                if df["severity"] in ("delayed", "cancelled", "diverted") and not acked:
+                if (df["severity"] in ("delayed", "cancelled", "diverted") or df["inbound_risk"]) and not acked:
                     if st.button("Acknowledge", key=f"ack_{df['flight']}_{df['date']}", use_container_width=True):
                         st.session_state['acked'].add(key)
                         st.rerun()
             if st.button("🔄 Force Refresh Live Data", use_container_width=True):
                 fr24_fetch_flight_history.clear()
                 flightstats_fetch.clear()
+                fr24_fetch_by_reg.clear()
                 st.rerun()
         else:
             st.markdown(
                 f"<div class='card muted'>No flights found for {simulated_today.strftime('%d %b')} or {simulated_tomorrow.strftime('%d %b')}.</div>",
                 unsafe_allow_html=True)
-
-        st.markdown("#### Agent: Tactical Bidding")
-        st.text_input("Search pairing...", placeholder="Find me a Sydney long stay", label_visibility="collapsed")
-        st.markdown(
-            "<div class='card'>"
-            "<div class='bidrow muted'><span>Pairing</span><span>Layover</span><span>Competition</span></div>"
-            "<div class='bidrow'><span><b>SYD-01</b></span><span>24h 30m</span><span style='color:#ff5252;'>18 Req [High]</span></div>"
-            "<div class='bidrow'><span><b>SYD-04</b> ⭐</span><span>34h 00m</span><span style='color:#ff9800;'>5 Req [Low]</span></div>"
-            "<div class='bidrow'><span><b>SYD-09</b></span><span>48h 00m</span><span style='color:#ff5252;'>22 Req [V.High]</span></div>"
-            "</div>", unsafe_allow_html=True)
-        st.button("Request SYD-04", use_container_width=True)
