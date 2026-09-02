@@ -1,5 +1,2 @@
-streamlit
-pandas
-requests
-beautifulsoup4
-duckduckgo_search
+streamlit>=1.30
+requests>=2.31
