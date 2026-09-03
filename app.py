@@ -6,6 +6,62 @@ import json
 import requests
 from datetime import datetime, timedelta, timezone, time as dtime
 
+# --- 0. TIMEZONE HANDLING ---
+# The crew portal logs every time in the LOCAL time of the airport where the
+# event happens: check-in/departure in ORIGIN local time, arrival/check-out in
+# DESTINATION local time. Naively subtracting them over/under-counts block
+# hours (e.g. MEL -> CMB looked like 6h instead of ~10h30). We keep the local
+# stamps as-is (they drive the calendar and the FAU-sheet allowance math such
+# as overnights/meals) and ALSO compute a UTC twin of each stamp so elapsed
+# time math (block hours, acting hours) is exact across time zones.
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:          # Python < 3.9 fallback
+    ZoneInfo = None
+
+AIRPORT_TZ = {               # IATA -> IANA timezone (DST-aware)
+    "CMB": "Asia/Colombo", "MAA": "Asia/Kolkata", "DEL": "Asia/Kolkata",
+    "BOM": "Asia/Kolkata", "BLR": "Asia/Kolkata", "HYD": "Asia/Kolkata",
+    "CCU": "Asia/Kolkata", "COK": "Asia/Kolkata", "TRV": "Asia/Kolkata",
+    "TRZ": "Asia/Kolkata", "MLE": "Indian/Maldives", "GAN": "Indian/Maldives",
+    "KHI": "Asia/Karachi", "LHE": "Asia/Karachi", "DAC": "Asia/Dhaka",
+    "DXB": "Asia/Dubai", "AUH": "Asia/Dubai", "DOH": "Asia/Qatar",
+    "BAH": "Asia/Bahrain", "DMM": "Asia/Riyadh", "RUH": "Asia/Riyadh",
+    "JED": "Asia/Riyadh", "KWI": "Asia/Kuwait", "MCT": "Asia/Muscat",
+    "SIN": "Asia/Singapore", "KUL": "Asia/Kuala_Lumpur", "BKK": "Asia/Bangkok",
+    "CGK": "Asia/Jakarta", "HKG": "Asia/Hong_Kong", "CAN": "Asia/Shanghai",
+    "PVG": "Asia/Shanghai", "PEK": "Asia/Shanghai", "ICN": "Asia/Seoul",
+    "NRT": "Asia/Tokyo", "KIX": "Asia/Tokyo", "IST": "Europe/Istanbul",
+    "LHR": "Europe/London", "CDG": "Europe/Paris", "FRA": "Europe/Berlin",
+    "ZRH": "Europe/Zurich", "SYD": "Australia/Sydney", "MEL": "Australia/Melbourne",
+    "SEZ": "Indian/Mahe",
+}
+
+AIRPORT_OFFSET_H = {         # fixed UTC offsets — fallback if zoneinfo missing
+    "CMB": 5.5, "MAA": 5.5, "DEL": 5.5, "BOM": 5.5, "BLR": 5.5, "HYD": 5.5,
+    "CCU": 5.5, "COK": 5.5, "TRV": 5.5, "TRZ": 5.5, "MLE": 5.0, "GAN": 5.0,
+    "KHI": 5.0, "LHE": 5.0, "DAC": 6.0, "DXB": 4.0, "AUH": 4.0, "DOH": 3.0,
+    "BAH": 3.0, "DMM": 3.0, "RUH": 3.0, "JED": 3.0, "KWI": 3.0, "MCT": 4.0,
+    "SIN": 8.0, "KUL": 8.0, "BKK": 7.0, "CGK": 7.0, "HKG": 8.0, "CAN": 8.0,
+    "PVG": 8.0, "PEK": 8.0, "ICN": 9.0, "NRT": 9.0, "KIX": 9.0, "IST": 3.0,
+    "LHR": 0.0, "CDG": 1.0, "FRA": 1.0, "ZRH": 1.0, "SYD": 10.0, "MEL": 10.0,
+    "SEZ": 4.0,
+}
+
+def to_utc(dt, iata):
+    """Convert a naive local datetime at airport `iata` to a naive UTC datetime."""
+    if dt is None or dt.tzinfo is not None:
+        return dt
+    code = (iata or "").upper()
+    if ZoneInfo is not None:
+        try:
+            tz = ZoneInfo(AIRPORT_TZ.get(code, "Asia/Colombo"))
+            return dt.replace(tzinfo=tz).astimezone(timezone.utc).replace(tzinfo=None)
+        except Exception:
+            pass
+    off = AIRPORT_OFFSET_H.get(code, 5.5)
+    return dt - timedelta(hours=off)
+
 # --- 1. DATABASE SETUP ---
 def init_db():
     conn = sqlite3.connect('crew_companion.db')
@@ -208,6 +264,22 @@ def parse_roster_text(raw_text):
                 if m:
                     flight_no = f"UL {m.group(1)}"
 
+            # Raw activity code — needed for CLV exclusion & acting-duty marking
+            if activity_type == "FLIGHT":
+                code = flight_no.replace(" ", "")
+            elif activity_type == "LAYOVER":
+                code = "HTL"
+            elif activity_type == "DAY OFF":
+                code = next((c for c in ("ROF", "TOF", "OFF") if c in line_str), "OFF")
+            elif activity_type == "STANDBY":
+                m = re.search(r'\bSB\d*\b', line_str)
+                code = m.group(0) if m else "SB"
+            elif activity_type == "LEAVE":
+                m = re.search(r'\b(ALV|RLV|ALP|CLV)\b', line_str)
+                code = m.group(1) if m else "LEAVE"
+            else:
+                code = "OTHER"
+
             # Multi-day span support (layover/standby/off blocks with start+end stamps)
             if dt_stamps:
                 start_dt, end_dt = min(dt_stamps), max(dt_stamps)
@@ -290,11 +362,33 @@ def parse_roster_text(raw_text):
             elif activity_type in ("STANDBY", "LAYOVER") and dt_stamps:
                 ci_dt, co_dt = min(dt_stamps), max(dt_stamps)
 
+            # --- timezone normalization ---
+            # Portal logs check-in/departure in ORIGIN local time and
+            # arrival/check-out in DESTINATION local time. The LOCAL stamps are
+            # kept untouched for calendar-date / allowance math (overnights &
+            # meals follow the same convention as the FAU sheet). UTC twins are
+            # computed alongside for true elapsed-time math (block hours).
+            if activity_type == "LAYOVER":
+                stn = route if route not in (None, "-") else "CMB"
+                origin_iata = dest_iata = stn
+            elif activity_type == "STANDBY":
+                origin_iata = dest_iata = "CMB"
+            elif route and "➔" in route:
+                p = [x.strip() for x in route.split("➔")]
+                origin_iata, dest_iata = (p + ["CMB", "CMB"])[:2]
+            else:
+                origin_iata = dest_iata = "CMB"
+            ci_u = to_utc(ci_dt, origin_iata)
+            dep_u = to_utc(dep_dt, origin_iata)
+            arr_u = to_utc(arr_dt, dest_iata)
+            co_u = to_utc(co_dt, dest_iata)
+
             parsed_rows.append({
                 "Date": row_date_str,
                 "DateObj": row_dt_obj,
                 "EndDateObj": end_dt_obj,
                 "Type": activity_type,
+                "Code": code,
                 "Flight / Code": flight_no if flight_no != "-" else activity_type,
                 "Check-In": checkin_time,
                 "Departure": dep_time,
@@ -302,7 +396,8 @@ def parse_roster_text(raw_text):
                 "Arrival": arr_time,
                 "Checkout": checkout_time,
                 "Aircraft": ac_type,
-                "CIdt": ci_dt, "DEPdt": dep_dt, "ARRdt": arr_dt, "COdt": co_dt
+                "CIdt": ci_dt, "DEPdt": dep_dt, "ARRdt": arr_dt, "COdt": co_dt,
+                "CIdt_u": ci_u, "DEPdt_u": dep_u, "ARRdt_u": arr_u, "COdt_u": co_u
             })
 
     return parsed_rows
@@ -331,8 +426,12 @@ def build_duties(rows):
     duties = []
     for r in fl:
         o, d = _route_od(r["Route"])
+        if r.get("DEPdt_u") and r.get("ARRdt_u"):
+            block_h = (r["ARRdt_u"] - r["DEPdt_u"]).total_seconds() / 3600
+        else:
+            block_h = (r["ARRdt"] - r["DEPdt"]).total_seconds() / 3600
         sec = {"flight": r["Flight / Code"], "o": o, "d": d, "dep": r["DEPdt"], "arr": r["ARRdt"],
-               "ci": r.get("CIdt"), "block_h": (r["ARRdt"] - r["DEPdt"]).total_seconds() / 3600}
+               "ci": r.get("CIdt"), "block_h": block_h}
         if duties and (sec["dep"] - duties[-1]["chocks_on"]).total_seconds() <= 4 * 3600 \
                 and duties[-1]["dest"] == o:
             duties[-1]["sectors"].append(sec)
@@ -970,8 +1069,15 @@ def compute_analytics(rows):
     duty_days, daily_min = set(), {}
     layovers = enrich_layovers(rows)
     for r in rows:
-        if r["Type"] == "FLIGHT" and r["Departure"] != "-" and r["Arrival"] != "-":
-            m = _mins_between(r["Departure"], r["Arrival"])
+        if r["Type"] == "FLIGHT":
+            if r.get("DEPdt_u") and r.get("ARRdt_u"):
+                m = int((r["ARRdt_u"] - r["DEPdt_u"]).total_seconds() // 60)
+                if m <= 0:
+                    m = 0
+            elif r["Departure"] != "-" and r["Arrival"] != "-":
+                m = _mins_between(r["Departure"], r["Arrival"])
+            else:
+                continue
             block_min += m
             n_flights += 1
             try:
@@ -1189,13 +1295,22 @@ def _meal_counts(start, end):
         d += timedelta(days=1)
     return tuple(out)
 
-def compute_salary(rows, prof):
+def compute_salary(rows, prof, acting=None):
     """Full payslip from parsed roster + crew profile. Mirrors the sheet:
     meal entitlements (P), on-board meal deduction (Q/OBOPMA), layover &
     turnaround overnights, SCHBLK-guaranteed split-rate productivity, APIT."""
     cat = prof["cat"]
     rate = float(prof["rate"])
     flights = [(i, r) for i, r in enumerate(rows) if r["Type"] == "FLIGHT"]
+
+    def _block_mins(r):
+        """True elapsed block minutes — UTC twins when available (handles the
+        portal's mixed-local timestamps), else the local stamps as fallback."""
+        if r.get("ARRdt_u") and r.get("DEPdt_u"):
+            return max(0, int((r["ARRdt_u"] - r["DEPdt_u"]).total_seconds() // 60))
+        if r.get("ARRdt") and r.get("DEPdt"):
+            return max(0, int((r["ARRdt"] - r["DEPdt"]).total_seconds() // 60))
+        return 0
 
     def win(r):
         return (r.get("CIdt") or r.get("DEPdt")), (r.get("COdt") or r.get("ARRdt"))
@@ -1230,10 +1345,17 @@ def compute_salary(rows, prof):
             for k, v in enumerate((b, l, d)):
                 ent[k] += v
             detail.append((f"🏨 Layover {r['Route']}", f"{b}B {l}L {d}D", "hotel"))
-        if hs:
-            end_ref = (nf["ARRdt"].date() if (nf and nf.get("ARRdt"))
-                       else (r["EndDateObj"].date() if r.get("EndDateObj") else hs.date()))
-            l_nights += max(0, (end_ref - hs.date()).days)
+        # Layover O/N count — nights AWAY FROM BASE, from the outbound flight's
+        # report (check-in) to the return flight's check-out after landing.
+        # Mirrors the sheet's 'Hours & ONights' column I ("L Overnight"):
+        #   INT(next_checkout_or_end) - INT(prev_checkin_or_checkout)
+        prev_time = (pf.get("CIdt") or pf.get("COdt") or pf.get("ARRdt")) if pf else (r.get("CIdt") or hs)
+        if nf is not None:
+            next_time = nf.get("COdt") or nf.get("ARRdt") or he
+        else:
+            next_time = he or r.get("EndDateObj")
+        if prev_time and next_time and next_time > prev_time:
+            l_nights += (next_time.date() - prev_time.date()).days
 
     t_on = 0
     for i, r in flights:
@@ -1243,9 +1365,9 @@ def compute_salary(rows, prof):
         if s and e and s.date() != e.date():
             t_on += 1
 
-    block_min = sum(int((r["ARRdt"] - r["DEPdt"]).total_seconds() // 60)
-                    for _, r in flights if r.get("ARRdt") and r.get("DEPdt"))
-    leave_days = sum(1 for r in rows if r["Type"] == "LEAVE")
+    block_min = sum(_block_mins(r) for _, r in flights)
+    # CLV (casual leave) is NOT paid — only ALV / RLV / ALP (sheet C17)
+    leave_days = sum(1 for r in rows if r.get("Code") in ("ALV", "RLV", "ALP"))
 
     # --- FBPP: turnaround allowance (H&O col O formula) ---
     # Inbound sector to CMB, previous roster row not HTL → $28 if scheduled
@@ -1253,6 +1375,8 @@ def compute_salary(rows, prof):
     # actual block time for flight numbers not in the table.
     fbpp_usd = 0.0
     fbpp_items = []
+    fbpp_missing = []
+    fbpp_overrides = (prof.get("fbpp_overrides") or {})
     for i, r in flights:
         _o, _d = _route_od(r["Route"])
         if _d != "CMB":
@@ -1260,21 +1384,53 @@ def compute_salary(rows, prof):
         if i - 1 >= 0 and rows[i - 1]["Type"] == "LAYOVER":
             continue  # returning from a layover — not a turnaround
         fl = str(r["Flight / Code"]).replace(" ", "").upper()
-        sched = UL_SCHED_MIN.get(fl)
-        approx = False
+        # FBPP pays on the COMBINED up+down SCHEDULED time, keyed by the return
+        # flight number (UL # table). Actual block time under-reports (e.g.
+        # 2h + 1h50 = 3h50 < 4h), so we never fall back to actual silently.
+        sched = UL_SCHED_MIN.get(fl) or fbpp_overrides.get(fl)
         if sched is None:
-            if r.get("ARRdt") and r.get("DEPdt"):
-                sched = int((r["ARRdt"] - r["DEPdt"]).total_seconds() // 60)
-                approx = True
-            else:
-                continue
+            hint = None
+            pr = rows[i - 1] if i - 1 >= 0 else None
+            if pr is not None:
+                b1 = _block_mins(pr)
+                b2 = _block_mins(r)
+                if b1 > 0 and b2 > 0:
+                    hint = b1 + b2
+            fbpp_missing.append((fl, f"{_o} ➔ CMB", hint))
+            continue
         amt = FBPP_OVER4_USD if sched > FBPP_SPLIT_MIN else FBPP_UNDER4_USD
         fbpp_usd += amt
-        fbpp_items.append((f"{fl} {_o}➔CMB", sched, amt, approx))
+        fbpp_items.append((f"{fl} {_o}➔CMB", sched, amt, False))
     fbpp_rs = fbpp_usd * rate
 
+    # --- acting duty (sheet Breakdown!J12-J15) ---
+    # Hours flown in a higher category are paid at the ACTING category's <75h
+    # hourly rate (CS → CS<5Yrs $13.5, PUR → PUR<5Yrs $20), and are excluded
+    # from the regular 75h-split productivity pay.
+    act_min, act_pay_rs, act_detail = 0, 0.0, []
+    acting_marks = acting or {}
+    if acting_marks:
+        for i, r in flights:
+            if not r.get("DateObj"):
+                continue
+            key = f"{r.get('Code') or str(r['Flight / Code']).replace(' ', '')}@{r['DateObj'].date()}"
+            cat_act = acting_marks.get(key)
+            if not cat_act:
+                continue
+            lookup = {"CS": "CS<5Yrs", "PUR": "PUR<5Yrs"}.get(cat_act, cat_act)
+            rate_act = HOURLY_PAY.get(lookup, (0, 0))[0]
+            mins = _block_mins(r)
+            act_min += mins
+            act_pay_rs += (mins / 60) * rate_act * rate
+            act_detail.append((r["Flight / Code"], cat_act, mins))
+
     # --- productivity pay (Breakdown!B6/B7/B8/C15) ---
-    final_min = max(block_min, int(prof["schblk_min"]))
+    # Regular paid minutes: if total (regular + acting) is under SCHBLK the
+    # guarantee tops the REGULAR part up to SCHBLK − acting; otherwise the
+    # regular part is paid as flown.
+    reg_min = block_min - act_min
+    schblk_min = int(prof["schblk_min"])
+    final_min = max(0, schblk_min - act_min) if block_min < schblk_min else reg_min
     m75, mex = min(final_min, SPLIT_MIN), max(0, final_min - SPLIT_MIN)
     r75, rex = HOURLY_PAY[cat]
     ob_count = sum(ob)
@@ -1285,7 +1441,7 @@ def compute_salary(rows, prof):
     premium = SPECIAL_PREMIUM[cat]
     leave_rs = leave_days * LEAVE_RATE_RS[cat]
     earnings = (float(prof["basic"]) + premium + float(prof["crge"])
-                + productivity_rs + fbpp_rs + leave_rs)
+                + productivity_rs + fbpp_rs + leave_rs + act_pay_rs)
 
     epf = round((float(prof["basic"]) + premium) * float(prof.get("epf_pct", 10)) / 100)
     tax = apit_tax(earnings)
@@ -1303,6 +1459,8 @@ def compute_salary(rows, prof):
         "l_nights": l_nights, "t_on": t_on, "leave_days": leave_days,
         "productivity_rs": productivity_rs, "ob_deduct_rs": ob_deduct_rs,
         "fbpp_usd": fbpp_usd, "fbpp_rs": fbpp_rs, "fbpp_items": fbpp_items,
+        "fbpp_missing": fbpp_missing,
+        "act_min": act_min, "act_pay_rs": act_pay_rs, "act_detail": act_detail,
         "premium": premium, "leave_rs": leave_rs,
         "earnings": earnings, "epf": epf, "tax": tax, "festival": fest,
         "deductions": deductions, "net": net,
@@ -1773,11 +1931,41 @@ else:
                     _n_f = sum(1 for r in perf_rows if r["Type"] == "FLIGHT")
                     _mlabel = datetime(sel_month[0], sel_month[1], 1).strftime("%B %Y") if sel_month else ""
                     st.markdown(f"<div class='muted' style='margin-bottom:8px;'>✅ Computing <b>{_mlabel}</b>: <b>{_n_f} sectors</b> · duties {min(_pd).strftime('%d %b')} – {max(_pd).strftime('%d %b')}</div>", unsafe_allow_html=True)
+                # --- acting duty marks (persisted per flight + date) ---
+                acting_saved = saved.get("acting", {}) or {}
+                flight_rows = [r for r in perf_rows if r["Type"] == "FLIGHT" and r.get("DateObj")]
+                acting_live = {}
+                if flight_rows:
+                    with st.expander("🎭 Acting Duty (flights flown in a higher category)", expanded=bool(acting_saved)):
+                        st.markdown("<div class='muted' style='margin-bottom:6px;'>Tick any flight you operated <b>acting</b> (e.g. C/C as CS, or CS as PUR). Acting hours are paid at the acting category's rate (<b>CS $13.5/h · PUR $20/h</b>) on top of your regular pay, and are excluded from the regular 75h-split.</div>", unsafe_allow_html=True)
+                        for idx, r in enumerate(flight_rows):
+                            code = r.get("Code") or str(r["Flight / Code"]).replace(" ", "")
+                            skey = f"{code}@{r['DateObj'].date()}"
+                            c1, c2 = st.columns([3.2, 1])
+                            on = c1.checkbox(f"{r['Flight / Code']} · {r['Route']} · {r['DateObj'].strftime('%d %b')}",
+                                             value=skey in acting_saved, key=f"act_{skey}_{idx}")
+                            cat_act = c2.selectbox("Acting cat", ["CS", "PUR"],
+                                                   index=1 if acting_saved.get(skey) == "PUR" else 0,
+                                                   key=f"actcat_{skey}_{idx}", disabled=not on)
+                            if on:
+                                acting_live[skey] = cat_act
+                        if st.button("💾 Save Acting Marks", use_container_width=True, key="act_save"):
+                            marks = {}
+                            for idx, r in enumerate(flight_rows):
+                                code = r.get("Code") or str(r["Flight / Code"]).replace(" ", "")
+                                skey = f"{code}@{r['DateObj'].date()}"
+                                if st.session_state.get(f"act_{skey}_{idx}"):
+                                    marks[skey] = st.session_state.get(f"actcat_{skey}_{idx}", "CS")
+                            save_profile(st.session_state["username"], {**saved, "acting": marks})
+                            st.success("Acting marks saved.")
+                            st.rerun()
+
                 prof = {"cat": cat, "rate": usd_rate, "schblk_min": parse_hhmm_minutes(schblk),
                         "festival": festival, "basic": basic, "crge": crge,
                         "transport": transport, "medical": medical, "fau": fau,
-                        "stamp": stamp, "apiit": apiit, "epf_pct": epf_pct}
-                s = compute_salary(perf_rows, prof)
+                        "stamp": stamp, "apiit": apiit, "epf_pct": epf_pct,
+                        "fbpp_overrides": saved.get("fbpp_overrides", {})}
+                s = compute_salary(perf_rows, prof, acting=acting_live)
 
                 h1, h2, h3 = st.columns(3)
                 h1.markdown(f"<div class='card' style='text-align:center;border-color:#4caf50;'><div class='muted'>NET SALARY (Rs)</div><div style='font-size:26px;font-weight:800;color:#4caf50;'>Rs {s['net']:,.0f}</div><div class='muted'>after tax & deductions</div></div>", unsafe_allow_html=True)
@@ -1790,7 +1978,8 @@ else:
                          ("CRGE", float(crge), "#ffb74d"),
                          ("Basic", float(basic), "#b39ddb"),
                          ("FBPP", s['fbpp_rs'], "#f06292"),
-                         ("Leave", s['leave_rs'], "#4dd0e1")]
+                         ("Leave", s['leave_rs'], "#4dd0e1"),
+                         ("Acting", s['act_pay_rs'], "#ce93d8")]
                 tot = sum(p[1] for p in parts) or 1
                 seg = "".join(f"<div style='width:{100*v/tot:.1f}%;background:{c};height:14px;'></div>" for _, v, c in parts if v > 0)
                 leg = " ".join(f"<span style='font-size:11px;color:{c};'>■ {n}</span>" for n, v, c in parts if v > 0)
@@ -1806,6 +1995,7 @@ else:
                         + f"<div class='bidrow'><span>Productivity Pay*</span><span>{s['productivity_rs']:,.1f}</span></div>"
                         + f"<div class='bidrow'><span>Flt Base Pro Pay ({len(s['fbpp_items'])} T/A · ${s['fbpp_usd']:,.0f})</span><span>{s['fbpp_rs']:,.1f}</span></div>"
                         + f"<div class='bidrow'><span>Leave Pay ({s['leave_days']}d)</span><span>{s['leave_rs']:,.0f}</span></div>"
+                        + (f"<div class='bidrow'><span>Acting Pay ({s['act_min']//60}h {s['act_min']%60}m)</span><span>{s['act_pay_rs']:,.0f}</span></div>" if s["act_min"] else "")
                         + f"<div class='bidrow'><b>Total Earnings</b><b>{s['earnings']:,.1f}</b></div>"
                         + f"<div class='muted' style='margin-top:6px;'>*{s['final_min']//60}h {s['final_min']%60}m paid ({s['m75']}min ≤75h + {s['mex']}min >75h), minus {s['ob_count']} on-board meals (−Rs {s['ob_deduct_rs']:,.0f}). Flown: {s['block_min']//60}h {s['block_min']%60}m.</div>"
                         + "</div>", unsafe_allow_html=True)
@@ -1839,7 +2029,23 @@ else:
                     with st.expander(f"✈ FBPP turnaround detail ({len(s['fbpp_items'])} × T/A = ${s['fbpp_usd']:,.0f})"):
                         for name, sched, amt, approx in s["fbpp_items"]:
                             band = ">4h" if sched > FBPP_SPLIT_MIN else "≤4h"
-                            note = " · sched time est. from actual (flight not in UL table)" if approx else ""
-                            st.markdown(f"<div class='bidrow'><span>{name} <span class='muted'>({sched//60}h {sched%60:02d}m {band}{note})</span></span><span>${amt}</span></div>", unsafe_allow_html=True)
+                            st.markdown(f"<div class='bidrow'><span>{name} <span class='muted'>({sched//60}h {sched%60:02d}m {band} · scheduled up+down)</span></span><span>${amt}</span></div>", unsafe_allow_html=True)
+
+                if s.get("fbpp_missing"):
+                    st.markdown(
+                        f"<div style='font-size:12.5px;background:#33260f;border:1px solid #ffc107;color:#ffd54f;padding:10px;border-radius:8px;margin-bottom:8px;'>"
+                        f"⚠️ <b>FBPP:</b> {len(s['fbpp_missing'])} turnaround return flight(s) not in the scheduled-duration table — currently paying <b>$0</b> for them. "
+                        f"Enter their <b>combined up+down scheduled</b> minutes below (pre-filled with actual flown time, which under-counts).</div>",
+                        unsafe_allow_html=True)
+                    for fl, route, hint in s["fbpp_missing"]:
+                        c1, c2 = st.columns([3, 1])
+                        ovr = c1.number_input(f"{fl} ({route}) — combined scheduled minutes",
+                                              value=float(hint or 240), step=5.0, key=f"fbpp_{fl}")
+                        if c2.button("💾 Save", key=f"fbpp_save_{fl}"):
+                            fbpp_overrides = dict(saved.get("fbpp_overrides", {}) or {})
+                            fbpp_overrides[fl] = int(ovr)
+                            save_profile(st.session_state["username"], {**saved, "fbpp_overrides": fbpp_overrides})
+                            st.success(f"{fl} saved — FBPP now uses {int(ovr)} min (${'28' if int(ovr) > FBPP_SPLIT_MIN else '21'}).")
+                            st.rerun()
 
                 st.markdown("<div class='muted' style='margin-top:8px;'>⚠️ Independent estimate for personal guidance only — refer to your official payslip for final figures.</div>", unsafe_allow_html=True)
