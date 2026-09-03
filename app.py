@@ -1969,7 +1969,7 @@ else:
 
                 h1, h2, h3 = st.columns(3)
                 h1.markdown(f"<div class='card' style='text-align:center;border-color:#4caf50;'><div class='muted'>NET SALARY (Rs)</div><div style='font-size:26px;font-weight:800;color:#4caf50;'>Rs {s['net']:,.0f}</div><div class='muted'>after tax & deductions</div></div>", unsafe_allow_html=True)
-                h2.markdown(f"<div class='card' style='text-align:center;'><div class='muted'>ALLOWANCES (USD)</div><div style='font-size:26px;font-weight:800;color:#00bcd4;'>${s['allow_usd_total']:,.0f}</div><div class='muted'>≈ Rs {s['allow_rs_total']:,.0f}</div></div>", unsafe_allow_html=True)
+                h2.markdown(f"<div class='card' style='text-align:center;'><div class='muted'>ALLOWANCES (USD — gross)</div><div style='font-size:26px;font-weight:800;color:#00bcd4;'>${s['allow_usd_total']:,.0f}</div><div class='muted'>≈ Rs {s['allow_rs_total']:,.0f}</div><div class='muted' style='margin-top:6px;'>meals + layover + turnaround overnights — the on-board meal cut is shown in Deductions</div></div>", unsafe_allow_html=True)
                 h3.markdown(f"<div class='card' style='text-align:center;'><div class='muted'>TOTAL TAKE-HOME</div><div style='font-size:26px;font-weight:800;color:#ffb74d;'>Rs {s['net'] + s['allow_rs_total']:,.0f}</div><div class='muted'>salary + allowances</div></div>", unsafe_allow_html=True)
 
                 # earnings composition bar
@@ -2002,6 +2002,9 @@ else:
                 with b2:
                     st.markdown(
                         "<div class='card'><h5>Deductions (Rs)</h5>"
+                        + (f"<div class='bidrow' style='color:#ffb74d;'><span>On-board meals (O/B Overpayed M/A · {s['ob_count']} meals)</span><span>−Rs {s['ob_deduct_rs']:,.0f}</span></div>"
+                           + "<div class='muted' style='margin-bottom:6px;'>Already deducted inside Productivity Pay — shown here so it's not a mystery.</div>"
+                           if s['ob_count'] else "")
                         + f"<div class='bidrow'><span>EPF ({epf_pct:.0f}%)</span><span>{s['epf']:,.0f}</span></div>"
                         + f"<div class='bidrow'><span>Transport</span><span>{transport:,.0f}</span></div>"
                         + f"<div class='bidrow'><span>Medical</span><span>{medical:,.0f}</span></div>"
@@ -2012,18 +2015,26 @@ else:
                         + f"<div class='bidrow'><b>Total Deductions</b><b>{s['deductions']:,.1f}</b></div>"
                         + "</div>", unsafe_allow_html=True)
 
+                ob_usd = s['ob_count'] * MEAL_RATE_USD
+                net_allow_usd = s['allow_usd_total'] - ob_usd
                 st.markdown(
                     "<div class='card'><h5>Allowances (USD — paid separately)</h5>"
                     + f"<div class='bidrow'><span>Meals: {s['ent'][0]}B {s['ent'][1]}L {s['ent'][2]}D ({s['ent_count']} × $25)</span><span>${s['meal_usd']:,.0f}</span></div>"
                     + f"<div class='bidrow'><span>Layover overnights ({s['l_nights']} × ${OVERNIGHT_RATE_USD[cat]})</span><span>${s['on_usd']:,.0f}</span></div>"
                     + f"<div class='bidrow'><span>Turnaround overnights ({s['t_on']} × ${OVERNIGHT_RATE_USD[cat]})</span><span>${s['ta_on_usd']:,.0f}</span></div>"
-                    + f"<div class='bidrow'><b>Total</b><b>${s['allow_usd_total']:,.0f} ≈ Rs {s['allow_rs_total']:,.0f}</b></div>"
+                    + f"<div class='bidrow'><b>Total allowance earned</b><b>${s['allow_usd_total']:,.0f} ≈ Rs {s['allow_rs_total']:,.0f}</b></div>"
+                    + (f"<div class='bidrow' style='color:#ff8a8a;'><span>On-board meals deducted from salary ({s['ob_count']} × $25)</span><span>−${ob_usd:,.0f} ≈ −Rs {s['ob_deduct_rs']:,.0f}</span></div>"
+                       + f"<div class='bidrow'><b>Net allowance you actually pocket</b><b>${net_allow_usd:,.0f} ≈ Rs {s['allow_rs_total'] - s['ob_deduct_rs']:,.0f}</b></div>"
+                       if s['ob_count'] else "")
+                    + "<div class='muted' style='margin-top:6px;'>You receive the full allowance in USD, but the on-board meal part is clawed back from your salary — so month-end you effectively pocket the <b>net</b> figure on top of your salary.</div>"
                     + "</div>", unsafe_allow_html=True)
 
-                with st.expander("🍽 Meal entitlement detail (per duty)"):
+                with st.expander("🍽 Meals breakdown (per duty)"):
+                    st.markdown("<div class='muted' style='margin-bottom:6px;'>This is where each B / L / D meal came from: ✈ flight meals are eaten <b>on board</b> → deducted from salary · 🏨 hotel meals → paid as meal allowance.</div>", unsafe_allow_html=True)
                     for name, meals, kind in s["detail"]:
-                        tag = "deducted from salary" if kind == "on board" else "hotel allowance"
-                        st.markdown(f"<div class='bidrow'><span>{name}</span><span>{meals} <span class='muted'>({tag})</span></span></div>", unsafe_allow_html=True)
+                        tag = "on-board → deducted from salary" if kind == "on board" else "hotel → paid as allowance"
+                        color = "#ff8a8a" if kind == "on board" else "#a5d6a7"
+                        st.markdown(f"<div class='bidrow'><span>{name}</span><span style='color:{color};'>{meals} <span class='muted'>({tag})</span></span></div>", unsafe_allow_html=True)
 
                 if s["fbpp_items"]:
                     with st.expander(f"✈ FBPP turnaround detail ({len(s['fbpp_items'])} × T/A = ${s['fbpp_usd']:,.0f})"):
