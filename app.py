@@ -581,6 +581,7 @@ SEASIA_MORNING_FLIGHTS = {"UL314", "UL364"}   # known SIN/KUL/CGK morning T/A
 MIN_BASE_REST_H = 17.5          # 17h30m chocks-on -> next report at base
 REGIONAL_MAX_SECTOR_H = 4.0     # 'regional' = sector length under 4 hours
 SBY2_CODE, SBY4_CODE = "SB2", "SB4"   # standby codes the FAU rules explicitly allow
+MIDEAST_STATIONS = {"DXB", "AUH", "MCT", "DOH", "BAH", "DMM", "RUH", "JED", "KWI"}
 
 def _route_od(route):
     if route and "➔" in route:
@@ -751,9 +752,13 @@ def audit_roster(rows):
                 require_days_off(arr, 2, "JED turnaround")
             # R9 — SIN/KUL/CGK morning turnaround → next-day flights after 18:00, or SBY4
             hit_sea = set(du["stations"]) & SEASIA_MORNING_TA
-            first_dep = du["sectors"][0]["dep"]
-            is_morning = bool(du["numbers"] & SEASIA_MORNING_FLIGHTS) or (
-                isinstance(first_dep, datetime) and dtime(7, 0) < first_dep.time() < dtime(8, 0))
+            s0 = du["sectors"][0]
+            # 'morning' = a hardcoded morning flight number, or a CMB→SIN
+            # departure between 07:00–08:00 (the old CMB–SIN morning T/A).
+            cmb_sin_morning = (s0["o"] == "CMB" and s0["d"] == "SIN"
+                               and isinstance(s0["dep"], datetime)
+                               and dtime(7, 0) < s0["dep"].time() < dtime(8, 0))
+            is_morning = bool(du["numbers"] & SEASIA_MORNING_FLIGHTS) or cmb_sin_morning
             if hit_sea and is_morning:
                 d1 = arr.date() + timedelta(days=1)
                 for e in duty_day_map.get(d1, []):
@@ -1172,6 +1177,38 @@ def rest_impact_note(rows, flight_no, fdate, delay_mins):
                             f"BELOW the 17h30m FAU MINIMUM. Contact crew control; report/pickup time must shift.")
             return None
     return None
+
+
+def suggest_standby_for_cancel(row):
+    """SOFT advisory only — never edits the roster. Given a CANCELLED flight's
+    roster row, return the standby code that is typically inserted, per the
+    FAU map:
+      * midnight flight (departs 00:00–05:59): report before midnight → SBY4,
+        report after midnight → SBY1
+      * Middle-East flight reporting before 18:00 → SBY3
+      * morning turnaround out of CMB: report after 06:00 → SBY2, before
+        06:00 → SBY1
+    Returns None when the flight doesn't match any category."""
+    ci = row.get("CIdt") or row.get("DEPdt")
+    dep = row.get("DEPdt")
+    if not isinstance(ci, datetime) or not isinstance(dep, datetime):
+        return None
+    o, d = _route_od(row.get("Route") or "")
+
+    # midnight flight (small-hours departure)
+    if dep.time() < dtime(6, 0):
+        return "SB4" if ci.date() < dep.date() else "SB1"
+
+    # Middle-East flight reporting before 18:00
+    if d in MIDEAST_STATIONS and ci.time() < dtime(18, 0):
+        return "SB3"
+
+    # morning turnaround out of CMB
+    if o == "CMB" and dep.time() < dtime(12, 0):
+        return "SB2" if ci.time() >= dtime(6, 0) else "SB1"
+
+    return None
+
 
 # --- 3.5 ANALYTICS, STATION INTEL & WEATHER (KEYLESS) ---
 import math
@@ -2177,7 +2214,7 @@ else:
     - **UL231/232 (DXB)** → next day only SBY2 (06:00–18:00) or a flight within that window.
     - **LHR / FRA / CDG / FCO / MXP / NRT / SYD / MEL layovers & JED turnaround** → arrival day + **2 days off**.
     - **DOH / BAH / DMM turnarounds** → arrival day + **1 day off**.
-    - **SIN / KUL / CGK morning turnarounds** (dep 07:00–08:00, or UL314/UL364) → next-day flights report after 18:00, or SBY4.
+    - **SIN / KUL / CGK morning turnarounds** (UL314/UL364, or a CMB–SIN departure 07:00–08:00) → next-day flights report after 18:00, or SBY4.
     - **Standby windows:** SBY1 00:01–11:59 · SBY2 06:00–18:00 · SBY3 12:00–23:59 · SBY4 18:00–05:59.
     - **Standby insertion if your flight cancels:** morning T/A (report after 06:00) → SBY2 · morning T/A (report before 06:00) → SBY1 · Middle-East flight reporting before 18:00 → SBY3 · midnight flight reporting before midnight → SBY4 · midnight flight reporting after midnight → SBY1.
     - Training/duty codes (SEP, SEC, CRM, DGR, …) count as a duty day — they are **not** days off.
@@ -2231,6 +2268,15 @@ else:
                                 delay_guess = int(m.group(1))
                             rest_note = rest_impact_note(parsed_rows, flight["flight_no"],
                                                          flight["date_obj"], delay_guess or 0)
+                        # Cancellation → soft standby suggestion (roster unchanged)
+                        sb_suggest = None
+                        if telemetry.get("severity") == "cancelled":
+                            frow = next((r for r in parsed_rows
+                                         if r["Type"] == "FLIGHT" and r.get("DateObj")
+                                         and r["DateObj"].date() == flight["date_obj"]
+                                         and str(r["Flight / Code"]).replace(" ", "") == str(flight["flight_no"]).replace(" ", "")), None)
+                            if frow:
+                                sb_suggest = suggest_standby_for_cancel(frow)
                         flight_check_results.append({"flight": flight["flight_no"], "route": flight["route"],
                                                      "date": flight["date_obj"].strftime("%d %b %Y"),
                                                      "delayed": telemetry["is_delayed"],
@@ -2238,7 +2284,8 @@ else:
                                                      "status": telemetry["status_message"],
                                                      "inbound_note": telemetry.get("inbound_note"),
                                                      "inbound_risk": telemetry.get("inbound_risk", False),
-                                                     "rest_note": rest_note})
+                                                     "rest_note": rest_note,
+                                                     "sb_suggest": sb_suggest})
             st.session_state['alert_count'] = sum(
                 1 for f in flight_check_results
                 if (f["severity"] in ("delayed", "cancelled", "diverted") or f["inbound_risk"])
@@ -2276,6 +2323,10 @@ else:
                         r_tc = "#ff8a8a" if rest_bad else "#a5d6a7"
                         extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#131f2b;"
                                   f"border:1px solid {r_bc};color:{r_tc};font-size:11.5px;'>{df['rest_note']}</div>")
+                    if df.get("sb_suggest"):
+                        extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#2b2413;"
+                                  f"border:1px solid #ffc107;color:#ffd54f;font-size:11.5px;'>"
+                                  f"📋 Soft suggestion (roster unchanged): if cancelled, insert <b>{df['sb_suggest']}</b> standby.</div>")
                     st.markdown(
                         f"<div style='font-size:13px;background:{bg};padding:12px;border-radius:8px;margin-top:10px;border:1px solid {bc};{op}'>"
                         f"{icon} <b style='font-size:14px;'>{df['flight']}</b> ({df['route']}) — <span style='color:#ccc;'><i>{df['date']}</i></span>"
