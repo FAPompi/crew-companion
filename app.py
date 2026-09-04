@@ -1600,6 +1600,79 @@ def _count_local_nights(start_dt, end_dt):
     return n
 
 
+def _spans_window(start_dt, end_dt, win_start_t, win_end_t):
+    """True if [start_dt, end_dt] overlaps any daily [win_start_t → win_end_t] window
+    (handles windows that cross midnight, e.g. 2200→0800)."""
+    if not isinstance(start_dt, datetime) or not isinstance(end_dt, datetime) or end_dt <= start_dt:
+        return False
+    d = start_dt.date()
+    for _ in range(4):
+        ws = datetime.combine(d, win_start_t)
+        we = datetime.combine(d, win_end_t)
+        if we <= ws:
+            we += timedelta(days=1)
+        if start_dt < we and end_dt > ws:
+            return True
+        d += timedelta(days=1)
+    return False
+
+
+def duty_classify(ci_dt, arr_dt):
+    """Classify a duty window (Colombo local) into early / late / night flags.
+    Early Start = commences 0500–0659; Late Finish = finishes 0100–0159;
+    Night Duty = any part falls within 0200–0459."""
+    if not isinstance(ci_dt, datetime) or not isinstance(arr_dt, datetime):
+        return {"early": False, "late": False, "night": False}
+    if arr_dt <= ci_dt:
+        arr_dt += timedelta(days=1)
+    return {
+        "early": dtime(5, 0) <= ci_dt.time() <= dtime(6, 59),
+        "late": dtime(1, 0) <= arr_dt.time() <= dtime(1, 59),
+        "night": _spans_window(ci_dt, arr_dt, dtime(2, 0), dtime(4, 59)),
+    }
+
+
+def apply_delay(acclimatized, sectors, preceding_rest_h, dep_dt, delay_min):
+    """8.2.6 delayed reporting. Returns (band, note). delay_min < 240 → max FDP from
+    the original report band; ≥ 240 → more limiting band of planned vs actual report."""
+    band_orig = fdp_band((dep_dt - timedelta(hours=1)).time())
+    if delay_min < 240:
+        return band_orig, (f"Delay &lt; 4 h → max FDP from the ORIGINAL report band ({band_orig}); "
+                           "the FDP clock starts at the actual (delayed) report time.")
+    dep_act = dep_dt + timedelta(minutes=delay_min)
+    band_act = fdp_band((dep_act - timedelta(hours=1)).time())
+    v1 = fdp_limit_min(acclimatized, band_orig, sectors, preceding_rest_h)
+    v2 = fdp_limit_min(acclimatized, band_act, sectors, preceding_rest_h)
+    band = band_orig if v1 <= v2 else band_act
+    return band, (f"Delay ≥ 4 h → more limiting band of planned ({band_orig}) vs actual ({band_act}) "
+                  f"= <b>{band}</b>; the FDP clock starts 4 h after the original report time.")
+
+
+def extension_minutes(split_rest_min=None, relief_rest_min=None, relief_type=None):
+    """Returns (extra_minutes, cap_min_or_None, detail). Split duty (8.2.13): rest 3–10 h
+    between sectors → extend by ½ of the rest. In-flight relief (8.2.12): needs ≥ 3 h rest;
+    bunk → +½, seat → +⅓ of rest taken; caps 19 h cabin (bunk) / 16 h cabin (seat)."""
+    extra = 0
+    cap = None
+    detail = []
+    if split_rest_min and 180 <= split_rest_min <= 600:
+        add = split_rest_min // 2
+        extra += add
+        detail.append(f"split-duty rest {_fmt_hm(split_rest_min)} → +{_fmt_hm(add)}")
+    if relief_rest_min and relief_rest_min >= 180 and relief_type in ("Bunk", "Seat"):
+        frac = 0.5 if relief_type == "Bunk" else (1 / 3)
+        add = int(relief_rest_min * frac)
+        extra += add
+        cap = (19 * 60) if relief_type == "Bunk" else (16 * 60)
+        detail.append(f"in-flight relief ({relief_type}) {_fmt_hm(relief_rest_min)} → +{_fmt_hm(add)}, "
+                      f"capped at {_fmt_hm(cap)}")
+    return extra, cap, " · ".join(detail)
+
+
+CUMULATIVE_LIMITS = {"7d": 60 * 60, "14d": 105 * 60, "28d": 210 * 60}   # cabin crew 8.3.d
+CUMULATIVE_7D_SOFT = 65 * 60                                            # unforeseen-delay allowance
+
+
 def _duty_chip(sectors):
     """One compact chip per duty: a turnaround collapses to 'UL404/5' with one
     line per sector — route, dep–arr times and TRUE flying time (UTC-corrected
@@ -2649,6 +2722,8 @@ else:
             arr_next = st.checkbox("Chocks-on is the day AFTER departure", value=False, key="fdp_arr_next")
             sectors = st.selectbox("Sectors in this duty", list(range(1, 9)), index=1, key="fdp_sectors",
                                    format_func=lambda n: f"{n} sector" + ("" if n == 1 else "s"))
+            delay_min = st.number_input("Delay to reporting time, if told before leaving rest (minutes)",
+                                        min_value=0, max_value=720, value=0, step=15, key="fdp_delay")
 
             ci_dt = datetime.combine(ci_date, ci_t)
             dep_dt = datetime.combine(ci_date + (timedelta(days=1) if dep_next else timedelta(0)), dep_t)
@@ -2756,14 +2831,45 @@ else:
                  "(need 3 consecutive local nights at CMB to re-acclimatize)</div>"),
                 unsafe_allow_html=True)
 
+            # ---------- 4. Extensions & variations ----------
+            st.markdown("##### 4 \u00b7 Extensions & variations (optional)")
+            split_use = st.checkbox("Split duty \u2014 a break of less than the minimum rest between sectors", value=False, key="fdp_split_use")
+            split_rest = None
+            if split_use:
+                split_rest = st.number_input("Break between sectors (minutes, 180\u2013600)", min_value=180, max_value=600, value=180, step=15, key="fdp_split_rest")
+            relief_use = st.checkbox("In-flight relief \u2014 rest taken on board", value=False, key="fdp_relief_use")
+            relief_rest = None
+            relief_type = None
+            if relief_use:
+                c1, c2 = st.columns([1, 1])
+                relief_rest = c1.number_input("In-flight rest taken (minutes, \u2265 180)", min_value=180, max_value=720, value=180, step=15, key="fdp_relief_rest")
+                relief_type = c2.radio("Rest facility", ["Bunk", "Seat"], index=0, key="fdp_relief_type", horizontal=True)
+            annex_b1 = st.checkbox("CMB\u2013LHR / CDG / FRA layover reporting 2200\u20130559 (Annex A B.1)", value=False, key="fdp_annex_b1")
+            if annex_b1:
+                st.markdown("<div class='muted' style='font-size:12px;'>Annex A B.1: max FDP <b>13:00</b>, extendable by in-flight relief "
+                            "\u2014 requires <b>6 Economy seats blocked</b> for cabin-crew rest.</div>", unsafe_allow_html=True)
+
         with rcol2:
-            max_fdp = fdp_limit_min(acclim_bool, band, sectors, preceding_rest_h)
-            actual_fdp = int((arr_dt - ci_dt).total_seconds() // 60)
-            if actual_fdp <= 0:
-                actual_fdp += 24 * 60
-            latest_co = ci_dt + timedelta(minutes=max_fdp)
+            # --- delayed-reporting shift (8.2.6) ---
+            ci_act = ci_dt + timedelta(minutes=delay_min)
+            dep_act = dep_dt + timedelta(minutes=delay_min)
+            arr_act = arr_dt + timedelta(minutes=delay_min)
+            band_used = band
+            fdp_start = ci_dt
+            delay_note = ""
+            if delay_min > 0:
+                band_used, delay_note = apply_delay(acclim_bool, sectors, preceding_rest_h, dep_dt, delay_min)
+                fdp_start = ci_act if delay_min < 240 else (ci_dt + timedelta(hours=4))
+
+            base_fdp = 780 if annex_b1 else fdp_limit_min(acclim_bool, band_used, sectors, preceding_rest_h)
+            extra, cap, ext_detail = extension_minutes(split_rest, relief_rest, relief_type)
+            max_fdp = min(base_fdp + extra, cap) if cap else base_fdp + extra
+
+            actual_fdp = int((arr_act - fdp_start).total_seconds() // 60)
+            if actual_fdp < 0:
+                actual_fdp = 0
+            latest_co = fdp_start + timedelta(minutes=max_fdp)
             margin = max_fdp - actual_fdp
-            flight_crew_val = max_fdp - 60
 
             if margin >= 0:
                 vc_bg, vc_bc, vc_tc, vc_icon = "#12301f", "#4caf50", "#a5d6a7", "\u2705"
@@ -2777,20 +2883,30 @@ else:
                 f"<div style='font-size:20px;font-weight:800;color:{vc_tc};'>{v_title}</div>"
                 f"<div class='muted'>{v_sub}</div></div>", unsafe_allow_html=True)
 
+            if delay_note:
+                st.markdown(f"<div class='card' style='font-size:12.5px;border-left:3px solid #ffc107;'>{delay_note}</div>",
+                            unsafe_allow_html=True)
+
             rows = [
-                ("Local time of start (dep \u2212 1h)", band_t.strftime("%H:%M") + f" \u2192 band <b>{band}</b>"),
+                ("Local time of start (dep \u2212 1h)", band_t.strftime("%H:%M") + f" \u2192 band <b>{band_used}</b>"),
                 ("Sectors", f"{sectors}"),
                 ("Table used", ("Table A \u2014 acclimatized" if acclim_bool else "Table B \u2014 not acclimatized")),
             ]
             if not acclim_bool and preceding_rest_h is not None:
                 bucket = "between 18h and 30h" if 18 < preceding_rest_h <= 30 else "up to 18h / over 30h"
                 rows.append(("Preceding rest (Table B key)", f"{_fmt_hm(int(preceding_rest_h * 60))} \u2192 {bucket}"))
+            if annex_b1:
+                rows.append(("Annex A B.1 cap", "13:00 (LHR/CDG/FRA 2200\u20130559)"))
+            else:
+                rows.append(("Table value (flight crew)", _fmt_hm(base_fdp - 60)))
+                rows.append(("Cabin crew (+1:00)", _fmt_hm(base_fdp)))
+            if ext_detail:
+                rows.append(("Extensions", ext_detail))
             rows += [
-                ("Flight-crew table value", _fmt_hm(flight_crew_val)),
-                ("Cabin crew (+1:00)", _fmt_hm(max_fdp)),
-                ("FDP starts (check-in)", ci_dt.strftime("%d %b %H:%M")),
+                ("Max cabin FDP", _fmt_hm(max_fdp)),
+                ("FDP counts from", fdp_start.strftime("%d %b %H:%M")),
                 ("Latest allowed chocks-on", latest_co.strftime("%d %b %H:%M")),
-                ("Actual chocks-on", arr_dt.strftime("%d %b %H:%M")),
+                ("Actual chocks-on", arr_act.strftime("%d %b %H:%M")),
                 ("Actual FDP", _fmt_hm(actual_fdp)),
             ]
             rows_html = "".join(f"<div class='bidrow'><span>{k}</span><span>{v}</span></div>" for k, v in rows)
@@ -2798,7 +2914,7 @@ else:
 
             this_dur_h = actual_fdp / 60
             need_rest_h = max(this_dur_h - 1, 11.0)
-            earliest_next = arr_dt + timedelta(hours=need_rest_h)
+            earliest_next = arr_act + timedelta(hours=need_rest_h)
             st.markdown(
                 f"<div class='card' style='font-size:12.5px;'><b style='color:#00bcd4;'>Rest needed after this duty:</b> "
                 f"max({_fmt_hm(actual_fdp)} \u2212 1h, 11h) = <b>{_fmt_hm(int(need_rest_h * 60))}</b> \u00b7 "
@@ -2836,3 +2952,178 @@ else:
                             "Local time of start = first departure \u2212 1h (flight-crew report time). "
                             "Acclimatized = 3 consecutive local nights at CMB.</div>",
                             unsafe_allow_html=True)
+
+        # ---------- Duty-day classification ----------
+        st.markdown("##### \U0001f319 Duty-day classification (early / late / night)")
+        cls = duty_classify(ci_act, arr_act)
+        badges = []
+        if cls["early"]:
+            badges.append(("\u2600\ufe0f Early Start", "commences 0500\u20130659 local"))
+        if cls["late"]:
+            badges.append(("\U0001f307 Late Finish", "finishes 0100\u20130159 local"))
+        if cls["night"]:
+            badges.append(("\U0001f303 Night Duty", "any part falls 0200\u20130459 local"))
+        if not badges:
+            badges.append(("\u2705 Standard day duty", "not early, late or night"))
+        bcols = st.columns(len(badges))
+        for i, (t, s) in enumerate(badges):
+            bcols[i].markdown(
+                f"<div class='card' style='text-align:center;'><div style='font-size:16px;font-weight:700;'>{t}</div>"
+                f"<div class='muted' style='font-size:11px;'>{s}</div></div>", unsafe_allow_html=True)
+        if cls["early"] or cls["late"] or cls["night"]:
+            st.markdown("<div class='muted' style='font-size:12.5px;'>\u26a0\ufe0f Duties touching <b>0100\u20130659</b>: "
+                        "max <b>3 consecutive</b>, max <b>4 in any 7 days</b>; a run is only broken by <b>\u2265 34 h</b> free "
+                        "of such duties.</div>", unsafe_allow_html=True)
+        if cls["early"]:
+            st.markdown("<div class='muted' style='font-size:12.5px;'>\u2600\ufe0f Regular early-morning series (4\u20135 in a row): "
+                        "\u2265 24 h rest before it, each duty \u2264 9 h, and \u2265 63 h free after it.</div>", unsafe_allow_html=True)
+        if cls["night"]:
+            st.markdown("<div class='muted' style='font-size:12.5px;'>\U0001f303 For night duties you must be <b>free by 21:00</b> "
+                        "before a block; regular night duty (4\u20135 in a row): \u2265 24 h rest before, each duty \u2264 8 h, "
+                        "and \u2265 54 h free after.</div>", unsafe_allow_html=True)
+
+        # ---------- Cumulative duty hours ----------
+        st.markdown("##### \U0001f9ee Cumulative duty hours \u2014 60 / 105 / 210")
+        st.markdown("<div class='muted' style='font-size:12px;'>Cabin-crew caps (&sect;8.3.d). Duty periods, FDPs, "
+                    "positioning and standby all count \u2014 standby is counted <b>in full</b> here. The current duty is "
+                    "added to each window automatically.</div>", unsafe_allow_html=True)
+
+        if "fdp_duties" not in st.session_state:
+            st.session_state["fdp_duties"] = []
+
+        with st.form("fdp_duty_log"):
+            a1, a2, a3, a4, a5 = st.columns([1.15, 1.05, 0.7, 0.7, 1.3])
+            log_date = a1.date_input("Duty date", value=ci_date, key="fdp_log_date")
+            log_kind = a2.selectbox("Type", ["FDP", "Standby", "Positioning", "Other"], key="fdp_log_kind")
+            log_h = a3.number_input("Hrs", 0, 30, 0, key="fdp_log_h")
+            log_m = a4.number_input("Min", 0, 59, 0, step=5, key="fdp_log_m")
+            log_label = a5.text_input("Label (optional)", key="fdp_log_label")
+            submitted = st.form_submit_button("\U0001f195 Add duty")
+        if submitted:
+            mins = log_h * 60 + log_m
+            if mins > 0:
+                st.session_state["fdp_duties"].append({
+                    "date": log_date.isoformat(),
+                    "kind": log_kind,
+                    "minutes": mins,
+                    "label": log_label.strip() or log_kind,
+                })
+                st.session_state["fdp_log_h"] = 0
+                st.session_state["fdp_log_m"] = 0
+                st.session_state["fdp_log_label"] = ""
+                st.rerun()
+
+        duties = st.session_state["fdp_duties"]
+        if duties:
+            duties = sorted(duties, key=lambda d: d["date"])
+            st.session_state["fdp_duties"] = duties
+            del_idx = None
+            for i, d in enumerate(duties):
+                c1, c2 = st.columns([9, 1])
+                c1.markdown(f"<span style='font-size:13px;'>{d['date']} \u00b7 <b>{d['label']}</b> "
+                            f"({d['kind']}) \u2014 {_fmt_hm(d['minutes'])}</span>", unsafe_allow_html=True)
+                if c2.button("\U0001f5d1", key=f"fdp_del_{i}"):
+                    del_idx = i
+            if del_idx is not None:
+                st.session_state["fdp_duties"] = [d for i, d in enumerate(duties) if i != del_idx]
+                st.rerun()
+        else:
+            st.markdown("<div class='muted' style='font-size:12px;'>No extra duties logged \u2014 the windows below only "
+                        "contain the current duty.</div>", unsafe_allow_html=True)
+
+        totals = {}
+        for wkey, days in (("7d", 7), ("14d", 14), ("28d", 28)):
+            lo = ci_date - timedelta(days=days - 1)
+            total = actual_fdp
+            for d in duties:
+                try:
+                    dd = datetime.strptime(d["date"], "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+                if lo <= dd <= ci_date:
+                    total += d["minutes"]
+            totals[wkey] = total
+
+        c7, c14, c28 = st.columns(3)
+        for col, wkey, label in ((c7, "7d", "7 days"), (c14, "14d", "14 days"), (c28, "28d", "28 days")):
+            total = totals[wkey]
+            if wkey == "7d":
+                if total <= CUMULATIVE_LIMITS["7d"]:
+                    bg, bc, tc, txt = "#12301f", "#4caf50", "#a5d6a7", "\u2705 OK"
+                elif total <= CUMULATIVE_7D_SOFT:
+                    bg, bc, tc, txt = "#33260f", "#ffc107", "#ffd54f", "\u26a0\ufe0f only with delays"
+                else:
+                    bg, bc, tc, txt = "#331414", "#ff1744", "#ff8a8a", "\u274c EXCEEDS"
+                cap_txt = "cap 60 h (65 h w/ delays)"
+            else:
+                limit = CUMULATIVE_LIMITS[wkey]
+                ok = total <= limit
+                bg, bc, tc, txt = ("#12301f", "#4caf50", "#a5d6a7", "\u2705 OK") if ok else ("#331414", "#ff1744", "#ff8a8a", "\u274c EXCEEDS")
+                cap_txt = f"cap {_fmt_hm(limit)}"
+            col.markdown(
+                f"<div class='card' style='background:{bg};border:1px solid {bc};text-align:center;'>"
+                f"<div class='muted' style='font-size:11px;'>Last {label}</div>"
+                f"<div style='font-size:22px;font-weight:800;color:{tc};'>{_fmt_hm(total)}</div>"
+                f"<div class='muted' style='font-size:11px;'>{cap_txt}</div>"
+                f"<div style='font-size:13px;color:{tc};'>{txt}</div></div>", unsafe_allow_html=True)
+
+        # ---------- FAQ ----------
+        with st.expander("\U0001f4d6 FAQ \u2014 what do all these terms actually mean? (tap to learn)"):
+            st.markdown("""
+**The basics**
+- **FDP (Flight Duty Period)** — your working day, from the moment you **report/check-in** until the aircraft's
+  **on-chock** (see below) after your **final sector**. Your commute *after* chocks-on doesn't count.
+- **Sector** — one leg: from the aircraft first moving under its own power to it coming to rest at the stand.
+  CMB \u2192 BKK is 1 sector; a same-day return CMB \u2192 BKK \u2192 CMB is **2 sectors**.
+- **Check-in / report time** — the time you must sign in for the duty (usually departure \u2212 1 h 20 m for cabin crew).
+- **On-chock** — when the aircraft is parked and chocks go under the wheels; your FDP officially ends there.
+
+**Reading the FDP table**
+- **Local time of start** — the band in Table A/B is read from **first departure \u2212 1 hour** (the flight-crew
+  report time), even though you check in a bit earlier. Example: dep 07:35 \u2192 start 06:35 \u2192 band 0600\u20130759.
+- **Table A vs Table B** — Table A when you're **acclimatized** to base; Table B when you're **not acclimatized**.
+  Table B is also keyed on how long you rested **before** the duty (see below).
+- **+1:00 cabin crew** — cabin crew may work **1 hour longer** than the flight-crew value in the table (&sect;8.3.a).
+
+**Acclimatization & local nights**
+- **Acclimatized** — your body clock is on base time. You're acclimatized after **3 consecutive local nights** on the
+  ground in a time zone no wider than 2 hours, and you stay acclimatized until a duty ends somewhere **more than 2 h**
+  off base time.
+- **Local night** — an **8-hour period between 2200 and 0800** local time. Landing back in CMB after a RUH/DXB/SIN-style
+  layover does **not** instantly re-acclimatize you \u2014 you need 3 local nights at home first.
+
+**Rest rules**
+- **Minimum rest before a duty (cabin crew)** — the **greater of (previous duty \u2212 1 hour) or 11 hours**.
+- **Preceding rest (for Table B)** — the rest you had *immediately before* this duty. The Table B row changes at
+  **18 h and 30 h**: up to 18 h or over 30 h is one row, between 18 h and 30 h is the other (30 h counts as "between").
+
+**Cumulative limits** (the running totals over days and weeks)
+- Cabin crew: **60 h in 7 days** (up to 65 h only with unforeseen delays), **105 h in 14 days**, **210 h in 28 days**.
+  FDPs, standby and positioning all add into these totals.
+
+**Early / late / night duties**
+- **Early Start** — duty starts 0500\u20130659. **Late Finish** — ends 0100\u20130159. **Night Duty** — any part of the
+  duty falls between 0200 and 0459.
+- Duties touching 0100\u20130659: max **3 in a row** and max **4 in 7 days**, broken only by **\u2265 34 h** clear.
+- Before a night-duty block you must be **free by 21:00**.
+
+**Days off**
+- A **single day off** = **2 local nights** and at least **34 hours**. No more than **7 consecutive days on duty**,
+  and you need **2 consecutive days off in every 14 days**.
+
+**Standby & positioning**
+- **Standby** — you're on call, not off duty; it **counts in full** toward your cumulative totals.
+- **Positioning (deadheading)** — flying as a passenger at the company's request. It's duty time, but **not a sector**.
+
+**Extensions & delays**
+- **Split duty** — a duty with a break of less than the minimum rest between sectors can be extended by **half the break**
+  (break 3\u201310 h).
+- **In-flight relief** — with \u2265 3 h rest on board: **bunk** adds **half** the rest (max 19 h cabin), **seat** adds
+  **one third** (max 16 h cabin).
+- **Delayed reporting** — if told *before leaving rest*: delay **under 4 h** \u2192 max FDP from the original report band;
+  delay **4 h or more** \u2192 the more limiting band, and the FDP clock starts 4 h after the original report time.
+
+**Annex A B.1 (LHR / CDG / FRA)**
+- CMB\u2013London/CDG/Frankfurt layovers reporting **2200\u20130559** local: max FDP **13:00**, extendable with in-flight
+  relief \u2014 and **6 Economy seats must be blocked** for cabin-crew rest.
+""")
