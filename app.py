@@ -1673,6 +1673,156 @@ CUMULATIVE_LIMITS = {"7d": 60 * 60, "14d": 105 * 60, "28d": 210 * 60}   # cabin 
 CUMULATIVE_7D_SOFT = 65 * 60                                            # unforeseen-delay allowance
 
 
+def standby_fdp_check(acclimatized, sectors, preceding_rest_h, band, sby_minutes, case_c):
+    """8.2.8 — called out from standby into an FDP. Returns (allowed_total_min, case, detail).
+    The combined standby + FDP may be 1 h longer than the flight-crew FDP (8.3.c)."""
+    table_val = fdp_limit_min(acclimatized, band, sectors, preceding_rest_h) - 60   # flight-crew value
+    if case_c:
+        return (table_val + 60, "Case C",
+                "Standby at home/suitable accommodation 2200\u20130800 with \u2264 2 h notice \u2192 normal FDP "
+                "applies, no standby addition.")
+    if sby_minutes < 6 * 60:
+        return (sby_minutes + table_val + 60, "Case A",
+                "Called out before 6 h of standby \u2192 total allowed = standby time + Table A/B FDP (+ 1 h cabin).")
+    return (6 * 60 + table_val + 60, "Case B",
+            "Called out after more than 6 h of standby \u2192 total allowed = 6 h + Table A/B FDP (+ 1 h cabin); "
+            "standby beyond 6 h is deducted.")
+
+
+def _group_runs(items, keyfn, break_h=34.0):
+    """Group qualifying items into runs, where consecutive qualifying items are
+    separated by less than break_h hours of free time (FOM 'consecutive' = not
+    broken by \u2265 34 h free from such duties)."""
+    runs, cur = [], []
+    for it in items:
+        if not keyfn(it):
+            continue
+        if cur and (it["start"] - cur[-1]["end"]).total_seconds() < break_h * 3600:
+            cur.append(it)
+        else:
+            if cur:
+                runs.append(cur)
+            cur = [it]
+    if cur:
+        runs.append(cur)
+    return runs
+
+
+def fdp_roster_audit(rows):
+    """Chapter 08 FTL checks across the whole parsed roster: early/late/night
+    classification, the 0100\u20130659 run limits, and cumulative duty hours
+    (60/105/210). Returns {counts, cumulative, findings}."""
+    duties = build_duties(rows)
+    for du in duties:
+        start, end = du["report"], du["chocks_on"]
+        if not isinstance(start, datetime) or not isinstance(end, datetime) or end <= start:
+            end = (start if isinstance(start, datetime) else datetime.now()) + timedelta(minutes=1)
+        du["start"], du["end"] = start, end
+
+    counts = {"early": 0, "late": 0, "night": 0}
+    for du in duties:
+        c = duty_classify(du["start"], du["end"])
+        du["early"], du["late"], du["night"] = c["early"], c["late"], c["night"]
+        if c["early"]:
+            counts["early"] += 1
+        if c["late"]:
+            counts["late"] += 1
+        if c["night"]:
+            counts["night"] += 1
+
+    findings = []
+
+    # --- 0100\u20130659 touch limits: \u2264 3 consecutive, \u2264 4 in 7 days ---
+    touching = [du for du in duties if _spans_window(du["start"], du["end"], dtime(1, 0), dtime(6, 59))]
+    for run in _group_runs(touching, lambda d: True):
+        if len(run) >= 4:
+            findings.append(("violation",
+                f"{len(run)} consecutive duties touch 0100\u20130659 (limit is 3) \u2014 "
+                + " \u2192 ".join(d["label"] for d in run) + "."))
+    for du in touching:
+        lo = du["start"] - timedelta(days=6)
+        cnt = sum(1 for t in touching if lo <= t["start"] <= du["start"])
+        if cnt > 4:
+            findings.append(("violation",
+                f"{cnt} duties touch 0100\u20130659 within 7 days ending {du['start']:%d %b} (limit is 4)."))
+            break
+
+    # --- regular early-morning series (runs of 4\u20135, max 5, duty \u2264 9 h) ---
+    for run in _group_runs(duties, lambda d: d["early"]):
+        if len(run) >= 4:
+            over = [d for d in run if (d["end"] - d["start"]).total_seconds() > 9 * 3600]
+            sev, msg = "note", (f"{len(run)} consecutive early starts = a regular early-morning series "
+                                "\u2014 each duty \u2264 9 h, \u2265 24 h rest before the series, \u2265 63 h free after.")
+            if len(run) > 5:
+                sev, msg = "violation", f"{len(run)} consecutive early starts exceed the 5-duty cap."
+            elif over:
+                sev, msg = "violation", ("Regular early-morning series: " + ", ".join(d["label"] for d in over)
+                                         + " exceed(s) the 9 h duty cap.")
+            findings.append((sev, msg + "  (" + " \u2192 ".join(d["label"] for d in run) + ")"))
+    # --- regular night-duty series (runs of 4\u20135, max 5, duty \u2264 8 h) ---
+    for run in _group_runs(duties, lambda d: d["night"]):
+        if len(run) >= 4:
+            over = [d for d in run if (d["end"] - d["start"]).total_seconds() > 8 * 3600]
+            sev, msg = "note", (f"{len(run)} consecutive night duties = a regular night-duty series "
+                                "\u2014 each duty \u2264 8 h, \u2265 24 h rest before, \u2265 54 h free after.")
+            if len(run) > 5:
+                sev, msg = "violation", f"{len(run)} consecutive night duties exceed the 5-duty cap."
+            elif over:
+                sev, msg = "violation", ("Regular night-duty series: " + ", ".join(d["label"] for d in over)
+                                         + " exceed(s) the 8 h duty cap.")
+            findings.append((sev, msg + "  (" + " \u2192 ".join(d["label"] for d in run) + ")"))
+    # --- free by 21:00 before a night-duty block (runs of 2\u20133 nights) ---
+    for run in _group_runs(duties, lambda d: d["night"]):
+        if len(run) < 2:
+            continue
+        prev = None
+        for other in duties:
+            if other["end"] <= run[0]["start"]:
+                prev = other
+        if prev and prev["end"].time() > dtime(21, 0) and (run[0]["start"] - prev["end"]).total_seconds() < 34 * 3600:
+            findings.append(("note",
+                f"Night-duty block starting {run[0]['label']} ({run[0]['start']:%d %b}): previous duty "
+                f"{prev['label']} ends {prev['end']:%H:%M}, so the crew is not free by 21:00 before the block."))
+
+    # --- cumulative duty hours (rolling 7/14/28-day windows, standby in full) ---
+    periods = [{"label": du["label"], "start": du["start"], "end": du["end"],
+                "minutes": int((du["end"] - du["start"]).total_seconds() // 60)} for du in duties]
+    for r in rows:
+        if r["Type"] in ("STANDBY", "DUTY") and r.get("CIdt"):
+            s = r["CIdt"]
+            e = r.get("COdt") or s
+            if not isinstance(e, datetime) or e <= s:
+                e = s + timedelta(minutes=1)
+            periods.append({"label": (r.get("Code") or r["Type"]).strip(), "start": s, "end": e,
+                            "minutes": int((e - s).total_seconds() // 60)})
+    periods.sort(key=lambda p: p["start"])
+    cumulative = {w: {"max": 0, "date": None} for w in ("7d", "14d", "28d")}
+    if periods:
+        anchors = sorted({p["start"].date() for p in periods})
+        for wkey, days in (("7d", 7), ("14d", 14), ("28d", 28)):
+            best, best_date = 0, None
+            for anchor in anchors:
+                lo = anchor - timedelta(days=days - 1)
+                total = sum(p["minutes"] for p in periods if lo <= p["start"].date() <= anchor)
+                if total > best:
+                    best, best_date = total, anchor
+            cumulative[wkey] = {"max": best, "date": best_date}
+
+    for wkey, limit, cap_txt, soft in (("7d", CUMULATIVE_LIMITS["7d"], "60 h (65 h with delays)", CUMULATIVE_7D_SOFT),
+                                       ("14d", CUMULATIVE_LIMITS["14d"], "105 h", None),
+                                       ("28d", CUMULATIVE_LIMITS["28d"], "210 h", None)):
+        c = cumulative[wkey]
+        if c["max"] > (soft or limit):
+            findings.append(("violation",
+                f"Cumulative: {_fmt_hm(c['max'])} in {wkey.replace('d', '')} days (ending {c['date']:%d %b}) exceeds the {cap_txt} cap."))
+        elif soft and c["max"] > limit:
+            findings.append(("note",
+                f"Cumulative: {_fmt_hm(c['max'])} in 7 days (ending {c['date']:%d %b}) is over 60 h \u2014 "
+                "only OK if caused by unforeseen delays (\u2264 65 h)."))
+
+    return {"counts": counts, "cumulative": cumulative, "findings": findings}
+
+
 def _duty_chip(sectors):
     """One compact chip per duty: a turnaround collapses to 'UL404/5' with one
     line per sector — route, dep–arr times and TRUE flying time (UTC-corrected
@@ -2360,6 +2510,36 @@ else:
     - Training/duty codes (SEP, SEC, CRM, DGR, …) count as a duty day — they are **not** days off.
                     """)
 
+            # ---------- FDP COMPLIANCE: CHAPTER 08 (early/late/night + cumulative) ----------
+            if parsed_rows:
+                st.markdown("#### \u2696\ufe0f FDP Compliance \u2014 Chapter 08")
+                fdp = fdp_roster_audit(parsed_rows)
+                fviol = [f for f in fdp["findings"] if f[0] == "violation"]
+                fnote = [f for f in fdp["findings"] if f[0] == "note"]
+                cum = fdp["cumulative"]
+                cum_line = (f"<div class='muted' style='font-size:12px;'>Rolling maxima this roster: "
+                            f"<b>{_fmt_hm(cum['7d']['max'])}</b> / 60h (7d) \u00b7 "
+                            f"<b>{_fmt_hm(cum['14d']['max'])}</b> / 105h (14d) \u00b7 "
+                            f"<b>{_fmt_hm(cum['28d']['max'])}</b> / 210h (28d) \u2014 standby & duty days counted in full.</div>")
+                cnt = fdp["counts"]
+                cnt_line = (f"<div class='muted' style='font-size:12px;'>Duty mix: \u2600\ufe0f {cnt['early']} early \u00b7 "
+                            f"\U0001f307 {cnt['late']} late \u00b7 \U0001f303 {cnt['night']} night</div>")
+                if not fdp["findings"]:
+                    st.markdown(
+                        f"<div class='card' style='border-color:#4caf50;'><span style='color:#a5d6a7;'>\u2705 FDP limits OK \u2014 "
+                        "no early/late/night or cumulative breaches in this roster.</span>"
+                        f"{cnt_line}{cum_line}</div>", unsafe_allow_html=True)
+                else:
+                    st.markdown(
+                        f"<div class='card' style='border-color:#ff5252;'><b style='color:#ff8a8a;'>{len(fviol)} FDP breach(es)</b>"
+                        + (f" \u00b7 <span style='color:#ffb74d;'>{len(fnote)} note(s)</span>" if fnote else "") +
+                        f"{cnt_line}{cum_line}</div>", unsafe_allow_html=True)
+                    for sev, msg in fdp["findings"]:
+                        if sev == "violation":
+                            st.markdown(f"<div style='font-size:12.5px;background:#2c1f1f;border:1px solid #ff5252;color:#ff8a8a;padding:10px;border-radius:8px;margin-bottom:8px;'>\u26a0\ufe0f {msg}</div>", unsafe_allow_html=True)
+                        else:
+                            st.markdown(f"<div style='font-size:12.5px;background:#33260f;border:1px solid #ffc107;color:#ffd54f;padding:10px;border-radius:8px;margin-bottom:8px;'>\u2139\ufe0f {msg}</div>", unsafe_allow_html=True)
+
         # ---------- RIGHT: AGENT ALERTS + BIDDING ----------
         with right_col:
             st.markdown("#### Flight Monitoring Agent")
@@ -2849,6 +3029,22 @@ else:
                 st.markdown("<div class='muted' style='font-size:12px;'>Annex A B.1: max FDP <b>13:00</b>, extendable by in-flight relief "
                             "\u2014 requires <b>6 Economy seats blocked</b> for cabin-crew rest.</div>", unsafe_allow_html=True)
 
+            # ---------- 5. Commencing duty from standby ----------
+            st.markdown("##### 5 \u00b7 Commencing duty from standby (optional)")
+            sby_use = st.checkbox("This duty starts from standby (called out)", value=False, key="fdp_sby_use")
+            sby_start = None
+            sby_case_c = False
+            if sby_use:
+                c1, c2 = st.columns([1, 1])
+                sby_date = c1.date_input("Standby start date", value=ci_date, key="fdp_sby_date")
+                sby_t = c2.time_input("Standby start time", value=dtime(0, 0), key="fdp_sby_t") or dtime(0, 0)
+                sby_start = datetime.combine(sby_date, sby_t)
+                sby_case_c = st.checkbox("Standby at home / suitable accommodation 2200\u20130800 with \u2264 2 h notice (Case C)",
+                                         value=False, key="fdp_sby_case_c")
+                st.markdown("<div class='muted' style='font-size:12px;'>Standby ends when you report (check-in) \u00b7 max standby "
+                            "<b>12 h</b>. The standby start time sets the allowable FDP band unless the actual FDP starts in a "
+                            "more limiting band.</div>", unsafe_allow_html=True)
+
         with rcol2:
             # --- delayed-reporting shift (8.2.6) ---
             ci_act = ci_dt + timedelta(minutes=delay_min)
@@ -2860,6 +3056,16 @@ else:
             if delay_min > 0:
                 band_used, delay_note = apply_delay(acclim_bool, sectors, preceding_rest_h, dep_dt, delay_min)
                 fdp_start = ci_act if delay_min < 240 else (ci_dt + timedelta(hours=4))
+
+            sby_note = ""
+            if sby_use and sby_start is not None:
+                band_sby = fdp_band(sby_start.time())
+                band_fdp_act = fdp_band((dep_act - timedelta(hours=1)).time())
+                v_sby = fdp_limit_min(acclim_bool, band_sby, sectors, preceding_rest_h)
+                v_act = fdp_limit_min(acclim_bool, band_fdp_act, sectors, preceding_rest_h)
+                band_used = band_sby if v_sby <= v_act else band_fdp_act
+                sby_note = (f"Standby start {sby_start:%H:%M} sets the FDP band \u2192 more limiting of "
+                            f"{band_sby} / {band_fdp_act} = <b>{band_used}</b>.")
 
             base_fdp = 780 if annex_b1 else fdp_limit_min(acclim_bool, band_used, sectors, preceding_rest_h)
             extra, cap, ext_detail = extension_minutes(split_rest, relief_rest, relief_type)
@@ -2885,6 +3091,9 @@ else:
 
             if delay_note:
                 st.markdown(f"<div class='card' style='font-size:12.5px;border-left:3px solid #ffc107;'>{delay_note}</div>",
+                            unsafe_allow_html=True)
+            if sby_note:
+                st.markdown(f"<div class='card' style='font-size:12.5px;border-left:3px solid #00bcd4;'>{sby_note}</div>",
                             unsafe_allow_html=True)
 
             rows = [
@@ -2935,6 +3144,30 @@ else:
                     f"<b>{_fmt_hm(int(req_rest_h * 60))}</b> \u2192 "
                     f"<span style='color:{rb_t};border-bottom:1px solid {rb_c};'>{verdict}</span></div>",
                     unsafe_allow_html=True)
+
+            if sby_use and sby_start is not None:
+                sby_min = int((ci_act - sby_start).total_seconds() // 60)
+                if sby_min < 0:
+                    sby_min = 0
+                allowed_tot, sby_case, sby_detail = standby_fdp_check(acclim_bool, sectors, preceding_rest_h,
+                                                                     band_used, sby_min, sby_case_c)
+                actual_tot = sby_min + actual_fdp
+                sby_ok = actual_tot <= allowed_tot
+                over12 = " \u00b7 \u26a0\ufe0f standby exceeds 12 h" if sby_min > 12 * 60 else ""
+                sb_c, sb_t = ("#4caf50", "#a5d6a7") if sby_ok else ("#ff5252", "#ff8a8a")
+                sby_verdict = ("\u2705 within limits" if sby_ok else f"\u274c exceeds by {_fmt_hm(actual_tot - allowed_tot)}")
+                st.markdown(
+                    f"<div class='card' style='font-size:12.5px;'>"
+                    f"<b style='color:#00bcd4;'>Standby + FDP (called out):</b> standby {_fmt_hm(sby_min)} + "
+                    f"FDP {_fmt_hm(actual_fdp)} = <b>{_fmt_hm(actual_tot)}</b> \u00b7 allowed "
+                    f"<b>{_fmt_hm(allowed_tot)}</b> ({sby_case}){over12}<br>"
+                    f"<span class='muted'>{sby_detail}</span><br>"
+                    f"<span style='color:{sb_t};border-bottom:1px solid {sb_c};'>{sby_verdict}</span></div>",
+                    unsafe_allow_html=True)
+                st.markdown(
+                    f"<div class='muted' style='font-size:11.5px;margin-top:2px;'>Min rest after a call-out is based on the "
+                    f"<b>combined</b> standby + FDP duration ({_fmt_hm(actual_tot)}). A standby that finishes <i>without</i> a "
+                    f"call-out needs 12 h rest before the next duty.</div>", unsafe_allow_html=True)
 
             with st.expander("\U0001f4d6 FDP tables (Chapter 08)"):
                 ta = "| Local time of start | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8+ |\n|---|---|---|---|---|---|---|---|---|\n"
