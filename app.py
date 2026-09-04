@@ -1573,7 +1573,7 @@ def fdp_limit_min(acclimatized, band, sectors, preceding_rest_h=None):
     if acclimatized:
         row = FDP_TABLE_A.get(band, FDP_TABLE_A["0600-0759"])
     else:
-        bucket = ("between18_30" if preceding_rest_h is not None and 18 < preceding_rest_h < 30
+        bucket = ("between18_30" if preceding_rest_h is not None and 18 < preceding_rest_h <= 30
                   else "up18_or_over30")
         row = FDP_TABLE_B[bucket]
     return row[sectors - 1] + 60
@@ -2630,34 +2630,36 @@ else:
 
             st.markdown("##### 2 · Previous duty (optional)")
             st.markdown("<div class='muted' style='margin-top:-6px;margin-bottom:6px;'>Used for preceding rest "
-                        "(Table B), the min-rest check and the acclimatization hint.</div>", unsafe_allow_html=True)
+                        "(Table B) and the min-rest check.</div>", unsafe_allow_html=True)
             use_prev = st.toggle("Include previous duty", value=False, key="fdp_use_prev")
             prev_ci_date = prev_ci_t = prev_co_date = prev_co_t = None
-            prev_stn = "CMB"
             if use_prev:
                 prev_ci_date = st.date_input("Previous check-in date", value=ci_date - timedelta(days=1), key="fdp_pci_date")
                 prev_ci_t = st.time_input("Previous check-in time", value=dtime(6, 0), key="fdp_pci_t") or dtime(6, 0)
                 prev_co_next = st.checkbox("Previous chocks-on was the day AFTER its check-in", value=False, key="fdp_pco_next")
                 prev_co_t = st.time_input("Previous chocks-on time", value=dtime(18, 0), key="fdp_pco_t") or dtime(18, 0)
                 prev_co_date = prev_ci_date + (timedelta(days=1) if prev_co_next else timedelta(0))
-                stations = sorted(AIRPORT_OFFSET_H.keys())
-                prev_stn = st.selectbox("Previous duty ended at (station)", stations,
-                                        index=stations.index("CMB") if "CMB" in stations else 0, key="fdp_pstn")
 
             st.markdown("##### 3 · Acclimatization")
-            sugg_no = False
-            sugg_txt = "Yes — acclimatized (home base CMB)"
-            sugg_col = "#4caf50"
-            if use_prev and prev_stn:
-                off = AIRPORT_OFFSET_H.get(prev_stn, 5.5)
-                if abs(off - 5.5) > 2:
-                    sugg_no = True
-                    sugg_txt = f"No — last duty ended at {prev_stn} (UTC{off:+.1f}, more than 2h from CMB)"
-                    sugg_col = "#ff8a8a"
-            st.markdown(f"<div style='font-size:12px;color:{sugg_col};margin-bottom:6px;'>Suggestion: {sugg_txt} "
-                        f"(override below)</div>", unsafe_allow_html=True)
-            acclim = st.radio("Acclimatized at start of this duty?", ["Yes", "No"],
-                              index=1 if sugg_no else 0, key="fdp_acclim")
+            st.markdown("<div class='muted' style='margin-top:-6px;margin-bottom:6px;'>"
+                        "You are <b>acclimatized</b> to CMB only after <b>3 consecutive local nights</b> on the ground "
+                        "at base (within a 2h-wide time zone). A layover at a station more than 2h off CMB "
+                        "(e.g. RUH, DOH, SIN, KUL, ICN, NRT, LHR, SYD, MEL) de-acclimatizes you — landing back in CMB "
+                        "does <b>not</b> instantly re-acclimatize you.</div>", unsafe_allow_html=True)
+            nights_at_base = st.selectbox("Consecutive local nights at CMB before this duty",
+                                          ["0", "1", "2", "3 or more"], index=3, key="fdp_nights",
+                                          help="How many consecutive local nights you've spent at home base (CMB) "
+                                               "before this duty starts. 3+ → acclimatized (Table A); fewer → "
+                                               "not acclimatized (Table B).")
+            acclim_bool = (nights_at_base == "3 or more")
+            st.markdown(
+                ("<div style='font-size:12.5px;background:#12301f;border:1px solid #4caf50;color:#a5d6a7;"
+                 "padding:8px;border-radius:8px;'>✅ Acclimatized → Table A applies</div>"
+                 if acclim_bool else
+                 "<div style='font-size:12.5px;background:#33260f;border:1px solid #ffc107;color:#ffd54f;"
+                 "padding:8px;border-radius:8px;'>⏱ Not acclimatized → Table B applies "
+                 "(need 3 consecutive local nights at CMB to re-acclimatize)</div>"),
+                unsafe_allow_html=True)
 
         with rcol2:
             ci_dt = datetime.combine(ci_date, ci_t)
@@ -2678,7 +2680,6 @@ else:
                 if preceding_rest_h < 0:
                     preceding_rest_h += 24
 
-            acclim_bool = (acclim == "Yes")
             max_fdp = fdp_limit_min(acclim_bool, band, sectors, preceding_rest_h)
             actual_fdp = int((arr_dt - ci_dt).total_seconds() // 60)
             if actual_fdp <= 0:
@@ -2705,7 +2706,7 @@ else:
                 ("Table used", ("Table A — acclimatized" if acclim_bool else "Table B — not acclimatized")),
             ]
             if not acclim_bool and preceding_rest_h is not None:
-                bucket = "between 18h and 30h" if 18 < preceding_rest_h < 30 else "up to 18h / over 30h"
+                bucket = "between 18h and 30h" if 18 < preceding_rest_h <= 30 else "up to 18h / over 30h"
                 rows.append(("Preceding rest (Table B key)", f"{_fmt_hm(int(preceding_rest_h * 60))} → {bucket}"))
             rows += [
                 ("Flight-crew table value", _fmt_hm(flight_crew_val)),
@@ -2754,5 +2755,6 @@ else:
                 st.markdown("**Table B — Not acclimatized** (flight crew; cabin crew +1:00)")
                 st.markdown(tb)
                 st.markdown("<div class='muted'>All times Colombo local. FDP = check-in → final chocks-on. "
-                            "Local time of start = first departure − 1h (flight-crew report time).</div>",
+                            "Local time of start = first departure − 1h (flight-crew report time). "
+                            "Acclimatized = 3 consecutive local nights at CMB.</div>",
                             unsafe_allow_html=True)
