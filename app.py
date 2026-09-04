@@ -1185,27 +1185,29 @@ def suggest_standby_for_cancel(row):
     FAU map:
       * midnight flight (departs 00:00–05:59): report before midnight → SBY4,
         report after midnight → SBY1
-      * Middle-East flight reporting before 18:00 → SBY3
-      * morning turnaround out of CMB: report after 06:00 → SBY2, before
-        06:00 → SBY1
+      * Middle-East flight reporting before 18:00 → SBY3 (18:00+ → none)
+      * morning report (any flight): before 06:00 → SBY1, 06:00–11:59 → SBY2
     Returns None when the flight doesn't match any category."""
     ci = row.get("CIdt") or row.get("DEPdt")
     dep = row.get("DEPdt")
     if not isinstance(ci, datetime) or not isinstance(dep, datetime):
         return None
-    o, d = _route_od(row.get("Route") or "")
+    _, d = _route_od(row.get("Route") or "")
 
     # midnight flight (small-hours departure)
     if dep.time() < dtime(6, 0):
         return "SB4" if ci.date() < dep.date() else "SB1"
 
-    # Middle-East flight reporting before 18:00
+    # Middle-East flight reporting before 18:00 → SBY3 (18:00+ → no suggestion)
     if d in MIDEAST_STATIONS and ci.time() < dtime(18, 0):
         return "SB3"
 
-    # morning turnaround out of CMB
-    if o == "CMB" and dep.time() < dtime(12, 0):
-        return "SB2" if ci.time() >= dtime(6, 0) else "SB1"
+    # Morning turnaround — keyed on report/check-in time, any flight:
+    #   report before 06:00 → SBY1 ;  morning report 06:00–11:59 → SBY2
+    if ci.time() < dtime(6, 0):
+        return "SB1"
+    if ci.time() < dtime(12, 0):
+        return "SB2"
 
     return None
 
@@ -2216,7 +2218,7 @@ else:
     - **DOH / BAH / DMM turnarounds** → arrival day + **1 day off**.
     - **SIN / KUL / CGK morning turnarounds** (UL314/UL364, or a CMB–SIN departure 07:00–08:00) → next-day flights report after 18:00, or SBY4.
     - **Standby windows:** SBY1 00:01–11:59 · SBY2 06:00–18:00 · SBY3 12:00–23:59 · SBY4 18:00–05:59.
-    - **Standby insertion if your flight cancels:** morning T/A (report after 06:00) → SBY2 · morning T/A (report before 06:00) → SBY1 · Middle-East flight reporting before 18:00 → SBY3 · midnight flight reporting before midnight → SBY4 · midnight flight reporting after midnight → SBY1.
+    - **Standby insertion if your flight cancels:** morning report before 06:00 → SBY1 · morning report 06:00–11:59 → SBY2 · Middle-East flight reporting before 18:00 → SBY3 · midnight flight reporting before midnight → SBY4 · midnight flight reporting after midnight → SBY1.
     - Training/duty codes (SEP, SEC, CRM, DGR, …) count as a duty day — they are **not** days off.
                     """)
 
