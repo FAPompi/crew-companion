@@ -2002,9 +2002,9 @@ else:
             cat = st.selectbox("Category", cats, index=cats.index(saved.get("cat", "C3")) if saved.get("cat", "C3") in cats else 5)
             usd_rate = st.number_input("USD → LKR rate", value=float(saved.get("rate", 318.56)), step=0.01, format="%.2f")
             schblk = st.text_input("SCHBLK (scheduled block hrs)", value=saved.get("schblk", "70h 00m"))
+            basic = st.number_input("Basic Salary (Rs)", value=float(saved.get("basic", 0.0)), step=500.0)
             festival = st.toggle("Festival Advance taken (Rs 5,000)", value=bool(saved.get("festival", False)))
             with st.expander("⚙️ Advanced (salary components & deductions)"):
-                basic = st.number_input("Basic Salary (Rs)", value=float(saved.get("basic", 0.0)), step=500.0)
                 crge = st.number_input("CRGE (Rs)", value=float(saved.get("crge", 10000.0)), step=500.0)
                 transport = st.number_input("Transport deduction (Rs)", value=float(saved.get("transport", 1000.0)), step=100.0)
                 medical = st.number_input("Medical contribution (Rs)", value=float(saved.get("medical", 500.0)), step=100.0)
@@ -2109,10 +2109,10 @@ else:
                 gross_no_ta_usd = s['allow_usd_total'] - s['ta_on_usd']
                 gross_no_ta_rs = s['allow_rs_total'] - ta_on_rs
                 h1, h2, h3, h4 = st.columns(4)
-                h1.markdown(f"<div class='card' style='text-align:center;border-color:#4caf50;'><div class='muted'>NET SALARY (Rs)</div><div style='font-size:22px;font-weight:800;color:#4caf50;'>Rs {s['net']:,.0f}</div><div class='muted'>after tax & deductions</div></div>", unsafe_allow_html=True)
-                h2.markdown(f"<div class='card' style='text-align:center;'><div class='muted'>TURNAROUND O/N (USD)</div><div style='font-size:22px;font-weight:800;color:#8bc34a;'>${s['ta_on_usd']:,.0f}</div><div class='muted'>≈ Rs {ta_on_rs:,.0f}</div><div class='muted' style='margin-top:6px;'>{s['t_on']} overnight(s) × ${OVERNIGHT_RATE_USD[cat]}</div></div>", unsafe_allow_html=True)
-                h3.markdown(f"<div class='card' style='text-align:center;'><div class='muted'>ALLOWANCES (USD — gross)</div><div style='font-size:22px;font-weight:800;color:#00bcd4;'>${gross_no_ta_usd:,.0f}</div><div class='muted'>≈ Rs {gross_no_ta_rs:,.0f}</div><div class='muted' style='margin-top:6px;'>meals + layover overnights — full gross, nothing deducted here · turnaround O/N in its own card</div></div>", unsafe_allow_html=True)
-                h4.markdown(f"<div class='card' style='text-align:center;'><div class='muted'>TOTAL TAKE-HOME</div><div style='font-size:22px;font-weight:800;color:#ffb74d;'>Rs {s['net'] + s['allow_rs_total']:,.0f}</div><div class='muted'>salary + all allowances</div></div>", unsafe_allow_html=True)
+                h1.markdown(f"<div class='card' style='text-align:center;border-color:#4caf50;min-height:150px;'><div class='muted'>NET SALARY (Rs)</div><div style='font-size:22px;font-weight:800;color:#4caf50;'>Rs {s['net']:,.0f}</div><div class='muted'>after tax & deductions</div></div>", unsafe_allow_html=True)
+                h2.markdown(f"<div class='card' style='text-align:center;min-height:150px;'><div class='muted'>TURNAROUND O/N (USD)</div><div style='font-size:22px;font-weight:800;color:#8bc34a;'>${s['ta_on_usd']:,.0f}</div><div class='muted'>≈ Rs {ta_on_rs:,.0f}</div><div class='muted' style='margin-top:6px;'>{s['t_on']} overnight(s) × ${OVERNIGHT_RATE_USD[cat]}</div></div>", unsafe_allow_html=True)
+                h3.markdown(f"<div class='card' style='text-align:center;min-height:150px;'><div class='muted'>ALLOWANCES (USD — gross)</div><div style='font-size:22px;font-weight:800;color:#00bcd4;'>${gross_no_ta_usd:,.0f}</div><div class='muted'>≈ Rs {gross_no_ta_rs:,.0f}</div><div class='muted' style='margin-top:6px;'>Layover Meal Allowance + Layover Overnights</div></div>", unsafe_allow_html=True)
+                h4.markdown(f"<div class='card' style='text-align:center;min-height:150px;'><div class='muted'>TOTAL TAKE-HOME</div><div style='font-size:22px;font-weight:800;color:#ffb74d;'>Rs {s['net'] + s['allow_rs_total']:,.0f}</div><div class='muted'>Salary + All Allowances + T/A Overnight Allowances</div></div>", unsafe_allow_html=True)
 
                 # earnings composition bar
                 parts = [("Productivity", max(s['productivity_rs'], 0), "#00bcd4"),
@@ -2120,7 +2120,7 @@ else:
                          ("CRGE", float(crge), "#ffb74d"),
                          ("Basic", float(basic), "#b39ddb"),
                          ("FBPP", s['fbpp_rs'], "#f06292"),
-                         ("Leave", s['leave_rs'], "#4dd0e1"),
+                         ("Duty Day", s['leave_rs'], "#4dd0e1"),
                          ("Acting", s['act_pay_rs'], "#ce93d8")]
                 tot = sum(p[1] for p in parts) or 1
                 seg = "".join(f"<div style='width:{100*v/tot:.1f}%;background:{c};height:14px;'></div>" for _, v, c in parts if v > 0)
@@ -2136,7 +2136,7 @@ else:
                         + f"<div class='bidrow'><span>CRGE</span><span>{crge:,.0f}</span></div>"
                         + f"<div class='bidrow'><span>Productivity Pay*</span><span>{s['productivity_rs']:,.1f}</span></div>"
                         + f"<div class='bidrow'><span>Flt Base Pro Pay ({len(s['fbpp_items'])} T/A · ${s['fbpp_usd']:,.0f})</span><span>{s['fbpp_rs']:,.1f}</span></div>"
-                        + f"<div class='bidrow'><span>Leave Pay ({s['leave_days']}d)</span><span>{s['leave_rs']:,.0f}</span></div>"
+                        + f"<div class='bidrow'><span>Duty Day Pay ({s['leave_days']}d)</span><span>{s['leave_rs']:,.0f}</span></div>"
                         + (f"<div class='bidrow'><span>Acting Pay ({s['act_min']//60}h {s['act_min']%60}m)</span><span>{s['act_pay_rs']:,.0f}</span></div>" if s["act_min"] else "")
                         + f"<div class='bidrow'><b>Total Earnings</b><b>{s['earnings']:,.1f}</b></div>"
                         + f"<div class='muted' style='margin-top:6px;'>*{s['final_min']//60}h {s['final_min']%60}m paid ({s['m75']}min ≤75h + {s['mex']}min >75h), minus {s['ob_count']} on-board meals (−Rs {s['ob_deduct_rs']:,.0f}). Flown: {s['block_min']//60}h {s['block_min']%60}m.</div>"
