@@ -1644,6 +1644,8 @@ def compute_salary(rows, prof, acting=None):
             detail.append((f"✈ {r['Flight / Code']} ({r['Route']})", f"{b}B {l}L {d}D", "on board"))
 
     l_nights = 0
+    layover_allow = []      # per-layover allowance breakdown (dashboard estimator)
+    claimed_flights = set()
     for i, r in enumerate(rows):
         if r["Type"] != "LAYOVER":
             continue
@@ -1653,11 +1655,23 @@ def compute_salary(rows, prof, acting=None):
         he = r.get("COdt") or ((nf.get("CIdt") or nf.get("DEPdt")) if nf else None)
         pf_end = (pf.get("COdt") or pf.get("ARRdt")) if pf else None
         ms = max(hs, pf_end) if (hs and pf_end) else (hs or pf_end)
+        lay_meals = 0
         if ms and he:
             b, l, d = _meal_counts(ms, he)
+            lay_meals = b + l + d
             for k, v in enumerate((b, l, d)):
                 ent[k] += v
             detail.append((f"🏨 Layover {r['Route']}", f"{b}B {l}L {d}D", "hotel"))
+        # meals eaten ON BOARD the flights into/out of this layover also belong
+        # to this layover trip (paid as allowance, deducted from salary)
+        for f in (pf, nf):
+            if f is None or id(f) in claimed_flights:
+                continue
+            fs, fe = win(f)
+            if fs and fe:
+                fb, fl_, fd = _meal_counts(fs, fe)
+                lay_meals += fb + fl_ + fd
+                claimed_flights.add(id(f))
         # Layover O/N count — nights AWAY FROM BASE, from the outbound flight's
         # report (check-in) to the return flight's check-out after landing.
         # Mirrors the sheet's 'Hours & ONights' column I ("L Overnight"):
@@ -1667,8 +1681,15 @@ def compute_salary(rows, prof, acting=None):
             next_time = nf.get("COdt") or nf.get("ARRdt") or he
         else:
             next_time = he or r.get("EndDateObj")
+        lay_nights = 0
         if prev_time and next_time and next_time > prev_time:
-            l_nights += (next_time.date() - prev_time.date()).days
+            lay_nights = (next_time.date() - prev_time.date()).days
+            l_nights += lay_nights
+        layover_allow.append({
+            "station": r["Route"] if r.get("Route") and r["Route"] != "-" else "LAY",
+            "meals": lay_meals, "nights": lay_nights,
+            "usd": lay_meals * MEAL_RATE_USD + lay_nights * OVERNIGHT_RATE_USD[cat],
+        })
 
     t_on = 0
     for i, r in flights:
@@ -1770,6 +1791,7 @@ def compute_salary(rows, prof, acting=None):
         "block_min": block_min, "final_min": final_min, "m75": m75, "mex": mex,
         "ent": ent, "ent_count": ent_count, "ob_count": ob_count, "detail": detail,
         "l_nights": l_nights, "t_on": t_on, "leave_days": leave_days,
+        "layover_allow": layover_allow,
         "productivity_rs": productivity_rs, "ob_deduct_rs": ob_deduct_rs,
         "fbpp_usd": fbpp_usd, "fbpp_rs": fbpp_rs, "fbpp_items": fbpp_items,
         "fbpp_missing": fbpp_missing,
@@ -1954,16 +1976,21 @@ else:
                 f"<div class='muted' style='margin-top:4px;'>1.5 + 1.4·redeyes + 0.7·max-streak + 3.0·(block/85) — capped at 10</div></div>",
                 unsafe_allow_html=True)
             if est_sal:
-                rate_on = OVERNIGHT_RATE_USD[_est_prof["cat"]]
                 est_total = est_sal["meal_usd"] + est_sal["on_usd"]
-                rows_html = (
-                    f"<div class='bidrow'><span>Layover Meal Allowance ({est_sal['ent_count']} × ${MEAL_RATE_USD:.0f})</span><span>${est_sal['meal_usd']:,.0f}</span></div>"
-                    f"<div class='bidrow'><span>Layover Overnights ({est_sal['l_nights']} × ${rate_on})</span><span>${est_sal['on_usd']:,.0f}</span></div>"
-                )
+                rows_html = ""
+                for lv in est_sal.get("layover_allow", []):
+                    city = STATION_INFO.get(lv["station"], (lv["station"],))[0]
+                    rows_html += (
+                        f"<div class='bidrow'><span>{city} ({lv['station']})"
+                        f"<span class='muted'> · {lv['nights']} night(s), {lv['meals']} meals</span></span>"
+                        f"<span>~${lv['usd']:,.0f}</span></div>"
+                    )
+                if not rows_html:
+                    rows_html = "<div class='muted'>No layovers in this roster.</div>"
                 st.markdown(
                     f"<div class='card'><h5>Estimated Allowances</h5>"
                     f"<div style='font-size:26px;font-weight:800;color:#4caf50;'>${est_total:,.0f} USD</div>"
-                    f"<div class='muted' style='margin-bottom:6px;'>Layover meals + overnights — same logic as the Salary Calculator</div>{rows_html}</div>",
+                    f"<div class='muted' style='margin-bottom:6px;'>Per-layover breakdown (meals + overnights)</div>{rows_html}</div>",
                     unsafe_allow_html=True)
             else:
                 st.markdown(
