@@ -1535,6 +1535,50 @@ def _fmt_hm(mins):
     return f"{m}m"
 
 
+# --- 3.6 FDP CALCULATOR — FOM Part A Chapter 08 (cabin crew) ---
+# Table A/B hold the FLIGHT-CREW maxima in minutes; cabin crew get +1:00 (8.3.a).
+# All times are Colombo (CMB) local (user instruction — same convention as the
+# meal-allowance math). "Local time of start" for Table A = first departure − 1h
+# (the standard flight-crew reporting time).
+
+FDP_TABLE_A = {   # acclimatized — keyed on local time of start
+    "0600-0759": [780, 735, 690, 645, 600, 570, 540, 540],
+    "0800-1259": [840, 795, 750, 705, 660, 630, 600, 570],
+    "1300-1759": [780, 735, 690, 645, 600, 570, 540, 540],
+    "1800-2159": [720, 675, 630, 585, 540, 540, 540, 540],
+    "2200-0559": [660, 615, 570, 540, 540, 540, 540, 540],
+}
+FDP_TABLE_B = {   # not acclimatized — keyed on length of preceding rest
+    "up18_or_over30": [780, 750, 690, 645, 600, 555, 540, 540],
+    "between18_30":   [690, 660, 630, 585, 540, 540, 540, 540],
+}
+
+
+def fdp_band(t):
+    """Table A row key for a given local-time-of-start."""
+    if dtime(6, 0) <= t <= dtime(7, 59):
+        return "0600-0759"
+    if dtime(8, 0) <= t <= dtime(12, 59):
+        return "0800-1259"
+    if dtime(13, 0) <= t <= dtime(17, 59):
+        return "1300-1759"
+    if dtime(18, 0) <= t <= dtime(21, 59):
+        return "1800-2159"
+    return "2200-0559"
+
+
+def fdp_limit_min(acclimatized, band, sectors, preceding_rest_h=None):
+    """Cabin-crew max FDP in minutes = table value + 60 (8.3.a)."""
+    sectors = max(1, min(int(sectors), 8))
+    if acclimatized:
+        row = FDP_TABLE_A.get(band, FDP_TABLE_A["0600-0759"])
+    else:
+        bucket = ("between18_30" if preceding_rest_h is not None and 18 < preceding_rest_h < 30
+                  else "up18_or_over30")
+        row = FDP_TABLE_B[bucket]
+    return row[sectors - 1] + 60
+
+
 def _duty_chip(sectors):
     """One compact chip per duty: a turnaround collapses to 'UL404/5' with one
     line per sector — route, dep–arr times and TRUE flying time (UTC-corrected
@@ -2058,7 +2102,7 @@ else:
             st.session_state['logged_in'] = False
             st.rerun()
 
-    page_dash, page_salary = st.tabs(["📋 Dashboard", "💰 Salary Calculator"])
+    page_dash, page_salary, page_fdp = st.tabs(["📋 Dashboard", "💰 Salary Calculator", "⏱ FDP Calculator"])
 
     with page_dash:
         left_col, main_col, right_col = st.columns([1, 2.3, 1.3])
@@ -2218,7 +2262,7 @@ else:
     - **DOH / BAH / DMM turnarounds** → arrival day + **1 day off**.
     - **SIN / KUL / CGK morning turnarounds** (UL314/UL364, or a CMB–SIN departure 07:00–08:00) → next-day flights report after 18:00, or SBY4.
     - **Standby windows:** SBY1 00:01–11:59 · SBY2 06:00–18:00 · SBY3 12:00–23:59 · SBY4 18:00–05:59.
-    - **Standby insertion if your flight cancels:** morning report before 06:00 → SBY1 · morning report 06:00–11:59 → SBY2 · Middle-East flight reporting before 18:00 → SBY3 · midnight flight reporting before midnight → SBY4 · midnight flight reporting after midnight → SBY1.
+    - **Standby insertion if your flight cancels:** morning T/A (report after 06:00) → SBY2 · morning T/A (report before 06:00) → SBY1 · Middle-East flight reporting before 18:00 → SBY3 · midnight flight reporting before midnight → SBY4 · midnight flight reporting after midnight → SBY1.
     - Training/duty codes (SEP, SEC, CRM, DGR, …) count as a duty day — they are **not** days off.
                     """)
 
@@ -2562,3 +2606,153 @@ else:
                             st.rerun()
 
                 st.markdown("<div class='muted' style='margin-top:8px;'>⚠️ Independent estimate for personal guidance only — refer to your official payslip for final figures.</div>", unsafe_allow_html=True)
+
+    # ================= ⏱ FDP CALCULATOR PAGE =================
+    with page_fdp:
+        st.markdown("#### ⏱ FDP Calculator")
+        st.markdown(
+            "<div class='muted' style='margin-bottom:10px;'>Standalone Flight Duty Period calculator for "
+            "<b>cabin crew</b> — FOM Part A Chapter 08. Enter all times in <b>Colombo (CMB) local time</b>. "
+            "Max FDP = Table A/B value + 1:00 cabin-crew allowance (&sect;8.3.a).</div>", unsafe_allow_html=True)
+
+        lcol, rcol2 = st.columns([1, 1.15])
+
+        with lcol:
+            st.markdown("##### 1 · Current duty")
+            ci_date = st.date_input("Check-in (report) date", value=datetime.now().date(), key="fdp_ci_date")
+            ci_t = st.time_input("Check-in (report) time", value=dtime(6, 15), key="fdp_ci_t") or dtime(6, 15)
+            dep_t = st.time_input("First sector departure time", value=dtime(7, 35), key="fdp_dep_t") or dtime(7, 35)
+            dep_next = st.checkbox("Departure is the day AFTER check-in", value=False, key="fdp_dep_next")
+            arr_t = st.time_input("Final sector arrival (chocks-on) time", value=dtime(15, 45), key="fdp_arr_t") or dtime(15, 45)
+            arr_next = st.checkbox("Chocks-on is the day AFTER departure", value=False, key="fdp_arr_next")
+            sectors = st.selectbox("Sectors in this duty", list(range(1, 9)), index=1, key="fdp_sectors",
+                                   format_func=lambda n: f"{n} sector" + ("" if n == 1 else "s"))
+
+            st.markdown("##### 2 · Previous duty (optional)")
+            st.markdown("<div class='muted' style='margin-top:-6px;margin-bottom:6px;'>Used for preceding rest "
+                        "(Table B), the min-rest check and the acclimatization hint.</div>", unsafe_allow_html=True)
+            use_prev = st.toggle("Include previous duty", value=False, key="fdp_use_prev")
+            prev_ci_date = prev_ci_t = prev_co_date = prev_co_t = None
+            prev_stn = "CMB"
+            if use_prev:
+                prev_ci_date = st.date_input("Previous check-in date", value=ci_date - timedelta(days=1), key="fdp_pci_date")
+                prev_ci_t = st.time_input("Previous check-in time", value=dtime(6, 0), key="fdp_pci_t") or dtime(6, 0)
+                prev_co_next = st.checkbox("Previous chocks-on was the day AFTER its check-in", value=False, key="fdp_pco_next")
+                prev_co_t = st.time_input("Previous chocks-on time", value=dtime(18, 0), key="fdp_pco_t") or dtime(18, 0)
+                prev_co_date = prev_ci_date + (timedelta(days=1) if prev_co_next else timedelta(0))
+                stations = sorted(AIRPORT_OFFSET_H.keys())
+                prev_stn = st.selectbox("Previous duty ended at (station)", stations,
+                                        index=stations.index("CMB") if "CMB" in stations else 0, key="fdp_pstn")
+
+            st.markdown("##### 3 · Acclimatization")
+            sugg_no = False
+            sugg_txt = "Yes — acclimatized (home base CMB)"
+            sugg_col = "#4caf50"
+            if use_prev and prev_stn:
+                off = AIRPORT_OFFSET_H.get(prev_stn, 5.5)
+                if abs(off - 5.5) > 2:
+                    sugg_no = True
+                    sugg_txt = f"No — last duty ended at {prev_stn} (UTC{off:+.1f}, more than 2h from CMB)"
+                    sugg_col = "#ff8a8a"
+            st.markdown(f"<div style='font-size:12px;color:{sugg_col};margin-bottom:6px;'>Suggestion: {sugg_txt} "
+                        f"(override below)</div>", unsafe_allow_html=True)
+            acclim = st.radio("Acclimatized at start of this duty?", ["Yes", "No"],
+                              index=1 if sugg_no else 0, key="fdp_acclim")
+
+        with rcol2:
+            ci_dt = datetime.combine(ci_date, ci_t)
+            dep_dt = datetime.combine(ci_date + (timedelta(days=1) if dep_next else timedelta(0)), dep_t)
+            arr_dt = datetime.combine(dep_dt.date() + (timedelta(days=1) if arr_next else timedelta(0)), arr_t)
+
+            band_t = (dep_dt - timedelta(hours=1)).time()
+            band = fdp_band(band_t)
+
+            prev_dur_h = preceding_rest_h = None
+            if use_prev and prev_ci_date is not None and prev_co_date is not None:
+                pci_dt = datetime.combine(prev_ci_date, prev_ci_t)
+                pco_dt = datetime.combine(prev_co_date, prev_co_t)
+                prev_dur_h = (pco_dt - pci_dt).total_seconds() / 3600
+                if prev_dur_h <= 0:
+                    prev_dur_h += 24
+                preceding_rest_h = (ci_dt - pco_dt).total_seconds() / 3600
+                if preceding_rest_h < 0:
+                    preceding_rest_h += 24
+
+            acclim_bool = (acclim == "Yes")
+            max_fdp = fdp_limit_min(acclim_bool, band, sectors, preceding_rest_h)
+            actual_fdp = int((arr_dt - ci_dt).total_seconds() // 60)
+            if actual_fdp <= 0:
+                actual_fdp += 24 * 60
+            latest_co = ci_dt + timedelta(minutes=max_fdp)
+            margin = max_fdp - actual_fdp
+            flight_crew_val = max_fdp - 60
+
+            if margin >= 0:
+                vc_bg, vc_bc, vc_tc, vc_icon = "#12301f", "#4caf50", "#a5d6a7", "✅"
+                v_title, v_sub = "WITHIN LIMITS", f"{_fmt_hm(margin)} to spare"
+            else:
+                vc_bg, vc_bc, vc_tc, vc_icon = "#331414", "#ff1744", "#ff8a8a", "❌"
+                v_title, v_sub = "EXCEEDS MAX FDP", f"over by {_fmt_hm(-margin)}"
+            st.markdown(
+                f"<div class='card' style='text-align:center;background:{vc_bg};border:1px solid {vc_bc};'>"
+                f"<div style='font-size:26px;'>{vc_icon}</div>"
+                f"<div style='font-size:20px;font-weight:800;color:{vc_tc};'>{v_title}</div>"
+                f"<div class='muted'>{v_sub}</div></div>", unsafe_allow_html=True)
+
+            rows = [
+                ("Local time of start (dep − 1h)", band_t.strftime("%H:%M") + f" → band <b>{band}</b>"),
+                ("Sectors", f"{sectors}"),
+                ("Table used", ("Table A — acclimatized" if acclim_bool else "Table B — not acclimatized")),
+            ]
+            if not acclim_bool and preceding_rest_h is not None:
+                bucket = "between 18h and 30h" if 18 < preceding_rest_h < 30 else "up to 18h / over 30h"
+                rows.append(("Preceding rest (Table B key)", f"{_fmt_hm(int(preceding_rest_h * 60))} → {bucket}"))
+            rows += [
+                ("Flight-crew table value", _fmt_hm(flight_crew_val)),
+                ("Cabin crew (+1:00)", _fmt_hm(max_fdp)),
+                ("FDP starts (check-in)", ci_dt.strftime("%d %b %H:%M")),
+                ("Latest allowed chocks-on", latest_co.strftime("%d %b %H:%M")),
+                ("Actual chocks-on", arr_dt.strftime("%d %b %H:%M")),
+                ("Actual FDP", _fmt_hm(actual_fdp)),
+            ]
+            rows_html = "".join(f"<div class='bidrow'><span>{k}</span><span>{v}</span></div>" for k, v in rows)
+            st.markdown(f"<div class='card'>{rows_html}</div>", unsafe_allow_html=True)
+
+            this_dur_h = actual_fdp / 60
+            need_rest_h = max(this_dur_h - 1, 11.0)
+            earliest_next = arr_dt + timedelta(hours=need_rest_h)
+            st.markdown(
+                f"<div class='card' style='font-size:12.5px;'><b style='color:#00bcd4;'>Rest needed after this duty:</b> "
+                f"max({_fmt_hm(actual_fdp)} − 1h, 11h) = <b>{_fmt_hm(int(need_rest_h * 60))}</b> · "
+                f"earliest next check-in <b>{earliest_next.strftime('%d %b %H:%M')}</b></div>",
+                unsafe_allow_html=True)
+
+            if use_prev and prev_dur_h is not None and preceding_rest_h is not None:
+                req_rest_h = max(prev_dur_h - 1, 11.0)
+                rest_ok = preceding_rest_h >= req_rest_h
+                rb_c, rb_t = ("#4caf50", "#a5d6a7") if rest_ok else ("#ff5252", "#ff8a8a")
+                verdict = "✅ rest met" if rest_ok else f"⚠️ rest short by {_fmt_hm(int((req_rest_h - preceding_rest_h) * 60))}"
+                st.markdown(
+                    f"<div class='card' style='font-size:12.5px;'>"
+                    f"<b style='color:#00bcd4;'>Previous duty:</b> duration <b>{_fmt_hm(int(prev_dur_h * 60))}</b> · "
+                    f"rest before this duty <b>{_fmt_hm(int(preceding_rest_h * 60))}</b><br>"
+                    f"Required rest after previous duty = max({_fmt_hm(int(prev_dur_h * 60))} − 1h, 11h) = "
+                    f"<b>{_fmt_hm(int(req_rest_h * 60))}</b> → "
+                    f"<span style='color:{rb_t};border-bottom:1px solid {rb_c};'>{verdict}</span></div>",
+                    unsafe_allow_html=True)
+
+            with st.expander("📖 FDP tables (Chapter 08)"):
+                ta = "| Local time of start | 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8+ |\n|---|---|---|---|---|---|---|---|---|\n"
+                for bandk, row in FDP_TABLE_A.items():
+                    ta += f"| {bandk} | " + " | ".join(_fmt_hm(v) for v in row) + " |\n"
+                st.markdown("**Table A — Acclimatized** (flight crew; cabin crew +1:00)")
+                st.markdown(ta)
+                tb = "| Preceding rest | 1 | 2 | 3 | 4 | 5 | 6 | 7+ |\n|---|---|---|---|---|---|---|---|\n"
+                for bandk, row in FDP_TABLE_B.items():
+                    label = "Up to 18h / over 30h" if bandk == "up18_or_over30" else "Between 18h and 30h"
+                    tb += f"| {label} | " + " | ".join(_fmt_hm(v) for v in row[:7]) + " |\n"
+                st.markdown("**Table B — Not acclimatized** (flight crew; cabin crew +1:00)")
+                st.markdown(tb)
+                st.markdown("<div class='muted'>All times Colombo local. FDP = check-in → final chocks-on. "
+                            "Local time of start = first departure − 1h (flight-crew report time).</div>",
+                            unsafe_allow_html=True)
