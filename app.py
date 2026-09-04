@@ -2371,6 +2371,43 @@ else:
                 f"<div class='muted'>{analytics['redeyes']} red-eye dep · {analytics['max_streak']} consecutive duty days</div>"
                 f"<div class='muted' style='margin-top:4px;'>1.5 + 1.4·redeyes + 0.7·max-streak + 3.0·(block/85) — capped at 10</div></div>",
                 unsafe_allow_html=True)
+
+            # ---------- LEFT: FDP COMPLIANCE (Chapter 08) ----------
+            if parsed_rows:
+                st.markdown("#### ⚖ FDP Compliance")
+                fdp = fdp_roster_audit(parsed_rows)
+                fviol = [f for f in fdp["findings"] if f[0] == "violation"]
+                fnote = [f for f in fdp["findings"] if f[0] == "note"]
+                cnt = fdp["counts"]
+                cum = fdp["cumulative"]
+                if not fdp["findings"]:
+                    st.markdown(
+                        "<div class='card' style='border-color:#4caf50;text-align:center;'>"
+                        "<div style='color:#a5d6a7;font-weight:700;'>✅ FDP limits OK</div>"
+                        "<div class='muted' style='font-size:11px;'>no early/late/night or cumulative breaches</div></div>",
+                        unsafe_allow_html=True)
+                else:
+                    st.markdown(
+                        f"<div class='card' style='border-color:#ff5252;text-align:center;'>"
+                        f"<div style='color:#ff8a8a;font-weight:700;'>{len(fviol)} FDP breach(es)</div>"
+                        + (f"<div class='muted' style='font-size:11px;'>{len(fnote)} note(s)</div>" if fnote else "") +
+                        "</div>", unsafe_allow_html=True)
+                rows_html = (
+                    f"<div class='bidrow'><span>Early / Late / Night</span><span>{cnt['early']} / {cnt['late']} / {cnt['night']}</span></div>"
+                    f"<div class='bidrow'><span>7-day max (cap 60 h)</span><span>{_fmt_hm(cum['7d']['max'])}</span></div>"
+                    f"<div class='bidrow'><span>14-day max (cap 105 h)</span><span>{_fmt_hm(cum['14d']['max'])}</span></div>"
+                    f"<div class='bidrow'><span>28-day max (cap 210 h)</span><span>{_fmt_hm(cum['28d']['max'])}</span></div>"
+                )
+                st.markdown(
+                    f"<div class='card'>{rows_html}"
+                    f"<div class='muted' style='font-size:11px;margin-top:4px;'>standby & duty days counted in full</div></div>",
+                    unsafe_allow_html=True)
+                for sev, msg in fdp["findings"]:
+                    if sev == "violation":
+                        st.markdown(f"<div style='font-size:12px;background:#2c1f1f;border:1px solid #ff5252;color:#ff8a8a;padding:8px;border-radius:8px;margin-bottom:6px;'>⚠️ {msg}</div>", unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"<div style='font-size:12px;background:#33260f;border:1px solid #ffc107;color:#ffd54f;padding:8px;border-radius:8px;margin-bottom:6px;'>ℹ️ {msg}</div>", unsafe_allow_html=True)
+
             if est_sal:
                 est_total = est_sal["meal_usd"] + est_sal["on_usd"]
                 rows_html = ""
@@ -2510,37 +2547,7 @@ else:
     - Training/duty codes (SEP, SEC, CRM, DGR, …) count as a duty day — they are **not** days off.
                     """)
 
-            # ---------- FDP COMPLIANCE: CHAPTER 08 (early/late/night + cumulative) ----------
-            if parsed_rows:
-                st.markdown("#### \u2696\ufe0f FDP Compliance \u2014 Chapter 08")
-                fdp = fdp_roster_audit(parsed_rows)
-                fviol = [f for f in fdp["findings"] if f[0] == "violation"]
-                fnote = [f for f in fdp["findings"] if f[0] == "note"]
-                cum = fdp["cumulative"]
-                cum_line = (f"<div class='muted' style='font-size:12px;'>Rolling maxima this roster: "
-                            f"<b>{_fmt_hm(cum['7d']['max'])}</b> / 60h (7d) \u00b7 "
-                            f"<b>{_fmt_hm(cum['14d']['max'])}</b> / 105h (14d) \u00b7 "
-                            f"<b>{_fmt_hm(cum['28d']['max'])}</b> / 210h (28d) \u2014 standby & duty days counted in full.</div>")
-                cnt = fdp["counts"]
-                cnt_line = (f"<div class='muted' style='font-size:12px;'>Duty mix: \u2600\ufe0f {cnt['early']} early \u00b7 "
-                            f"\U0001f307 {cnt['late']} late \u00b7 \U0001f303 {cnt['night']} night</div>")
-                if not fdp["findings"]:
-                    st.markdown(
-                        f"<div class='card' style='border-color:#4caf50;'><span style='color:#a5d6a7;'>\u2705 FDP limits OK \u2014 "
-                        "no early/late/night or cumulative breaches in this roster.</span>"
-                        f"{cnt_line}{cum_line}</div>", unsafe_allow_html=True)
-                else:
-                    st.markdown(
-                        f"<div class='card' style='border-color:#ff5252;'><b style='color:#ff8a8a;'>{len(fviol)} FDP breach(es)</b>"
-                        + (f" \u00b7 <span style='color:#ffb74d;'>{len(fnote)} note(s)</span>" if fnote else "") +
-                        f"{cnt_line}{cum_line}</div>", unsafe_allow_html=True)
-                    for sev, msg in fdp["findings"]:
-                        if sev == "violation":
-                            st.markdown(f"<div style='font-size:12.5px;background:#2c1f1f;border:1px solid #ff5252;color:#ff8a8a;padding:10px;border-radius:8px;margin-bottom:8px;'>\u26a0\ufe0f {msg}</div>", unsafe_allow_html=True)
-                        else:
-                            st.markdown(f"<div style='font-size:12.5px;background:#33260f;border:1px solid #ffc107;color:#ffd54f;padding:10px;border-radius:8px;margin-bottom:8px;'>\u2139\ufe0f {msg}</div>", unsafe_allow_html=True)
-
-        # ---------- RIGHT: AGENT ALERTS + BIDDING ----------
+            # ---------- RIGHT: AGENT ALERTS + BIDDING ----------
         with right_col:
             st.markdown("#### Flight Monitoring Agent")
             agent_on = st.toggle("Agent: Real-Time Flight Monitor", value=True)
