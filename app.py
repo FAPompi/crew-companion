@@ -2363,18 +2363,19 @@ else:
     parsed_rows = parse_roster_text(active_text) if active_text else []
 
     # ---------- TEMP: FDP violation-preview test controls (scrap later) ----------
-    with st.sidebar:
-        st.markdown("#### \U0001f9ea FDP test controls")
-        st.caption("Temporary \u2014 injects synthetic duties to preview how each "
-                   "violation flags on the dashboard.")
+    with st.expander("\U0001f9ea FDP test controls \u2014 preview violations (temporary)", expanded=False):
+        st.markdown("<div class='muted' style='font-size:12px;'>Injects synthetic UL9xx duties into the roster "
+                    "so you can watch each violation flag on the dashboard. Works for every account \u2014 "
+                    "will be removed before release.</div>", unsafe_allow_html=True)
+        c1, c2, c3 = st.columns(3)
         flags = {}
-        flags["night_run"] = st.checkbox("4 consecutive night duties", key="tst_night_run")
-        flags["touch7"] = st.checkbox(">4 duties touching 01:00\u201306:59 in 7 days", key="tst_touch7")
-        flags["early_series"] = st.checkbox("6 consecutive early starts", key="tst_early_series")
-        flags["free2100"] = st.checkbox("Night block not free by 21:00", key="tst_free2100")
-        flags["cum7"] = st.checkbox("7-day cumulative > 60 h", key="tst_cum7")
-        flags["cum14"] = st.checkbox("14-day cumulative > 105 h", key="tst_cum14")
-        flags["cum28"] = st.checkbox("28-day cumulative > 210 h", key="tst_cum28")
+        flags["night_run"] = c1.checkbox("4 consecutive night duties", key="tst_night_run")
+        flags["touch7"] = c1.checkbox(">4 duties touching 01:00\u201306:59 in 7 days", key="tst_touch7")
+        flags["early_series"] = c1.checkbox("6 consecutive early starts", key="tst_early_series")
+        flags["free2100"] = c2.checkbox("Night block not free by 21:00", key="tst_free2100")
+        flags["cum7"] = c2.checkbox("7-day cumulative > 60 h", key="tst_cum7")
+        flags["cum14"] = c2.checkbox("14-day cumulative > 105 h", key="tst_cum14")
+        flags["cum28"] = c3.checkbox("28-day cumulative > 210 h", key="tst_cum28")
         if any(flags.values()):
             st.markdown("<div class='muted' style='font-size:11px;'>Injected duties (UL9xx) appear on the "
                         "calendar and in every check. Cumulative injections overlap the real roster, so a "
