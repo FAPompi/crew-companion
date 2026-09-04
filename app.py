@@ -195,8 +195,137 @@ def preprocess_roster_text(raw_text):
     """
     t = raw_text.replace("\r", "\n")
     t = re.sub(r'[ \t]*HTL', '\nHTL', t)
-    t = re.sub(r'(\d{2}[A-Z]{3}\d{2}\s*\d{2}:\d{2})\s*(?=UL\s*\d|SB|OFF|ROF|TOF)', r'\n\1', t)
+    # Split before a UL/SB/OFF duty that directly follows a timestamp. Use
+    # [ \t]* (NOT \s*) for the separator so the split never crosses a line
+    # break — otherwise tab-separated portal exports (whose HTL lines end in
+    # empty tab cells) get their end-time glued onto the next UL line, which
+    # collapses the layover window and corrupts the next flight's times.
+    t = re.sub(r'(\d{2}[A-Z]{3}\d{2}[ \t]*\d{2}:\d{2})[ \t]*(?=UL\s*\d|SB|OFF|ROF|TOF)', r'\n\1', t)
     return t
+
+def _parse_tab_line(line_str):
+    """Parse one tab-separated duty line from the crew-portal export.
+    Column layout (portal header): Activity, Checkin, Start, Dep, Arr, End,
+    Checkout, AcType, AcVersion, DD, Cat.  Parsing by column (instead of by
+    stamp order) keeps RETURN legs correct — their Check-In cell is empty, so
+    Start/End/Checkout must not be mistaken for Check-In/Departure/Arrival.
+    Returns a parsed-row dict, or None if the line is not a duty."""
+    cols = line_str.split("\t")
+    act = (cols[0] or "").strip()
+    if not act:
+        return None
+    up = act.upper()
+    m = re.match(r'^UL\s*(\d{1,4})$', up)
+    if m:
+        atype, flight_no, code = "FLIGHT", f"UL {m.group(1)}", f"UL{m.group(1)}"
+    elif up == "HTL":
+        atype, flight_no, code = "LAYOVER", "-", "HTL"
+    elif up in ("OFF", "ROF", "TOF"):
+        atype, flight_no, code = "DAY OFF", "-", up
+    elif re.match(r'^SB\d*$', up):
+        atype, flight_no, code = "STANDBY", "-", up
+    elif up in ("ALV", "RLV", "ALP", "CLV"):
+        atype, flight_no, code = "LEAVE", "-", up
+    else:
+        return None
+
+    def f(i):
+        return (cols[i].strip() if i < len(cols) else "") or ""
+
+    def dtf(s):
+        s = (s or "").strip()
+        if not s:
+            return None
+        try:
+            return datetime.strptime(s, "%d%b%y %H:%M")
+        except ValueError:
+            return None
+
+    def tpart(s):
+        s = (s or "").strip()
+        if len(s) >= 5 and s[-5] == " " and s[-3] == ":":
+            return s[-5:].strip()
+        return s[-5:] if s else "-"
+
+    checkin, start, dep_iata, arr_iata, end, checkout, actype = (f(i) for i in range(1, 8))
+
+    ci_dt = dtf(checkin)
+    dep_dt = dtf(start)
+    arr_dt = dtf(end)
+    co_dt = dtf(checkout)
+
+    # Non-flight blocks: CIdt/COdt span the block
+    # (HTL: Start→End; Standby: report→release).
+    if atype == "LAYOVER":
+        ci_dt = dep_dt or ci_dt
+        co_dt = arr_dt or co_dt
+    elif atype == "STANDBY":
+        ci_dt = ci_dt or dep_dt
+        co_dt = co_dt or arr_dt
+
+    # --- route / station & timezone origin/destination ---
+    if atype == "FLIGHT":
+        route = f"{dep_iata} ➔ {arr_iata}" if dep_iata and arr_iata else "-"
+        origin_iata, dest_iata = (dep_iata or "CMB"), (arr_iata or "CMB")
+    elif atype == "LAYOVER":
+        route = dep_iata or arr_iata or "-"
+        origin_iata = dest_iata = route if route != "-" else "CMB"
+    else:
+        route, origin_iata, dest_iata = "-", "CMB", "CMB"
+
+    # --- calendar dates (flight chips sit on the DEPARTURE date) ---
+    if atype == "FLIGHT":
+        anchor = dep_dt or arr_dt
+        row_dt_obj = datetime.combine(anchor.date(), datetime.min.time()) if anchor else None
+        end_dt_obj = None
+    else:
+        start_dt = ci_dt or dep_dt
+        end_dt = co_dt or arr_dt
+        row_dt_obj = datetime.combine(start_dt.date(), datetime.min.time()) if start_dt else None
+        end_dt_obj = (datetime.combine(end_dt.date(), datetime.min.time())
+                      if end_dt and start_dt and end_dt.date() > start_dt.date() else None)
+
+    row_date_str = row_dt_obj.strftime("%d%b%y").upper() if row_dt_obj else "-"
+
+    # --- display time strings ---
+    if atype == "FLIGHT":
+        checkin_time = tpart(checkin) if checkin else "-"
+        dep_time = tpart(start)
+        arr_time = tpart(end)
+        checkout_time = tpart(checkout) if checkout else "-"
+    elif atype == "LAYOVER":
+        checkin_time, checkout_time = "-", "-"
+        dep_time, arr_time = tpart(start), tpart(end)
+    elif atype == "STANDBY":
+        checkin_time = tpart(checkin) if checkin else tpart(start)
+        dep_time = tpart(start)
+        arr_time = tpart(end)
+        checkout_time = tpart(checkout) if checkout else tpart(end)
+    else:
+        checkin_time = dep_time = arr_time = checkout_time = "-"
+
+    ci_u = to_utc(ci_dt, origin_iata)
+    dep_u = to_utc(dep_dt, origin_iata)
+    arr_u = to_utc(arr_dt, dest_iata)
+    co_u = to_utc(co_dt, dest_iata)
+
+    return {
+        "Date": row_date_str,
+        "DateObj": row_dt_obj,
+        "EndDateObj": end_dt_obj,
+        "Type": atype,
+        "Code": code,
+        "Flight / Code": flight_no if atype == "FLIGHT" else atype,
+        "Check-In": checkin_time,
+        "Departure": dep_time,
+        "Route": route,
+        "Arrival": arr_time,
+        "Checkout": checkout_time,
+        "Aircraft": actype or "-",
+        "CIdt": ci_dt, "DEPdt": dep_dt, "ARRdt": arr_dt, "COdt": co_dt,
+        "CIdt_u": ci_u, "DEPdt_u": dep_u, "ARRdt_u": arr_u, "COdt_u": co_u,
+    }
+
 
 def parse_roster_text(raw_text):
     lines = preprocess_roster_text(raw_text).split('\n')
@@ -207,6 +336,15 @@ def parse_roster_text(raw_text):
     for line in lines:
         line_str = line.strip()
         if not line_str:
+            continue
+
+        # Fast path: tab-separated portal export (one duty per line, columns
+        # Activity / Checkin / Start / Dep / Arr / End / Checkout / ...).
+        # Column-based parsing keeps return legs (empty Check-In) correct.
+        if "\t" in line_str:
+            row = _parse_tab_line(line_str)
+            if row:
+                parsed_rows.append(row)
             continue
 
         date_match = re.search(r'^(\d{2}[A-Z]{3}\d{2})', line_str)
@@ -1967,10 +2105,14 @@ else:
                         "fbpp_overrides": saved.get("fbpp_overrides", {})}
                 s = compute_salary(perf_rows, prof, acting=acting_live)
 
-                h1, h2, h3 = st.columns(3)
-                h1.markdown(f"<div class='card' style='text-align:center;border-color:#4caf50;'><div class='muted'>NET SALARY (Rs)</div><div style='font-size:26px;font-weight:800;color:#4caf50;'>Rs {s['net']:,.0f}</div><div class='muted'>after tax & deductions</div></div>", unsafe_allow_html=True)
-                h2.markdown(f"<div class='card' style='text-align:center;'><div class='muted'>ALLOWANCES (USD — gross)</div><div style='font-size:26px;font-weight:800;color:#00bcd4;'>${s['allow_usd_total']:,.0f}</div><div class='muted'>≈ Rs {s['allow_rs_total']:,.0f}</div><div class='muted' style='margin-top:6px;'>meals + layover + turnaround overnights — the on-board meal cut is shown in Deductions</div></div>", unsafe_allow_html=True)
-                h3.markdown(f"<div class='card' style='text-align:center;'><div class='muted'>TOTAL TAKE-HOME</div><div style='font-size:26px;font-weight:800;color:#ffb74d;'>Rs {s['net'] + s['allow_rs_total']:,.0f}</div><div class='muted'>salary + allowances</div></div>", unsafe_allow_html=True)
+                ta_on_rs = s['ta_on_usd'] * float(usd_rate)
+                gross_no_ta_usd = s['allow_usd_total'] - s['ta_on_usd']
+                gross_no_ta_rs = s['allow_rs_total'] - ta_on_rs
+                h1, h2, h3, h4 = st.columns(4)
+                h1.markdown(f"<div class='card' style='text-align:center;border-color:#4caf50;'><div class='muted'>NET SALARY (Rs)</div><div style='font-size:22px;font-weight:800;color:#4caf50;'>Rs {s['net']:,.0f}</div><div class='muted'>after tax & deductions</div></div>", unsafe_allow_html=True)
+                h2.markdown(f"<div class='card' style='text-align:center;'><div class='muted'>TURNAROUND O/N (USD)</div><div style='font-size:22px;font-weight:800;color:#8bc34a;'>${s['ta_on_usd']:,.0f}</div><div class='muted'>≈ Rs {ta_on_rs:,.0f}</div><div class='muted' style='margin-top:6px;'>{s['t_on']} overnight(s) × ${OVERNIGHT_RATE_USD[cat]}</div></div>", unsafe_allow_html=True)
+                h3.markdown(f"<div class='card' style='text-align:center;'><div class='muted'>ALLOWANCES (USD — gross)</div><div style='font-size:22px;font-weight:800;color:#00bcd4;'>${gross_no_ta_usd:,.0f}</div><div class='muted'>≈ Rs {gross_no_ta_rs:,.0f}</div><div class='muted' style='margin-top:6px;'>meals + layover overnights — full gross, nothing deducted here · turnaround O/N in its own card</div></div>", unsafe_allow_html=True)
+                h4.markdown(f"<div class='card' style='text-align:center;'><div class='muted'>TOTAL TAKE-HOME</div><div style='font-size:22px;font-weight:800;color:#ffb74d;'>Rs {s['net'] + s['allow_rs_total']:,.0f}</div><div class='muted'>salary + all allowances</div></div>", unsafe_allow_html=True)
 
                 # earnings composition bar
                 parts = [("Productivity", max(s['productivity_rs'], 0), "#00bcd4"),
@@ -2016,17 +2158,16 @@ else:
                         + "</div>", unsafe_allow_html=True)
 
                 ob_usd = s['ob_count'] * MEAL_RATE_USD
-                net_allow_usd = s['allow_usd_total'] - ob_usd
+                net_allow_usd = gross_no_ta_usd - ob_usd
                 st.markdown(
                     "<div class='card'><h5>Allowances (USD — paid separately)</h5>"
                     + f"<div class='bidrow'><span>Meals: {s['ent'][0]}B {s['ent'][1]}L {s['ent'][2]}D ({s['ent_count']} × $25)</span><span>${s['meal_usd']:,.0f}</span></div>"
                     + f"<div class='bidrow'><span>Layover overnights ({s['l_nights']} × ${OVERNIGHT_RATE_USD[cat]})</span><span>${s['on_usd']:,.0f}</span></div>"
-                    + f"<div class='bidrow'><span>Turnaround overnights ({s['t_on']} × ${OVERNIGHT_RATE_USD[cat]})</span><span>${s['ta_on_usd']:,.0f}</span></div>"
-                    + f"<div class='bidrow'><b>Total allowance earned</b><b>${s['allow_usd_total']:,.0f} ≈ Rs {s['allow_rs_total']:,.0f}</b></div>"
+                    + f"<div class='bidrow'><b>Total allowance earned (meals + layover)</b><b>${gross_no_ta_usd:,.0f} ≈ Rs {gross_no_ta_rs:,.0f}</b></div>"
                     + (f"<div class='bidrow' style='color:#ff8a8a;'><span>On-board meals deducted from salary ({s['ob_count']} × $25)</span><span>−${ob_usd:,.0f} ≈ −Rs {s['ob_deduct_rs']:,.0f}</span></div>"
-                       + f"<div class='bidrow'><b>Net allowance you actually pocket</b><b>${net_allow_usd:,.0f} ≈ Rs {s['allow_rs_total'] - s['ob_deduct_rs']:,.0f}</b></div>"
+                       + f"<div class='bidrow'><b>Net allowance you actually pocket</b><b>${net_allow_usd:,.0f} ≈ Rs {gross_no_ta_rs - s['ob_deduct_rs']:,.0f}</b></div>"
                        if s['ob_count'] else "")
-                    + "<div class='muted' style='margin-top:6px;'>You receive the full allowance in USD, but the on-board meal part is clawed back from your salary — so month-end you effectively pocket the <b>net</b> figure on top of your salary.</div>"
+                    + "<div class='muted' style='margin-top:6px;'>Turnaround overnight pay is shown in its own card above. You receive the full allowance in USD, but the on-board meal part is clawed back from your salary — so month-end you effectively pocket the <b>net</b> figure.</div>"
                     + "</div>", unsafe_allow_html=True)
 
                 with st.expander("🍽 Meals breakdown (per duty)"):
