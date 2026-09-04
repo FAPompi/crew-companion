@@ -1408,7 +1408,8 @@ def _calendar_duties(rows):
     for r in fl:
         o, d = _route_od(r["Route"])
         sec = {"flight": r["Flight / Code"], "o": o, "d": d,
-               "ci": r.get("CIdt"), "dep": r["DEPdt"], "arr": r["ARRdt"], "co": r.get("COdt")}
+               "ci": r.get("CIdt"), "dep": r["DEPdt"], "arr": r["ARRdt"], "co": r.get("COdt"),
+               "dep_u": r.get("DEPdt_u"), "arr_u": r.get("ARRdt_u")}
         prev = groups[-1][-1] if groups else None
         gap_ok = (prev is not None and sec["dep"] is not None and prev["arr"] is not None
                   and (sec["dep"] - prev["arr"]).total_seconds() <= 4 * 3600)
@@ -1419,61 +1420,49 @@ def _calendar_duties(rows):
     return groups
 
 
-def _win_label(dt_, kind, other):
-    """'CI 06:15' — prepend day-of-month when the duty crosses midnight."""
-    if not isinstance(dt_, datetime):
-        return None
-    s = dt_.strftime("%H:%M")
-    if isinstance(other, datetime) and dt_.date() != other.date():
-        s = f"{dt_.day} {s}"
-    return f"{kind} {s}"
+def _fmt_hm(mins):
+    """310 -> '5h10', 55 -> '55m', 120 -> '2h'."""
+    h, m = divmod(max(0, int(mins)), 60)
+    if h and m:
+        return f"{h}h{m:02d}"
+    if h:
+        return f"{h}h"
+    return f"{m}m"
 
 
 def _duty_chip(sectors):
-    """One calendar chip per duty: a turnaround pair collapses to 'UL404/5'
-    with one line per sector, plus the full CI→CO duty window so a duty that
-    crosses midnight (e.g. CI 8th 21:15 → CO 9th 06:25) is unambiguous."""
+    """One compact chip per duty: a turnaround collapses to 'UL404/5' with one
+    line per sector — route, dep–arr times and TRUE flying time (UTC-corrected
+    block). No check-in/check-out clutter; midnight crossings get a tiny
+    '▸ starts / ↳ lands' marker on the adjacent day instead."""
     title = _compact_flight_label([s["flight"].replace(" ", "") for s in sectors])
     lines = []
     for s in sectors:
         dep_t = s["dep"].strftime("%H:%M") if isinstance(s["dep"], datetime) else ""
         arr_t = s["arr"].strftime("%H:%M") if isinstance(s["arr"], datetime) else ""
-        lines.append(f"<span>{s['o']} ➔ {s['d']} {dep_t} – {arr_t}</span>")
-    start = sectors[0].get("ci") or sectors[0].get("dep")
-    end = sectors[-1].get("co") or sectors[-1].get("arr")
-    win = ""
-    if isinstance(start, datetime) and isinstance(end, datetime):
-        a = _win_label(start, "CI" if sectors[0].get("ci") else "DEP", end)
-        b = _win_label(end, "CO" if sectors[-1].get("co") else "ARR", start)
-        if a and b:
-            win = f" <span class='chip-win'>{a} → {b}</span>"
-    return f"<div class='chip chip-flt'>✈ <b>{title}</b>{win}<br>{'<br>'.join(lines)}</div>"
+        a, b = s.get("arr_u"), s.get("dep_u")
+        if not (isinstance(a, datetime) and isinstance(b, datetime)):
+            a, b = s.get("arr"), s.get("dep")
+        dur = ""
+        if isinstance(a, datetime) and isinstance(b, datetime) and a > b:
+            dur = f" · {_fmt_hm((a - b).total_seconds() // 60)}"
+        lines.append(f"<span>{s['o']}→{s['d']} {dep_t}–{arr_t}{dur}</span>")
+    return f"<div class='chip chip-flt'>✈ <b>{title}</b><br>{'<br>'.join(lines)}</div>"
 
 
 def _duty_begin_chip(sectors):
-    """Marker on the day BEFORE the first departure when the check-in falls on
-    the previous day (e.g. UL191 CI 03OCT 23:20 for a 04OCT departure)."""
+    """Tiny marker on the day BEFORE a duty's first departure (check-in day)."""
     title = _compact_flight_label([s["flight"].replace(" ", "") for s in sectors])
-    s0 = sectors[0]
-    note = ""
-    if isinstance(s0.get("ci"), datetime):
-        note = f"CI {s0['ci'].strftime('%H:%M')}"
-        if isinstance(s0.get("dep"), datetime) and s0["dep"].date() != s0["ci"].date():
-            note += f" · dep {s0['dep'].day} {s0['dep'].strftime('%H:%M')}"
-    return f"<div class='chip chip-begin'>▸ <b>{title}</b><br><span>duty starts {note}</span></div>"
+    t = sectors[0]["ci"].strftime("%H:%M") if isinstance(sectors[0].get("ci"), datetime) else ""
+    return f"<div class='chip chip-begin'>▸ <b>{title}</b>{(' ' + t) if t else ''}</div>"
 
 
 def _duty_cont_chip(sectors):
-    """Marker on the day AFTER the last departure when the duty lands / checks
-    out on a later day (e.g. UL254 lands CMB 09SEP 05:55 after an 08SEP dep)."""
+    """Tiny marker on the day AFTER a duty's last departure (lands day)."""
     title = _compact_flight_label([s["flight"].replace(" ", "") for s in sectors])
-    last = sectors[-1]
-    parts = []
-    if isinstance(last.get("arr"), datetime):
-        parts.append(f"arr {last['d']} {last['arr'].strftime('%H:%M')}")
-    if isinstance(last.get("co"), datetime):
-        parts.append(f"CO {last['co'].strftime('%H:%M')}")
-    return f"<div class='chip chip-cont'>↳ <b>{title}</b><br><span>{' · '.join(parts)}</span></div>"
+    t = sectors[-1]["arr"].strftime("%H:%M") if isinstance(sectors[-1].get("arr"), datetime) else ""
+    return (f"<div class='chip chip-cont'>↳ <b>{title}</b> lands {t}</div>" if t
+            else f"<div class='chip chip-cont'>↳ <b>{title}</b></div>")
 
 
 def build_calendar_html(rows, span=None):
@@ -1493,7 +1482,15 @@ def build_calendar_html(rows, span=None):
         elif r["Type"] == "DAY OFF":
             chip = "<div class='chip chip-off'>🟢 OFF</div>"
         elif r["Type"] == "STANDBY":
-            chip = "<div class='chip chip-sby'>⏱ SB</div>"
+            code = r.get("Code") or "SB"
+            s0 = r.get("CIdt") or r.get("DEPdt")
+            s1 = r.get("COdt") or r.get("ARRdt")
+            t = ""
+            if isinstance(s0, datetime) and isinstance(s1, datetime):
+                t = f"{s0.strftime('%H:%M')}–{s1.strftime('%H:%M')}"
+                if s1.date() != s0.date():
+                    t = f"{s0.day} {s0.strftime('%H:%M')}–{s1.day} {s1.strftime('%H:%M')}"
+            chip = f"<div class='chip chip-sby'>⏱ <b>{code}</b>{(' · ' + t) if t else ''}</div>"
         elif r["Type"] == "LEAVE":
             chip = "<div class='chip chip-lay'>🌴 Leave</div>"
         else:
@@ -1552,98 +1549,6 @@ def build_calendar_html(rows, span=None):
         d += timedelta(days=1)
     cells.append("</div>")
     return "".join(cells)
-
-
-def build_timeline_html(rows, span=None):
-    """Vertical 'trip sheet' view — every duty in chronological order, each
-    showing its full CI→CO window, so midnight-crossing duties are unambiguous
-    (UL254 shows once, starting 08 Sep 21:15 and ending 09 Sep 06:25)."""
-    valid = [r for r in rows if r["DateObj"] is not None]
-    if not valid:
-        return "<div style='color:#7e8ba0;font-size:14px;'>No dated duties parsed.</div>"
-
-    entries = []  # (start_dt, end_dt, html)
-
-    # flight duty groups (turnarounds collapsed to one entry)
-    for grp in _calendar_duties(rows):
-        first, last = grp[0], grp[-1]
-        start = first.get("ci") or first.get("dep")
-        end = last.get("co") or last.get("arr")
-        if not isinstance(start, datetime) or not isinstance(end, datetime):
-            continue
-        title = _compact_flight_label([s["flight"].replace(" ", "") for s in grp])
-        lines = []
-        for s in grp:
-            dep_t = s["dep"].strftime("%H:%M") if isinstance(s["dep"], datetime) else ""
-            arr_t = s["arr"].strftime("%H:%M") if isinstance(s["arr"], datetime) else ""
-            plus = (f" <span class='muted'>+{s['arr'].day}</span>"
-                    if isinstance(s["dep"], datetime) and isinstance(s["arr"], datetime)
-                    and s["arr"].date() != s["dep"].date() else "")
-            lines.append(f"<div class='tl-line'>{s['o']} ➔ {s['d']} <b>{dep_t}</b> – <b>{arr_t}</b>{plus}</div>")
-        a = _win_label(start, "CI" if first.get("ci") else "DEP", end)
-        b = _win_label(end, "CO" if last.get("co") else "ARR", start)
-        win = f"<div class='tl-sub'>Duty window: {a} → {b}</div>" if a and b else ""
-        html = (f"<div class='tl-card tl-flt'><div class='tl-head'><b>✈ {title}</b>"
-                f"<span class='tl-day'>starts {start.strftime('%d %b')}</span></div>{win}{''.join(lines)}</div>")
-        entries.append((start, end, html))
-
-    # ground duties (layover / day off / standby / leave)
-    for r in rows:
-        if r["Type"] == "FLIGHT":
-            continue
-        start = r.get("CIdt") or r.get("DEPdt") or r["DateObj"]
-        if not isinstance(start, datetime):
-            continue
-        end = r.get("COdt") or r.get("ARRdt") or r.get("EndDateObj") or start
-        if not isinstance(end, datetime):
-            end = start
-        end_lbl = (end.strftime('%d %b %H:%M') if end.date() != start.date()
-                   else end.strftime('%H:%M'))
-        if r["Type"] == "LAYOVER":
-            stn = r["Route"] if r.get("Route") and r["Route"] != "-" else "Layover"
-            ap = AIRPORT_NAME.get(stn, "")
-            nights = ""
-            if r.get("EndDateObj") and r["DateObj"] and r["EndDateObj"].date() > r["DateObj"].date():
-                nights = f" · {(r['EndDateObj'].date() - r['DateObj'].date()).days} night(s)"
-            body = f"🏨 <b>{stn}</b>{(' — ' + ap) if ap else ''}{nights}"
-            sub = f"<div class='tl-sub'>{start.strftime('%d %b %H:%M')} → {end_lbl}</div>"
-            cls = "tl-lay"
-        elif r["Type"] == "DAY OFF":
-            body, sub, cls = "🟢 <b>Day Off</b>", "", "tl-off"
-        elif r["Type"] == "STANDBY":
-            code = r.get("Code") or "SB"
-            body = f"⏱ <b>Standby {code}</b>"
-            sub = f"<div class='tl-sub'>{start.strftime('%H:%M')} – {end_lbl}</div>"
-            cls = "tl-sby"
-        elif r["Type"] == "LEAVE":
-            body, sub, cls = "🌴 <b>Leave</b>", "", "tl-lay"
-        else:
-            continue
-        html = (f"<div class='tl-card {cls}'><div class='tl-head'>{body}"
-                f"<span class='tl-day'>{start.strftime('%d %b')}</span></div>{sub}</div>")
-        entries.append((start, end, html))
-
-    if span:
-        d0, d1 = span
-        entries = [(s, e, h) for s, e, h in entries if s.date() <= d1 and e.date() >= d0]
-
-    entries.sort(key=lambda x: x[0])
-    if not entries:
-        return "<div style='color:#7e8ba0;font-size:14px;'>No duties in this period.</div>"
-
-    today = datetime.now().date()
-    out = ["<div class='tl'>"]
-    prev_day = None
-    for start, end, html in entries:
-        day = start.date()
-        if day != prev_day:
-            out.append(f"<div class='tl-day-hdr'>{day.strftime('%A, %d %b %Y')}</div>")
-            prev_day = day
-        if day == today:
-            html = html.replace("class='tl-card ", "class='tl-card tl-today ")
-        out.append(html)
-    out.append("</div>")
-    return "".join(out)
 
 
 # --- 3.7 SALARY ENGINE (ported from the FAU sheet formulas + code.gs) ---
@@ -1904,19 +1809,6 @@ st.markdown("""
     .chip .chip-win { color:#8fb0c4; font-size:10.5px; }
     .chip-begin { background:#0c2833; color:#4dd0e1; border:1px dashed #1f6b7a; }
     .chip-cont { background:#0c2833; color:#4dd0e1; border-left:3px solid #4dd0e1; }
-    .tl { display:flex; flex-direction:column; }
-    .tl-day-hdr { color:#00bcd4; font-weight:700; font-size:13px; margin:14px 0 6px 0; border-bottom:1px solid #1f2b3a; padding-bottom:4px; }
-    .tl-card { background:#0f1926; border:1px solid #1f2b3a; border-radius:8px; padding:8px 10px; margin-bottom:8px; font-size:13px; }
-    .tl-head { display:flex; justify-content:space-between; align-items:baseline; }
-    .tl-day { color:#7e8ba0; font-size:11px; }
-    .tl-sub { color:#8fb0c4; font-size:11.5px; margin:3px 0 2px 0; }
-    .tl-line { color:#9fb3c8; font-size:12.5px; }
-    .tl-line b { color:#e8eef7; }
-    .tl-flt { border-left:3px solid #4dd0e1; }
-    .tl-lay { border-left:3px solid #ffb74d; }
-    .tl-off { border-left:3px solid #66bb6a; }
-    .tl-sby { border-left:3px solid #b39ddb; }
-    .tl-today { border-color:#00bcd4; box-shadow:0 0 0 1px #00bcd4 inset; }
     .hbar { display:flex; align-items:center; justify-content:space-between; background:#121e2c;
             border:1px solid #1f2b3a; border-radius:12px; padding:10px 18px; margin-bottom:14px; }
     .avatar { width:38px; height:38px; border-radius:50%; background:#0d3340; color:#4dd0e1;
@@ -2063,15 +1955,15 @@ else:
                 unsafe_allow_html=True)
             if est_sal:
                 rate_on = OVERNIGHT_RATE_USD[_est_prof["cat"]]
+                est_total = est_sal["meal_usd"] + est_sal["on_usd"]
                 rows_html = (
                     f"<div class='bidrow'><span>Layover Meal Allowance ({est_sal['ent_count']} × ${MEAL_RATE_USD:.0f})</span><span>${est_sal['meal_usd']:,.0f}</span></div>"
                     f"<div class='bidrow'><span>Layover Overnights ({est_sal['l_nights']} × ${rate_on})</span><span>${est_sal['on_usd']:,.0f}</span></div>"
-                    f"<div class='bidrow'><span>T/A Overnight Allowance ({est_sal['t_on']} × ${rate_on})</span><span>${est_sal['ta_on_usd']:,.0f}</span></div>"
                 )
                 st.markdown(
                     f"<div class='card'><h5>Estimated Allowances</h5>"
-                    f"<div style='font-size:26px;font-weight:800;color:#4caf50;'>${est_sal['allow_usd_total']:,.0f} USD</div>"
-                    f"<div class='muted' style='margin-bottom:6px;'>Meals + layover &amp; T/A overnights — same logic as the Salary Calculator</div>{rows_html}</div>",
+                    f"<div style='font-size:26px;font-weight:800;color:#4caf50;'>${est_total:,.0f} USD</div>"
+                    f"<div class='muted' style='margin-bottom:6px;'>Layover meals + overnights — same logic as the Salary Calculator</div>{rows_html}</div>",
                     unsafe_allow_html=True)
             else:
                 st.markdown(
@@ -2122,12 +2014,7 @@ else:
             else:
                 sel_span = None
 
-            view_mode = st.radio("Roster view", ["📅 Calendar", "📋 Trip Sheet"], horizontal=True,
-                                 key="roster_view_mode")
-            if view_mode == "📋 Trip Sheet":
-                st.markdown(f"<div class='card'>{build_timeline_html(parsed_rows, span=sel_span)}</div>", unsafe_allow_html=True)
-            else:
-                st.markdown(f"<div class='card'>{build_calendar_html(parsed_rows, span=sel_span)}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='card'>{build_calendar_html(parsed_rows, span=sel_span)}</div>", unsafe_allow_html=True)
 
             # Layover Intel
             layovers = [lv for lv in analytics["layovers"] if lv["station"]]
