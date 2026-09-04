@@ -1823,6 +1823,69 @@ def fdp_roster_audit(rows):
     return {"counts": counts, "cumulative": cumulative, "findings": findings}
 
 
+def _mk_test_flight(no, ci, dep, arr, route):
+    """TEMP tester helper: build a synthetic FLIGHT row in the parser's output shape."""
+    o, d = [x.strip() for x in route.split("\u2794")]
+    co = arr + timedelta(minutes=30)
+    return {
+        "Date": dep.strftime("%d%b%y").upper(),
+        "DateObj": datetime.combine(dep.date(), datetime.min.time()),
+        "EndDateObj": None,
+        "Type": "FLIGHT", "Code": f"UL{no}", "Flight / Code": f"UL {no}",
+        "Check-In": ci.strftime("%H:%M") if ci else "-",
+        "Departure": dep.strftime("%H:%M"), "Route": route,
+        "Arrival": arr.strftime("%H:%M"), "Checkout": co.strftime("%H:%M"),
+        "Aircraft": "-", "CIdt": ci, "DEPdt": dep, "ARRdt": arr, "COdt": co,
+        "CIdt_u": to_utc(ci, o), "DEPdt_u": to_utc(dep, o),
+        "ARRdt_u": to_utc(arr, d), "COdt_u": to_utc(co, d),
+    }
+
+
+def _build_test_injections(flags, anchor):
+    """TEMP tester helper: synthetic duties for the violation-preview toggles.
+    Injected in the days leading up to `anchor` (the roster's last date)."""
+    rows = []
+
+    def day(k):
+        return anchor - timedelta(days=k)
+
+    def night(no, d):          # single-sector night duty 00:00 → 05:30
+        return _mk_test_flight(no, datetime.combine(d, dtime(0, 0)), datetime.combine(d, dtime(0, 30)),
+                               datetime.combine(d, dtime(5, 30)), "CMB \u2794 BKK")
+
+    def early(no, d):          # early start 05:30 → 09:00
+        return _mk_test_flight(no, datetime.combine(d, dtime(5, 30)), datetime.combine(d, dtime(6, 0)),
+                               datetime.combine(d, dtime(9, 0)), "CMB \u2794 MAA")
+
+    def dayduty(no, d, ci_t, dep_t, arr_t):
+        return _mk_test_flight(no, datetime.combine(d, ci_t), datetime.combine(d, dep_t),
+                               datetime.combine(d, arr_t), "CMB \u2794 DXB")
+
+    if flags.get("night_run"):
+        for i in range(4):
+            rows.append(night(900 + i, day(3 - i)))
+    if flags.get("touch7"):
+        for i, k in enumerate([6, 5, 4, 2, 1]):
+            rows.append(early(910 + i, day(k)))
+    if flags.get("early_series"):
+        for i in range(6):
+            rows.append(early(920 + i, day(6 - i)))
+    if flags.get("free2100"):
+        rows.append(dayduty(930, day(2), dtime(10, 0), dtime(10, 30), dtime(23, 0)))
+        for i in range(2):
+            rows.append(night(931 + i, day(1 - i)))
+    if flags.get("cum7"):
+        for i in range(7):
+            rows.append(dayduty(940 + i, day(6 - i), dtime(8, 0), dtime(8, 30), dtime(18, 0)))
+    if flags.get("cum14"):
+        for i in range(14):
+            rows.append(dayduty(950 + i, day(13 - i), dtime(9, 0), dtime(9, 30), dtime(17, 0)))
+    if flags.get("cum28"):
+        for i in range(28):
+            rows.append(dayduty(960 + i, day(27 - i), dtime(9, 0), dtime(9, 30), dtime(17, 0)))
+    return rows
+
+
 def _duty_chip(sectors):
     """One compact chip per duty: a turnaround collapses to 'UL404/5' with one
     line per sector — route, dep–arr times and TRUE flying time (UTC-corrected
@@ -2298,6 +2361,29 @@ else:
         st.session_state['current_roster'] = load_roster_from_db(st.session_state['username'])
     active_text = st.session_state.get('current_roster', '')
     parsed_rows = parse_roster_text(active_text) if active_text else []
+
+    # ---------- TEMP: FDP violation-preview test controls (scrap later) ----------
+    with st.sidebar:
+        st.markdown("#### \U0001f9ea FDP test controls")
+        st.caption("Temporary \u2014 injects synthetic duties to preview how each "
+                   "violation flags on the dashboard.")
+        flags = {}
+        flags["night_run"] = st.checkbox("4 consecutive night duties", key="tst_night_run")
+        flags["touch7"] = st.checkbox(">4 duties touching 01:00\u201306:59 in 7 days", key="tst_touch7")
+        flags["early_series"] = st.checkbox("6 consecutive early starts", key="tst_early_series")
+        flags["free2100"] = st.checkbox("Night block not free by 21:00", key="tst_free2100")
+        flags["cum7"] = st.checkbox("7-day cumulative > 60 h", key="tst_cum7")
+        flags["cum14"] = st.checkbox("14-day cumulative > 105 h", key="tst_cum14")
+        flags["cum28"] = st.checkbox("28-day cumulative > 210 h", key="tst_cum28")
+        if any(flags.values()):
+            st.markdown("<div class='muted' style='font-size:11px;'>Injected duties (UL9xx) appear on the "
+                        "calendar and in every check. Cumulative injections overlap the real roster, so a "
+                        "14/28-day blowout will also raise the shorter windows \u2014 that's expected.</div>",
+                        unsafe_allow_html=True)
+    if any(flags.values()):
+        anchor = max((r["DateObj"].date() for r in parsed_rows if r["DateObj"]), default=datetime.now().date())
+        parsed_rows = parsed_rows + _build_test_injections(flags, anchor)
+
     analytics = compute_analytics(parsed_rows)
     # Allowance estimate for the dashboard reuses the SALARY CALCULATOR's own
     # logic (meals + layover overnights + T/A overnights) via compute_salary,
