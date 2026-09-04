@@ -1820,7 +1820,82 @@ def fdp_roster_audit(rows):
                 f"Cumulative: {_fmt_hm(c['max'])} in 7 days (ending {c['date']:%d %b}) is over 60 h \u2014 "
                 "only OK if caused by unforeseen delays (\u2264 65 h)."))
 
-    return {"counts": counts, "cumulative": cumulative, "findings": findings}
+    # --- days-off rules (8.2.17): duty-day status per calendar date ---
+    day_status = {}
+    for r in rows:
+        if not r.get("DateObj"):
+            continue
+        start = r["DateObj"].date()
+        end = (r["EndDateObj"].date() if r.get("EndDateObj") else start)
+        if r["Type"] in ("FLIGHT", "STANDBY", "LAYOVER", "DUTY"):
+            key = "duty"
+        elif r["Type"] == "DAY OFF":
+            key = "off"
+        elif r["Type"] == "LEAVE":
+            key = "leave"
+        else:
+            continue
+        d = start
+        while d <= end:
+            day_status.setdefault(d, set()).add(key)
+            d += timedelta(days=1)
+
+    days_off = {"off_days": 0, "max_duty_run": 0}
+    if day_status:
+        alldays = sorted(day_status)
+        lo, hi = alldays[0], alldays[-1]
+        days_off["off_days"] = sum(1 for d in day_status if "off" in day_status[d])
+
+        # (a) not more than 7 consecutive days on duty
+        run_start = None
+        run_len = 0
+        reported = False
+        d = lo
+        while d <= hi:
+            if "duty" in day_status.get(d, set()):
+                if run_start is None:
+                    run_start, reported = d, False
+                run_len += 1
+                days_off["max_duty_run"] = max(days_off["max_duty_run"], run_len)
+                if run_len > 7 and not reported:
+                    findings.append(("violation",
+                        f"{run_len} consecutive days on duty from {run_start:%d %b} to {d:%d %b} \u2014 limit is 7 "
+                        "(8.2.17.a: the 8th day must be a day off, or positioning to base followed by 2 days off)."))
+                    reported = True
+            else:
+                run_start, run_len, reported = None, 0, False
+            d += timedelta(days=1)
+
+        # (b) 2 consecutive days off in any consecutive 14 days
+        prev_viol = False
+        d = lo
+        while d + timedelta(days=13) <= hi:
+            has_pair = any("off" in day_status.get(d + timedelta(days=k), set())
+                           and "off" in day_status.get(d + timedelta(days=k + 1), set()) for k in range(13))
+            if not has_pair:
+                if not prev_viol:
+                    findings.append(("violation",
+                        f"No 2 consecutive days off in the 14 days from {d:%d %b} (8.2.17.b)."))
+                prev_viol = True
+            else:
+                prev_viol = False
+            d += timedelta(days=1)
+
+        # (c) at least 7 days off in any consecutive 28 days
+        prev_viol = False
+        d = lo
+        while d + timedelta(days=27) <= hi:
+            off_count = sum(1 for k in range(28) if "off" in day_status.get(d + timedelta(days=k), set()))
+            if off_count < 7:
+                if not prev_viol:
+                    findings.append(("violation",
+                        f"Only {off_count} day(s) off in the 28 days from {d:%d %b} \u2014 minimum is 7 (8.2.17.c)."))
+                prev_viol = True
+            else:
+                prev_viol = False
+            d += timedelta(days=1)
+
+    return {"counts": counts, "cumulative": cumulative, "days_off": days_off, "findings": findings}
 
 
 def _duty_chip(sectors):
@@ -2398,6 +2473,7 @@ else:
                     f"<div class='bidrow'><span>7-day max (cap 60 h)</span><span>{_fmt_hm(cum['7d']['max'])}</span></div>"
                     f"<div class='bidrow'><span>14-day max (cap 105 h)</span><span>{_fmt_hm(cum['14d']['max'])}</span></div>"
                     f"<div class='bidrow'><span>28-day max (cap 210 h)</span><span>{_fmt_hm(cum['28d']['max'])}</span></div>"
+                    f"<div class='bidrow'><span>Days off · longest duty streak</span><span>{fdp['days_off']['off_days']} · {fdp['days_off']['max_duty_run']}d</span></div>"
                 )
                 st.markdown(
                     f"<div class='card'>{rows_html}"
@@ -3235,8 +3311,13 @@ else:
 - Before a night-duty block you must be **free by 21:00**.
 
 **Days off**
-- A **single day off** = **2 local nights** and at least **34 hours**. No more than **7 consecutive days on duty**,
-  and you need **2 consecutive days off in every 14 days**.
+- A **single day off** = **2 local nights** and at least **34 hours** (each extra consecutive day off adds one more
+  local night).
+- You may not be **on duty more than 7 days in a row** — the **8th day must be off** (or you may be *positioned*
+  back to base on day 8, provided you then get 2 consecutive days off).
+- You must have **2 consecutive days off in every 14 days** — so by the **13th/14th day** of any stretch you
+  must have had a 2-day-off block.
+- At least **7 days off in every 4 weeks**, and an **average of 8 days off per 4-week period** over three periods.
 
 **Standby & positioning**
 - **Standby** — you're on call, not off duty; it **counts in full** toward your cumulative totals.
