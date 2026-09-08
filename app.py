@@ -93,6 +93,17 @@ def init_db():
             roster_text TEXT
         )
     ''')
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS roster_history (
+            username TEXT,
+            period_start TEXT,
+            published_text TEXT,
+            performed_text TEXT,
+            finalized INTEGER DEFAULT 0,
+            saved_at TEXT,
+            PRIMARY KEY (username, period_start)
+        )
+    ''')
     conn.commit()
     conn.close()
 
@@ -147,6 +158,126 @@ def load_performed_roster(username):
     conn.close()
     return d[0] if d else ''
 
+
+# --- roster periods ---
+# 28-day roster periods. User-confirmed starts (2026-09-08):
+#   13 Jul 2026, 10 Aug 2026, 07 Sep 2026 (current), 05 Oct 2026, ...
+# A label like "070926-041026" runs 07 Sep – 04 Oct inclusive (28 days), and the
+# NEXT period starts the following day (05 Oct).
+ROSTER_ANCHOR = datetime(2026, 7, 13).date()
+ROSTER_PERIOD_DAYS = 28
+
+
+# --- roster history (period-based archive: published plan + performed reality) ---
+
+def save_roster_history(username, period_start, published_text=None, performed_text=None, finalized=None):
+    """UPSERT one 28-day period into the history archive. period_start is a
+    datetime.date (stored as 'YYYY-MM-DD')."""
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    pkey = period_start.strftime('%Y-%m-%d') if isinstance(period_start, (datetime,)) else str(period_start)
+    c.execute('''INSERT INTO roster_history (username, period_start, published_text, performed_text, finalized, saved_at)
+                 VALUES (?, ?, ?, ?, ?, ?)
+                 ON CONFLICT(username, period_start) DO UPDATE SET
+                   published_text = COALESCE(excluded.published_text, roster_history.published_text),
+                   performed_text = COALESCE(excluded.performed_text, roster_history.performed_text),
+                   finalized = COALESCE(excluded.finalized, roster_history.finalized),
+                   saved_at = excluded.saved_at''',
+              (username, pkey, published_text, performed_text,
+               (1 if finalized else 0) if finalized is not None else None,
+               datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+    conn.commit()
+    conn.close()
+
+
+def load_roster_history(username):
+    """All archived periods for a user, oldest first. Each row: period_start
+    (datetime.date), published_text, performed_text, finalized (bool), saved_at."""
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    c.execute('''SELECT period_start, published_text, performed_text, finalized, saved_at
+                 FROM roster_history WHERE username = ? ORDER BY period_start''', (username,))
+    out = []
+    for ps, pub, perf, fin, saved in c.fetchall():
+        try:
+            d = datetime.strptime(ps, '%Y-%m-%d').date()
+        except ValueError:
+            d = None
+        out.append({"period_start": d, "published_text": pub or "",
+                    "performed_text": perf or "", "finalized": bool(fin),
+                    "saved_at": saved})
+    conn.close()
+    return out
+
+
+def _rows_in_period(rows, start, days=ROSTER_PERIOD_DAYS):
+    """Rows whose DateObj falls within [start, start + days)."""
+    lo, hi = start, start + timedelta(days=days)
+    return [r for r in rows if r.get("DateObj") and lo <= r["DateObj"].date() < hi]
+
+
+def roster_periods_off_days(username, current_rows):
+    """Off-day count per 28-day period, from finalized history (performed) plus
+    the current roster (published). The current period uses its finalized
+    performed text if one exists, else the live published text. Returns a list
+    of {start, off, src} sorted by period start."""
+    hist = load_roster_history(username)
+    cur_start = None
+    if current_rows:
+        dates = [r["DateObj"].date() for r in current_rows if r.get("DateObj")]
+        if dates:
+            cur_start = roster_period_of_roster(dates)
+    out, included = [], set()
+    for h in hist:
+        if not h["finalized"] or not h["performed_text"] or h["period_start"] is None:
+            continue
+        rows = parse_roster_text(h["performed_text"])
+        clipped = _rows_in_period(rows, h["period_start"])
+        ds = _day_status_map(clipped)
+        if ds:
+            out.append({"start": h["period_start"],
+                        "off": sum(1 for d, s in ds.items() if "off" in s), "src": "performed"})
+            included.add(h["period_start"])
+    if cur_start and cur_start not in included and current_rows:
+        ds = _day_status_map(_rows_in_period(current_rows, cur_start))
+        if ds:
+            out.append({"start": cur_start,
+                        "off": sum(1 for d, s in ds.items() if "off" in s), "src": "live"})
+    out.sort(key=lambda x: x["start"])
+    return out
+
+
+def days_off_average_8_2_17_d(username, current_rows):
+    """8.2.17(d): average days off per 4-week period over the last 3 periods.
+    Returns {n_periods, avg, ok, per} — avg/ok are None unless ≥ 3 periods."""
+    per = roster_periods_off_days(username, current_rows)
+    if len(per) < 3:
+        return {"n_periods": len(per), "avg": None, "ok": None, "per": per}
+    last3 = per[-3:]
+    avg = round(sum(p["off"] for p in last3) / 3.0, 1)
+    return {"n_periods": len(per), "avg": avg, "ok": avg >= 8, "per": per}
+
+
+def merged_history_rows(username, current_rows):
+    """Finalized performed rows (clipped to their periods) + the current roster
+    rows, merged and date-sorted — for cross-period rolling checks."""
+    hist = load_roster_history(username)
+    out = []
+    included = set()
+    for h in hist:
+        if not h["finalized"] or not h["performed_text"] or h["period_start"] is None:
+            continue
+        out += _rows_in_period(parse_roster_text(h["performed_text"]), h["period_start"])
+        included.add(h["period_start"])
+    if current_rows:
+        dates = [r["DateObj"].date() for r in current_rows if r.get("DateObj")]
+        if dates:
+            cur_start = roster_period_of_roster(dates)
+            if cur_start not in included:
+                out += _rows_in_period(current_rows, cur_start)
+    out.sort(key=lambda r: r["DateObj"] or datetime.min)
+    return out
+
 def save_profile(username, data):
     conn = sqlite3.connect('crew_companion.db')
     c = conn.cursor()
@@ -174,17 +305,24 @@ def load_roster_from_db(username):
     return data[0] if data else ""
 
 # --- 2. ROBUST ROSTER PARSER ---
-ROSTER_ANCHOR = datetime(2026, 10, 4).date()   # known roster period start (04Oct26-01Nov26)
-ROSTER_PERIOD_DAYS = 28
+
 
 def roster_period_bounds(d):
-    """Return (start, end) of the 28-day roster period containing date d,
-    derived from the known anchor period. Works for past and future periods."""
+    """Return (start, end_exclusive) of the 28-day roster period containing date d.
+    end_exclusive = start + 28 = the NEXT period's start. The period's LAST day is
+    end_exclusive - 1 (e.g. 07 Sep – 04 Oct 2026; next starts 05 Oct)."""
     k = (d - ROSTER_ANCHOR).days // ROSTER_PERIOD_DAYS
     start = ROSTER_ANCHOR + timedelta(days=ROSTER_PERIOD_DAYS * k)
-    # Airline convention: the period label ends on the NEXT period's start
-    # day (e.g. 04 Oct - 01 Nov), so the displayed span is 28 days + 1.
     return start, start + timedelta(days=ROSTER_PERIOD_DAYS)
+
+
+def roster_period_of_roster(valid_dates):
+    """The 28-day period containing the MEDIAN date of a roster — robust to a
+    day or two of the adjacent period's rows at either end of the paste."""
+    if not valid_dates:
+        return None
+    s = sorted(valid_dates)
+    return roster_period_bounds(s[len(s) // 2])[0]
 
 def preprocess_roster_text(raw_text):
     """
@@ -2952,6 +3090,13 @@ else:
                 mand_txt = f"{do['mandatory_count']} of {do['off_days']}"
                 mand_line = (", ".join(d.strftime("%d %b") for d in mand_dates)
                              if mand_dates else "none individually required")
+                davg = days_off_average_8_2_17_d(st.session_state['username'], parsed_rows)
+                if davg["avg"] is None:
+                    davg_txt = f"N/A · {davg['n_periods']}/3 periods"
+                    davg_color = "#9fb3c8"
+                else:
+                    davg_txt = f"{davg['avg']} avg · {'OK' if davg['ok'] else 'BELOW 8'}"
+                    davg_color = "#a5d6a7" if davg["ok"] else "#ff8a8a"
                 rows_html = (
                     f"<div class='bidrow'><span>Early / Late / Night</span><span>{cnt['early']} / {cnt['late']} / {cnt['night']}</span></div>"
                     f"<div class='bidrow'><span>7-day max (cap 60 h)</span><span>{_fmt_hm(cum['7d']['max'])}</span></div>"
@@ -2960,11 +3105,13 @@ else:
                     f"<div class='bidrow'><span>Days off · longest duty streak</span><span>{do['off_days']} · {do['max_duty_run']}d</span></div>"
                     f"<div class='bidrow'><span>Off-day rest (≥34h · 2 nights)</span><span>{off_rest_txt}</span></div>"
                     f"<div class='bidrow'><span>Mandatory days off (8.2.17)</span><span>{mand_txt}</span></div>"
+                    f"<div class='bidrow'><span>Days off avg / 4wk (8.2.17.d)</span><span style='color:{davg_color};'>{davg_txt}</span></div>"
                 )
                 st.markdown(
                     f"<div class='card'>{rows_html}"
                     f"<div class='muted' style='font-size:11px;margin-top:4px;'>standby & duty days counted in full</div>"
-                    f"<div class='muted' style='font-size:11px;margin-top:2px;'>mandatory: {mand_line}</div></div>",
+                    f"<div class='muted' style='font-size:11px;margin-top:2px;'>mandatory: {mand_line}</div>"
+                    f"<div class='muted' style='font-size:11px;margin-top:2px;'>(d) needs 3 finalized periods — finalize past rosters in Roster History.</div></div>",
                     unsafe_allow_html=True)
                 for sev, msg in fdp["findings"]:
                     if sev == "violation":
@@ -3009,13 +3156,77 @@ else:
                     else:
                         st.warning("Please paste roster text.")
 
-            # 28-day roster period navigation (anchored to known 04Oct26-01Nov26 period)
+            # ---------- ROSTER HISTORY: finalize ended periods ----------
+            if valid_dates_all:
+                hist_rows = load_roster_history(st.session_state['username'])
+                cur_start = roster_period_of_roster(valid_dates_all)
+                cur_end = cur_start + timedelta(days=ROSTER_PERIOD_DAYS)
+                cur_finalized = next((h for h in hist_rows
+                                      if h["period_start"] == cur_start and h["finalized"]), None)
+                period_ended = datetime.now().date() >= cur_end
+
+                if period_ended and not cur_finalized:
+                    st.markdown(
+                        f"<div style='padding:10px 14px;border-radius:8px;background:#33260f;"
+                        f"border:1px solid #ffc107;color:#ffd54f;font-size:13px;margin-bottom:10px;'>"
+                        f"⏰ Roster period <b>{cur_start.strftime('%d %b')} – {(cur_end - timedelta(days=1)).strftime('%d %b %Y')}</b> "
+                        f"has ended. Paste the <b>performed</b> roster (from the portal's performed view) to finalize it "
+                        f"— history & rolling checks use performed rosters, not the plan.</div>",
+                        unsafe_allow_html=True)
+                    with st.expander("📥 Finalize this period (paste performed roster)", expanded=True):
+                        perf_fin = st.text_area("Performed roster (this period)",
+                                                value=(cur_finalized["performed_text"] if cur_finalized else ""),
+                                                height=140,
+                                                key="finalize_perf_input")
+                        if st.button("Save as performed & finalize", key="finalize_btn"):
+                            if perf_fin.strip():
+                                save_roster_history(st.session_state['username'], cur_start,
+                                                    published_text=st.session_state['current_roster'],
+                                                    performed_text=perf_fin, finalized=True)
+                                st.success(f"Period {cur_start.strftime('%d %b')} finalized — rolling checks now use the performed roster.")
+                                st.rerun()
+                            else:
+                                st.warning("Paste the performed roster text first.")
+
+            # Manual finalize + history view (always available)
+            with st.expander("🗂 Roster History"):
+                hist_rows = load_roster_history(st.session_state['username'])
+                if hist_rows:
+                    for h in hist_rows:
+                        ps = h["period_start"]
+                        if ps is None:
+                            continue
+                        pe = ps + timedelta(days=ROSTER_PERIOD_DAYS)
+                        status = ("✅ finalized" if h["finalized"] else "⏳ awaiting performed")
+                        st.markdown(
+                            f"<div class='bidrow'><span>{ps.strftime('%d %b')} – {(pe - timedelta(days=1)).strftime('%d %b %Y')}</span>"
+                            f"<span>{status}</span></div>", unsafe_allow_html=True)
+                else:
+                    st.markdown("<div class='muted'>No finalized periods yet. When a roster period ends, finalize it here so rolling limits (e.g. the 8.2.17(d) 3-period average) can be checked.</div>", unsafe_allow_html=True)
+                if valid_dates_all:
+                    tgt_start = roster_period_of_roster(valid_dates_all)
+                    tgt = next((h for h in hist_rows if h["period_start"] == tgt_start), None)
+                    man_in = st.text_area("Performed roster text (for the period shown above)",
+                                          value=(tgt["performed_text"] if tgt else ""), height=120,
+                                          key="history_manual_input")
+                    if st.button("Save performed roster for this period", key="history_manual_btn"):
+                        if man_in.strip():
+                            save_roster_history(st.session_state['username'], tgt_start,
+                                                published_text=(tgt["published_text"] if tgt else st.session_state['current_roster']),
+                                                performed_text=man_in, finalized=True)
+                            st.success("Saved.")
+                            st.rerun()
+                        else:
+                            st.warning("Paste the performed roster text first.")
+
+            # 28-day roster period navigation (anchored 13 Jul 2026: 07 Sep–04 Oct is current)
             if valid_dates_all:
                 pmin = roster_period_bounds(min(valid_dates_all))[0]
                 pmax = roster_period_bounds(max(valid_dates_all))[0]
                 periods, p = [], pmin
                 while p <= pmax:
-                    periods.append((p, p + timedelta(days=ROSTER_PERIOD_DAYS)))
+                    # (start, last_day) — inclusive 28-day span for the calendar
+                    periods.append((p, p + timedelta(days=ROSTER_PERIOD_DAYS - 1)))
                     p += timedelta(days=ROSTER_PERIOD_DAYS)
                 starts = [x[0] for x in periods]
                 t0 = roster_period_bounds(datetime.now().date())[0]
