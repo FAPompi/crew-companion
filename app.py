@@ -3188,36 +3188,54 @@ else:
                             else:
                                 st.warning("Paste the performed roster text first.")
 
-            # Manual finalize + history view (always available)
+            # Roster history view + finalize ANY period (current or past)
             with st.expander("🗂 Roster History"):
                 hist_rows = load_roster_history(st.session_state['username'])
-                if hist_rows:
-                    for h in hist_rows:
-                        ps = h["period_start"]
-                        if ps is None:
-                            continue
-                        pe = ps + timedelta(days=ROSTER_PERIOD_DAYS)
-                        status = ("✅ finalized" if h["finalized"] else "⏳ awaiting performed")
-                        st.markdown(
-                            f"<div class='bidrow'><span>{ps.strftime('%d %b')} – {(pe - timedelta(days=1)).strftime('%d %b %Y')}</span>"
-                            f"<span>{status}</span></div>", unsafe_allow_html=True)
-                else:
-                    st.markdown("<div class='muted'>No finalized periods yet. When a roster period ends, finalize it here so rolling limits (e.g. the 8.2.17(d) 3-period average) can be checked.</div>", unsafe_allow_html=True)
-                if valid_dates_all:
-                    tgt_start = roster_period_of_roster(valid_dates_all)
-                    tgt = next((h for h in hist_rows if h["period_start"] == tgt_start), None)
-                    man_in = st.text_area("Performed roster text (for the period shown above)",
-                                          value=(tgt["performed_text"] if tgt else ""), height=120,
-                                          key="history_manual_input")
-                    if st.button("Save performed roster for this period", key="history_manual_btn"):
-                        if man_in.strip():
-                            save_roster_history(st.session_state['username'], tgt_start,
-                                                published_text=(tgt["published_text"] if tgt else st.session_state['current_roster']),
-                                                performed_text=man_in, finalized=True)
-                            st.success("Saved.")
-                            st.rerun()
-                        else:
-                            st.warning("Paste the performed roster text first.")
+                now_ref = (roster_period_of_roster(valid_dates_all) if valid_dates_all
+                           else roster_period_bounds(datetime.now().date())[0])
+                avail = [now_ref - timedelta(days=ROSTER_PERIOD_DAYS * k) for k in range(4)]
+                for h in hist_rows:
+                    if h["period_start"] and h["period_start"] not in avail:
+                        avail.append(h["period_start"])
+                avail = sorted(set(avail), reverse=True)   # newest first
+
+                st.markdown("<div class='muted' style='margin-bottom:6px;'>Paste your <b>performed</b> rosters (portal's performed view) for past periods here — the 8.2.17(d) 3-period average and rolling checks use these, not the published plan.</div>", unsafe_allow_html=True)
+                for s in avail:
+                    h = next((x for x in hist_rows if x["period_start"] == s), None)
+                    last = s + timedelta(days=ROSTER_PERIOD_DAYS - 1)
+                    cur_tag = " · current" if s == now_ref else ""
+                    if h and h["finalized"]:
+                        status = "✅ finalized"
+                    elif h:
+                        status = "⏳ saved, not finalized"
+                    else:
+                        status = "—"
+                    st.markdown(
+                        f"<div class='bidrow'><span>{s.strftime('%d %b')} – {last.strftime('%d %b %Y')}{cur_tag}</span>"
+                        f"<span>{status}</span></div>", unsafe_allow_html=True)
+
+                sel_start = st.selectbox(
+                    "Finalize which period?",
+                    avail,
+                    format_func=lambda s: (s.strftime('%d %b') + " – " +
+                                           (s + timedelta(days=ROSTER_PERIOD_DAYS - 1)).strftime('%d %b %Y') +
+                                           (" (current)" if s == now_ref else "")),
+                    key="history_sel_period")
+                tgt = next((h for h in hist_rows if h["period_start"] == sel_start), None)
+                man_in = st.text_area(
+                    "Performed roster text (this period)",
+                    value=(tgt["performed_text"] if tgt else ""), height=140,
+                    key=f"hist_perf_{sel_start.strftime('%Y%m%d')}")
+                if st.button("Save performed roster for this period", key="history_manual_btn"):
+                    if man_in.strip():
+                        save_roster_history(st.session_state['username'], sel_start,
+                                            published_text=(tgt["published_text"] if tgt else
+                                                            (st.session_state['current_roster'] if sel_start == now_ref else None)),
+                                            performed_text=man_in, finalized=True)
+                        st.success(f"Period {sel_start.strftime('%d %b')} finalized — rolling checks now use the performed roster.")
+                        st.rerun()
+                    else:
+                        st.warning("Paste the performed roster text first.")
 
             # 28-day roster period navigation (anchored 13 Jul 2026: 07 Sep–04 Oct is current)
             if valid_dates_all:
