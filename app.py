@@ -345,6 +345,14 @@ def _parse_tab_line(line_str):
     arr_u = to_utc(arr_dt, dest_iata)
     co_u = to_utc(co_dt, dest_iata)
 
+    # aircraft type: a 3-char alnum token (e.g. 320, 32B, 333) that isn't an IATA code
+    ac_type = "-"
+    for f in fields[act_idx + 1:]:
+        s = f.strip()
+        if re.match(r'^[A-Z0-9]{3}$', s) and not re.match(r'^[A-Z]{3}$', s):
+            ac_type = s
+            break
+
     return {
         "Date": row_date_str,
         "DateObj": row_dt_obj,
@@ -357,7 +365,7 @@ def _parse_tab_line(line_str):
         "Route": route,
         "Arrival": hm(arr_dt),
         "Checkout": hm(co_dt) if atype in ("FLIGHT", "STANDBY", "DUTY") else "-",
-        "Aircraft": "-",
+        "Aircraft": ac_type,
         "CIdt": ci_dt, "DEPdt": dep_dt, "ARRdt": arr_dt, "COdt": co_dt,
         "CIdt_u": ci_u, "DEPdt_u": dep_u, "ARRdt_u": arr_u, "COdt_u": co_u,
     }
@@ -1495,8 +1503,9 @@ def compute_analytics(rows):
         streak = streak + 1 if (days[i] - days[i-1]).days == 1 else 1
         max_streak = max(max_streak, streak)
     block_hrs = block_min / 60
-    fatigue = min(10.0, round(1.5 + redeyes * 1.4 + max_streak * 0.7 + (block_hrs / 85) * 3.0, 1))
-    fat_label = "Low" if fatigue < 4 else ("Moderate" if fatigue < 7 else "High")
+    fat = compute_fatigue(rows)
+    fatigue = fat["score"]
+    fat_label = fat["label"]
     allow_rows = []
     for lv in layovers:
         stn = lv["station"] or "?"
@@ -1505,9 +1514,89 @@ def compute_analytics(rows):
         allow_rows.append((stn, nights, rate, nights * rate))
     return {"block_hrs": round(block_hrs, 1), "block_target": 85, "flights": n_flights,
             "redeyes": redeyes, "max_streak": max_streak, "fatigue": fatigue,
-            "fatigue_label": fat_label, "daily_min": daily_min,
+            "fatigue_label": fat_label, "fatigue_parts": fat["parts"], "daily_min": daily_min,
             "allowance_rows": allow_rows, "allowance_total": sum(a[3] for a in allow_rows),
             "layovers": layovers}
+
+
+def compute_fatigue(rows):
+    """Fatigue proxy (0–10) grounded in the FOM Part A Ch.08 fatigue drivers.
+    This is a HEURISTIC — the FOM states the objectives and prescriptive limits
+    but gives no scoring formula. Drivers, each mapped to its FOM source:
+      · early/late/night duty load — §8.2.2 (report early / finish late over
+        consecutive days → sleep deprivation) + night duties more arduous
+      · longest consecutive run touching 0100–0659 — §8.2.2
+      · day/night alternation — §8.5 (avoid alternating day/night duties)
+      · 18–30h rest after a time-zone-crossing duty — §8.5 (undesirable)
+      · cumulative duty load vs 210h/28d — §8.3.d
+      · recovery deficit — §8.0 (≥2 consecutive nights of unrestricted sleep)
+    Returns {score, label, parts:[{label, pts, detail}]}."""
+    parts = []
+    duties = build_duties(rows)
+    for du in duties:
+        start, end = du["report"], du["chocks_on"]
+        if not isinstance(start, datetime) or not isinstance(end, datetime) or end <= start:
+            end = (start if isinstance(start, datetime) else datetime.now()) + timedelta(minutes=1)
+        du["start"], du["end"] = start, end
+        c = duty_classify(start, end)
+        du["early"], du["late"], du["night"] = c["early"], c["late"], c["night"]
+
+    eln = sum(1 for d in duties if d["early"] or d["late"] or d["night"])
+    touching = [d for d in duties if _spans_window(d["start"], d["end"], dtime(1, 0), dtime(6, 59))]
+    run0106 = max((len(r) for r in _group_runs(touching, lambda d: True)), default=0)
+
+    ordered = sorted(duties, key=lambda d: d["start"])
+    bands = ["night" if (d["start"].time() < dtime(7, 0) or d["start"].time() >= dtime(18, 0))
+             else "day" for d in ordered]
+    swings = sum(1 for i in range(1, len(bands)) if bands[i] != bands[i - 1])
+
+    bad_rest = 0
+    for i, du in enumerate(ordered):
+        tz_cross = any(abs(AIRPORT_OFFSET_H.get(s["o"], 5.5) - AIRPORT_OFFSET_H.get(s["d"], 5.5)) > 2
+                       for s in du["sectors"])
+        if not tz_cross or i + 1 >= len(ordered):
+            continue
+        rest = (ordered[i + 1]["start"] - du["end"]).total_seconds() / 3600
+        if 18 < rest <= 30:
+            bad_rest += 1
+
+    periods = [{"start": d["start"], "end": d["end"],
+                "minutes": int((d["end"] - d["start"]).total_seconds() // 60)} for d in duties]
+    for r in rows:
+        if r["Type"] in ("STANDBY", "DUTY") and r.get("CIdt"):
+            s = r["CIdt"]
+            e = r.get("COdt") or s
+            if not isinstance(e, datetime) or e <= s:
+                e = s + timedelta(minutes=1)
+            periods.append({"start": s, "end": e, "minutes": int((e - s).total_seconds() // 60)})
+    periods.sort(key=lambda p: p["start"])
+    cum28 = 0
+    if periods:
+        anchors = sorted({p["start"].date() for p in periods})
+        for anchor in anchors:
+            lo = anchor - timedelta(days=27)
+            cum28 = max(cum28, sum(p["minutes"] for p in periods if lo <= p["start"].date() <= anchor))
+    cum_ratio = cum28 / (210 * 60)
+
+    ds = _day_status_map(rows)
+    offs = sorted(d for d, s in ds.items() if "off" in s)
+    recovery_ok = any((offs[i + 1] - offs[i]).days == 1 for i in range(len(offs) - 1))
+
+    score = 0.6
+    def add(label, pts, detail):
+        parts.append({"label": label, "pts": round(pts, 1), "detail": detail})
+    p = min(3.0, 0.4 * eln); add("Early / late / night duties", p, f"{eln} duty(ies)"); score += p
+    p = min(2.0, 0.6 * max(0, run0106 - 1)); add("0100–0659 consecutive run", p, f"longest {run0106}"); score += p
+    p = min(1.5, 0.5 * swings); add("Day/night alternation", p, f"{swings} swing(s)"); score += p
+    p = min(1.5, 0.75 * bad_rest); add("18–30h rest after TZ flight", p, f"{bad_rest} occurrence(s)"); score += p
+    p = min(2.0, 2.0 * cum_ratio); add("Cumulative duty load", p, f"{_fmt_hm(cum28)} of 210h/28d"); score += p
+    p = 0.0 if recovery_ok else 0.6; add("Recovery deficit", p,
+        "2-off block present" if recovery_ok else "no 2 consecutive off days"); score += p
+    score = min(10.0, round(score, 1))
+    label = "Low" if score < 4 else ("Moderate" if score < 7 else "High")
+    return {"score": score, "label": label, "parts": parts, "eln": eln,
+            "run0106": run0106, "swings": swings, "bad_rest": bad_rest,
+            "cum28": cum28, "recovery_ok": recovery_ok}
 
 def enrich_layovers(rows):
     out, n = [], len(rows)
@@ -1632,6 +1721,14 @@ def _fmt_hm(mins):
     if h:
         return f"{h}h"
     return f"{m}m"
+
+
+def _gmt_str(off):
+    """UTC offset hours -> 'GMT+5:30'."""
+    sign = "+" if off >= 0 else "-"
+    h = int(abs(off))
+    m = int(round((abs(off) - h) * 60))
+    return f"GMT{sign}{h}" + (f":{m:02d}" if m else "")
 
 
 # --- 3.6 FDP CALCULATOR — FOM Part A Chapter 08 (cabin crew) ---
@@ -2188,21 +2285,15 @@ def fdp_roster_audit(rows):
 
 def _duty_chip(sectors):
     """One compact chip per duty: a turnaround collapses to 'UL404/5' with one
-    line per sector — route, dep–arr times and TRUE flying time (UTC-corrected
-    block). No check-in/check-out clutter; midnight crossings get a tiny
+    line per sector — route + dep–arr times only (flying time, airport names and
+    timezones live in the Flight Intel panel). Midnight crossings get a tiny
     '▸ starts / ↳ lands' marker on the adjacent day instead."""
     title = _compact_flight_label([s["flight"].replace(" ", "") for s in sectors])
     lines = []
     for s in sectors:
         dep_t = s["dep"].strftime("%H:%M") if isinstance(s["dep"], datetime) else ""
         arr_t = s["arr"].strftime("%H:%M") if isinstance(s["arr"], datetime) else ""
-        a, b = s.get("arr_u"), s.get("dep_u")
-        if not (isinstance(a, datetime) and isinstance(b, datetime)):
-            a, b = s.get("arr"), s.get("dep")
-        dur = ""
-        if isinstance(a, datetime) and isinstance(b, datetime) and a > b:
-            dur = f" · {_fmt_hm((a - b).total_seconds() // 60)}"
-        lines.append(f"<span>{s['o']}→{s['d']} {dep_t}–{arr_t}{dur}</span>")
+        lines.append(f"<span>{s['o']}→{s['d']} {dep_t}–{arr_t}</span>")
     return f"<div class='chip chip-flt'>✈ <b>{title}</b><br>{'<br>'.join(lines)}</div>"
 
 
@@ -2227,6 +2318,60 @@ def _off_chip(mand_rules):
         return (f"<div class='chip chip-off-mand' title='Mandatory — {', '.join(mand_rules)}'>"
                 f"🔴 OFF · MAND</div>")
     return "<div class='chip chip-off'>🟢 OFF</div>"
+
+
+def flight_intel_card(du, rows):
+    """HTML card for one duty: per-sector route + times + flying time, aircraft,
+    airport names and timezones, check-in/on-chock, and the duty's FDP vs its
+    Table A/B maximum. (Flying time/airport detail lives here, not on the
+    calendar chip.)"""
+    sectors = du["sectors"]
+    first = sectors[0]
+    report, chocks = du.get("report"), du.get("chocks_on")
+
+    ac_by = {}
+    for r in rows:
+        if r["Type"] == "FLIGHT":
+            ac_by[str(r["Flight / Code"]).replace(" ", "")] = r.get("Aircraft") or "-"
+
+    sec_rows = []
+    for s in sectors:
+        fno = s["flight"].replace(" ", "")
+        dep_t = s["dep"].strftime("%H:%M") if isinstance(s.get("dep"), datetime) else "-"
+        arr_t = s["arr"].strftime("%H:%M") if isinstance(s.get("arr"), datetime) else "-"
+        block = _fmt_hm(int(round(s["block_h"] * 60))) if s.get("block_h") else "-"
+        sec_rows.append((fno, s["o"], s["d"], dep_t, arr_t, block, ac_by.get(fno, "-")))
+
+    n = len(sectors)
+    band = fdp_band((first["dep"] - timedelta(hours=1)).time()) if isinstance(first.get("dep"), datetime) else "0600-0759"
+    acclim = _roster_acclimatized(rows, report, away_origin=du.get("origin"))
+    prec = _preceding_rest_h(rows, report) if not acclim else None
+    max_fdp = fdp_limit_min(acclim, band, n, prec)
+    fdp_actual = (int((chocks - report).total_seconds() // 60)
+                  if isinstance(report, datetime) and isinstance(chocks, datetime) and chocks > report else None)
+
+    d0 = first["dep"].date().strftime("%d %b") if isinstance(first.get("dep"), datetime) else ""
+    rows_html = ""
+    for fno, o, d, dep_t, arr_t, block, ac in sec_rows:
+        on = AIRPORT_NAME.get(o, "")
+        dn = AIRPORT_NAME.get(d, "")
+        ac_txt = f" · A/C {ac}" if ac not in ("-", "") else ""
+        rows_html += (
+            f"<div style='border:1px solid #1f2b3a;border-radius:8px;padding:8px 10px;margin-bottom:8px;'>"
+            f"<div style='display:flex;justify-content:space-between;font-size:12.5px;'>"
+            f"<b style='color:#4dd0e1;'>{fno}</b>"
+            f"<span style='color:#9fb3c8;'>{o}→{d} · {dep_t}–{arr_t}</span>"
+            f"<span style='color:#e8eef7;font-weight:600;'>{block}</span></div>"
+            f"<div class='muted' style='margin-top:3px;'>{on} ({o}, {_gmt_str(AIRPORT_OFFSET_H.get(o, 5.5))}) → {dn} ({d}, {_gmt_str(AIRPORT_OFFSET_H.get(d, 5.5))}){ac_txt}</div></div>"
+        )
+    fdp_html = ""
+    if fdp_actual is not None:
+        fdp_html = (f"<div class='bidrow'><span>Duty FDP (check-in → on-chock)</span>"
+                    f"<span>{_fmt_hm(fdp_actual)} / max {_fmt_hm(max_fdp)} · Table {'A' if acclim else 'B'}</span></div>")
+    head = f"✈ Flight Intel: {du['label']}" + (f" — {d0}" if d0 else "")
+    sub = (f"<div class='muted' style='margin-bottom:8px;'>Check-in {report:%H:%M} · On-chock {chocks:%H:%M} · {n} sector(s)</div>"
+           if isinstance(report, datetime) and isinstance(chocks, datetime) else "")
+    return f"<div class='card' style='border-color:#00bcd4;'><h5>{head}</h5>{sub}{rows_html}{fdp_html}</div>"
 
 
 def build_calendar_html(rows, span=None):
@@ -2756,13 +2901,21 @@ else:
                 unsafe_allow_html=True)
             spark = sparkline_svg([analytics['daily_min'].get(d, 0) for d in sorted(analytics['daily_min'])] or [0])
             fat_color = "#4caf50" if analytics['fatigue'] < 4 else ("#ff9800" if analytics['fatigue'] < 7 else "#ff5252")
+            fat_parts = sorted(analytics.get("fatigue_parts", []), key=lambda p: -p["pts"])
+            parts_html = ""
+            for p in fat_parts:
+                if p["pts"] <= 0:
+                    continue
+                parts_html += (f"<div class='bidrow'><span>{p['label']}</span>"
+                               f"<span>{p['detail']} · +{p['pts']}</span></div>")
             st.markdown(
-                f"<div class='card' style='text-align:center;'><h5>Fatigue Score</h5>"
-                f"{gauge_svg(analytics['fatigue'])}"
-                f"<div style='color:{fat_color};font-weight:700;font-size:14px;'>{analytics['fatigue_label']} ({analytics['fatigue']}/10)</div>"
-                f"<div style='margin-top:6px;'>{spark}</div>"
-                f"<div class='muted'>{analytics['redeyes']} red-eye dep · {analytics['max_streak']} consecutive duty days</div>"
-                f"<div class='muted' style='margin-top:4px;'>1.5 + 1.4·redeyes + 0.7·max-streak + 3.0·(block/85) — capped at 10</div></div>",
+                f"<div class='card'><h5 style='text-align:center;'>Fatigue Score</h5>"
+                f"<div style='text-align:center;'>{gauge_svg(analytics['fatigue'])}</div>"
+                f"<div style='color:{fat_color};font-weight:700;font-size:14px;text-align:center;'>{analytics['fatigue_label']} ({analytics['fatigue']}/10)</div>"
+                f"<div style='margin-top:6px;text-align:center;'>{spark}</div>"
+                f"<div class='muted' style='text-align:center;'>{analytics['redeyes']} red-eye dep · {analytics['max_streak']} consecutive duty days</div>"
+                f"<div style='margin-top:8px;'>{parts_html}</div>"
+                f"<div class='muted' style='margin-top:4px;'>heuristic from FOM Ch.08 fatigue drivers (early/late/night duties, 0100–0659 runs, day/night alternation, 18–30h rests after TZ flights, cumulative load, recovery) — not a regulatory limit.</div></div>",
                 unsafe_allow_html=True)
 
             # ---------- LEFT: FDP COMPLIANCE (Chapter 08) ----------
@@ -2884,38 +3037,61 @@ else:
 
             st.markdown(f"<div class='card'>{build_calendar_html(parsed_rows, span=sel_span)}</div>", unsafe_allow_html=True)
 
-            # Layover Intel
-            layovers = [lv for lv in analytics["layovers"] if lv["station"]]
-            if layovers:
-                opts = list(range(len(layovers)))
+            # Flight & Layover Intel — one selector for every duty AND layover
+            intel_items = []   # (kind, payload, label)
+            for du in build_duties(parsed_rows):
+                d0 = (du["sectors"][0]["dep"].date().strftime("%d %b")
+                      if isinstance(du["sectors"][0].get("dep"), datetime) else "")
+                intel_items.append(("flight", du, f"✈ {du['label']}" + (f" — {d0}" if d0 else "")))
+            for lv in analytics["layovers"]:
+                if not lv["station"]:
+                    continue
+                city = STATION_INFO.get(lv["station"], (lv["station"],))[0]
+                intel_items.append(("layover", lv,
+                                    f"🏨 {city} ({lv['station']}) — {lv['date'].strftime('%d %b') if lv['date'] else '?'}"))
+            if intel_items:
                 today = datetime.now().date()
-                def_idx = next((i for i, lv in enumerate(layovers) if lv["date"] and lv["date"] >= today), 0)
-                sel = st.selectbox("Layover Intel:", opts, index=def_idx,
-                                   format_func=lambda i: f"{STATION_INFO.get(layovers[i]['station'], (layovers[i]['station'],))[0]} ({layovers[i]['station']}) — {layovers[i]['date'].strftime('%d %b') if layovers[i]['date'] else '?'}")
-                lv = layovers[sel]
-                wx = fetch_station_weather(lv["station"])
-                info = STATION_INFO.get(lv["station"])
-                spots = (info[4] if info and info[4] else DEFAULT_SPOTS)
-                city = wx["city"] if wx else lv["station"]
-                apname = AIRPORT_NAME.get(lv["station"], "")
-                wx_html = (f"{wx['icon']} {wx['temp']}°C · {wx['desc']}" if wx and wx["temp"] is not None else "n/a")
-                lt_html = f"{wx['local_time']} ({wx['gmt']})" if wx else "-"
-                gt_html = f"{lv['ground_hrs']} hrs" if lv["ground_hrs"] else "-"
-                spots_html = "".join(f"<span class='spot'>{s}</span>" for s in spots)
-                st.markdown(
-                    f"<div class='card' style='border-color:#00bcd4;'>"
-                    f"<h5>🏨 Layover Intel: {city} ({lv['station']})" + (f" — {lv['date'].strftime('%d %b')}" if lv['date'] else "") + "</h5>"
-                    + (f"<div class='muted' style='margin-bottom:8px;'>✈ {apname}</div>" if apname else "")
-                    + f"<div style='display:flex;gap:28px;font-size:13px;margin-bottom:10px;'>"
-                    f"<div><div class='muted'>Weather (live)</div>{wx_html}</div>"
-                    f"<div><div class='muted'>Local Time</div>{lt_html}</div>"
-                    f"<div><div class='muted'>Ground Time</div>{gt_html}</div></div>"
-                    f"<div class='muted' style='margin-bottom:4px;'>Explore Spots</div>{spots_html}</div>",
-                    unsafe_allow_html=True)
+                def_idx = 0
+                for i, (kind, payload, _lbl) in enumerate(intel_items):
+                    if kind == "flight":
+                        dep = payload["sectors"][0].get("dep")
+                        d = dep.date() if isinstance(dep, datetime) else None
+                    else:
+                        lvd = payload.get("date")
+                        d = lvd.date() if isinstance(lvd, datetime) else None
+                    if d is not None and d >= today:
+                        def_idx = i
+                        break
+                sel = st.selectbox("Flight & Layover Intel:", list(range(len(intel_items))), index=def_idx,
+                                   format_func=lambda i: intel_items[i][2])
+                kind, payload, _lbl = intel_items[sel]
+                if kind == "flight":
+                    st.markdown(flight_intel_card(payload, parsed_rows), unsafe_allow_html=True)
+                else:
+                    lv = payload
+                    wx = fetch_station_weather(lv["station"])
+                    info = STATION_INFO.get(lv["station"])
+                    spots = (info[4] if info and info[4] else DEFAULT_SPOTS)
+                    city = wx["city"] if wx else lv["station"]
+                    apname = AIRPORT_NAME.get(lv["station"], "")
+                    wx_html = (f"{wx['icon']} {wx['temp']}°C · {wx['desc']}" if wx and wx["temp"] is not None else "n/a")
+                    lt_html = f"{wx['local_time']} ({wx['gmt']})" if wx else "-"
+                    gt_html = f"{lv['ground_hrs']} hrs" if lv["ground_hrs"] else "-"
+                    spots_html = "".join(f"<span class='spot'>{s}</span>" for s in spots)
+                    st.markdown(
+                        f"<div class='card' style='border-color:#00bcd4;'>"
+                        f"<h5>🏨 Layover Intel: {city} ({lv['station']})" + (f" — {lv['date'].strftime('%d %b')}" if lv['date'] else "") + "</h5>"
+                        + (f"<div class='muted' style='margin-bottom:8px;'>✈ {apname}</div>" if apname else "")
+                        + f"<div style='display:flex;gap:28px;font-size:13px;margin-bottom:10px;'>"
+                        f"<div><div class='muted'>Weather (live)</div>{wx_html}</div>"
+                        f"<div><div class='muted'>Local Time</div>{lt_html}</div>"
+                        f"<div><div class='muted'>Ground Time</div>{gt_html}</div></div>"
+                        f"<div class='muted' style='margin-bottom:4px;'>Explore Spots</div>{spots_html}</div>",
+                        unsafe_allow_html=True)
             elif active_text:
-                st.info("No layovers detected in roster for Layover Intel.")
+                st.info("No flights or layovers detected in this roster for Intel.")
             else:
-                st.info("Paste your roster above to populate the calendar, analytics and layover intel.")
+                st.info("Paste your roster above to populate the calendar, analytics and flight & layover intel.")
 
             # ---------- ROSTER GUARDIAN: FAU SOFT-RULES AUDIT ----------
             if parsed_rows:
