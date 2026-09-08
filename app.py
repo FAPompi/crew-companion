@@ -374,6 +374,17 @@ DUTY_CODES = ["SEP", "SEC", "CRM", "DGR", "F/A", "OBT", "SPC", "SVC", "GNT", "CB
 _DUTY_PAT = "|".join(re.escape(c) for c in DUTY_CODES)
 
 
+def _clamp_exclusive_end(dep_dt, arr_dt):
+    """The portal's PERFORMED view writes all-day markers with an EXCLUSIVE end:
+    'OFF 03AUG26 00:00 → 04AUG26 00:00' means off on 03 Aug only (the boundary
+    is the next day's midnight). Collapse that to the day before so a single day
+    off isn't double-counted. Real-times (23:59, 15:10, …) are left untouched."""
+    if (isinstance(dep_dt, datetime) and isinstance(arr_dt, datetime)
+            and arr_dt > dep_dt and arr_dt.time() == dtime(0, 0)):
+        return dep_dt, arr_dt - timedelta(days=1)
+    return dep_dt, arr_dt
+
+
 def _parse_tab_line(line_str):
     """Parse one tab-separated duty line from the crew-portal export.
 
@@ -441,7 +452,7 @@ def _parse_tab_line(line_str):
     elif act in ("OFF", "ROF"):
         atype, code = "DAY OFF", act
         if dts:
-            dep_dt, arr_dt = dts[0][1], dts[-1][1]
+            dep_dt, arr_dt = _clamp_exclusive_end(dts[0][1], dts[-1][1])
     elif act == "TOF":
         # Time OFF — a protected time-off window (NOT a full day off). No duty
         # may check in or check out within the window (user rule).
@@ -461,7 +472,7 @@ def _parse_tab_line(line_str):
     elif act in ("ALV", "RLV", "ALP", "CLV"):
         atype, code = "LEAVE", act
         if dts:
-            dep_dt, arr_dt = dts[0][1], dts[-1][1]
+            dep_dt, arr_dt = _clamp_exclusive_end(dts[0][1], dts[-1][1])
     elif act in DUTY_CODES:
         # training/duty day — carries check-in, start, end & check-out stamps
         atype, code = "DUTY", act
@@ -631,7 +642,10 @@ def parse_roster_text(raw_text):
             # Multi-day span support (layover/standby/off blocks with start+end stamps)
             if dt_stamps:
                 start_dt, end_dt = min(dt_stamps), max(dt_stamps)
-                if activity_type in ("LAYOVER", "STANDBY", "DAY OFF", "TIMEOFF"):
+                if activity_type in ("DAY OFF", "LEAVE"):
+                    # performed view: exclusive next-day 00:00 boundary → single day
+                    start_dt, end_dt = _clamp_exclusive_end(start_dt, end_dt)
+                if activity_type in ("LAYOVER", "STANDBY", "DAY OFF", "TIMEOFF", "LEAVE"):
                     row_dt_obj = datetime.combine(start_dt.date(), datetime.min.time())
                     row_date_str = start_dt.strftime("%d%b%y").upper()
                     if end_dt.date() > start_dt.date():
