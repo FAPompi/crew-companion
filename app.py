@@ -1149,44 +1149,45 @@ def fetch_live_flight_telemetry(flight_no, flight_date, route, scheduled_dep):
     return res
 
 def rest_impact_note(rows, flight_no, fdate, delay_mins):
-    """
-    If a monitored flight is running late, recompute the rest period before
-    the NEXT duty in the roster and flag if it drops below MIN_REST_HOURS.
-    """
+    """If a monitored flight is running late, recompute the rest period before
+    the NEXT duty and flag if it drops below MIN_REST_HOURS. Turnaround legs
+    (e.g. UL404/UL405 = one duty) are NOT a rest boundary — the 17h30m minimum
+    only applies between separate duties (and standby/duty reports)."""
     if not delay_mins or delay_mins <= 0:
         return None
-    for i, r in enumerate(rows):
-        if (r["Flight / Code"] == flight_no and r["DateObj"] is not None
-                and r["DateObj"].date() == fdate and r["Arrival"] != "-"):
+    duties = build_duties(rows)
+    fkey = flight_no.replace(" ", "")
+    duty = next((du for du in duties
+                 if any(s["flight"].replace(" ", "") == fkey and isinstance(s.get("dep"), datetime)
+                        and s["dep"].date() == fdate for s in du["sectors"])), None)
+    if duty is None:
+        return None
+    chocks = duty["chocks_on"]
+    if not isinstance(chocks, datetime):
+        return None
+    cands = [{"dt": du["report"], "label": du["label"]} for du in duties
+             if isinstance(du.get("report"), datetime) and du["report"] > chocks]
+    for sb in rows:
+        if sb["Type"] != "STANDBY":
+            continue
+        sdt = sb.get("CIdt")
+        if not isinstance(sdt, datetime) and sb["DateObj"] is not None and sb["Departure"] != "-":
             try:
-                arr_t = datetime.strptime(r["Arrival"], "%H:%M").time()
-                arr_dt = datetime.combine(fdate, arr_t)
-                if r["Departure"] != "-" and r["Arrival"] < r["Departure"]:
-                    arr_dt += timedelta(days=1)
-            except Exception:
-                return None
-            for j in range(i + 1, len(rows)):
-                nr = rows[j]
-                if nr["Type"] in ("FLIGHT", "STANDBY") and nr["DateObj"] is not None:
-                    tstr = nr["Check-In"] if nr["Check-In"] != "-" else nr["Departure"]
-                    if tstr == "-":
-                        return None
-                    try:
-                        ci_dt = datetime.combine(nr["DateObj"].date(), datetime.strptime(tstr, "%H:%M").time())
-                    except Exception:
-                        return None
-                    rest0 = (ci_dt - arr_dt).total_seconds() / 3600
-                    if rest0 <= 0:
-                        return None
-                    new_rest = rest0 - delay_mins / 60
-                    nxt = nr["Flight / Code"]
-                    if new_rest >= MIN_REST_HOURS:
-                        return (f"🛏 Rest impact: {rest0:.1f}h → {new_rest:.1f}h before {nxt} — "
-                                f"rest NOT affected (min 17h30m).")
-                    return (f"🛏 Rest impact: {rest0:.1f}h → {new_rest:.1f}h before {nxt} — "
-                            f"BELOW the 17h30m FAU MINIMUM. Contact crew control; report/pickup time must shift.")
-            return None
-    return None
+                sdt = datetime.combine(sb["DateObj"].date(), datetime.strptime(sb["Departure"], "%H:%M").time())
+            except ValueError:
+                sdt = None
+        if isinstance(sdt, datetime) and sdt > chocks:
+            cands.append({"dt": sdt, "label": f"Standby {sb.get('Code') or ''}".strip()})
+    if not cands:
+        return None
+    nxt = min(cands, key=lambda c: c["dt"])
+    rest0 = (nxt["dt"] - chocks).total_seconds() / 3600
+    new_rest = rest0 - delay_mins / 60
+    if new_rest >= MIN_REST_HOURS:
+        return (f"🛏 Rest impact: {rest0:.1f}h → {new_rest:.1f}h before {nxt['label']} — "
+                f"rest NOT affected (min 17h30m).")
+    return (f"🛏 Rest impact: {rest0:.1f}h → {new_rest:.1f}h before {nxt['label']} — "
+            f"BELOW the 17h30m FAU MINIMUM. Contact crew control; report/pickup time must shift.")
 
 
 def suggest_standby_for_cancel(row):
