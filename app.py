@@ -276,8 +276,14 @@ def _parse_tab_line(line_str):
         if dts:
             dep_dt, arr_dt = dts[0][1], dts[-1][1]
         ci_dt, co_dt = dep_dt, arr_dt
-    elif act in ("OFF", "ROF", "TOF"):
+    elif act in ("OFF", "ROF"):
         atype, code = "DAY OFF", act
+        if dts:
+            dep_dt, arr_dt = dts[0][1], dts[-1][1]
+    elif act == "TOF":
+        # Time OFF — a protected time-off window (NOT a full day off). No duty
+        # may check in or check out within the window (user rule).
+        atype, code = "TIMEOFF", act
         if dts:
             dep_dt, arr_dt = dts[0][1], dts[-1][1]
     elif re.match(r'^SB\d*$', act):
@@ -417,8 +423,10 @@ def parse_roster_text(raw_text):
 
             time_matches = re.findall(r'(\d{2}:\d{2})', line_str)
 
-            if "OFF" in line_str or "ROF" in line_str or "TOF" in line_str:
+            if "OFF" in line_str or "ROF" in line_str:
                 activity_type = "DAY OFF"
+            elif "TOF" in line_str:
+                activity_type = "TIMEOFF"
             elif any(c in line_str for c in ("ALV", "RLV", "ALP", "CLV")):
                 activity_type = "LEAVE"
             elif "HTL" in line_str:
@@ -438,7 +446,9 @@ def parse_roster_text(raw_text):
             elif activity_type == "LAYOVER":
                 code = "HTL"
             elif activity_type == "DAY OFF":
-                code = next((c for c in ("ROF", "TOF", "OFF") if c in line_str), "OFF")
+                code = next((c for c in ("ROF", "OFF") if c in line_str), "OFF")
+            elif activity_type == "TIMEOFF":
+                code = "TOF"
             elif activity_type == "STANDBY":
                 m = re.search(r'\bSB\d*\b', line_str)
                 code = m.group(0) if m else "SB"
@@ -451,7 +461,7 @@ def parse_roster_text(raw_text):
             # Multi-day span support (layover/standby/off blocks with start+end stamps)
             if dt_stamps:
                 start_dt, end_dt = min(dt_stamps), max(dt_stamps)
-                if activity_type in ("LAYOVER", "STANDBY", "DAY OFF"):
+                if activity_type in ("LAYOVER", "STANDBY", "DAY OFF", "TIMEOFF"):
                     row_dt_obj = datetime.combine(start_dt.date(), datetime.min.time())
                     row_date_str = start_dt.strftime("%d%b%y").upper()
                     if end_dt.date() > start_dt.date():
@@ -1708,6 +1718,198 @@ def _group_runs(items, keyfn, break_h=34.0):
     return runs
 
 
+def _day_status_map(rows):
+    """Calendar-date \u2192 set(status). FLIGHT/STANDBY/LAYOVER/DUTY \u2192 'duty',
+    DAY OFF \u2192 'off', LEAVE \u2192 'leave'. Multi-day rows span every date they
+    cover (8.2.17 counting: layover days count as duty, leave is not a day off)."""
+    day_status = {}
+    for r in rows:
+        if not r.get("DateObj"):
+            continue
+        start = r["DateObj"].date()
+        end = r["EndDateObj"].date() if r.get("EndDateObj") else start
+        if r["Type"] in ("FLIGHT", "STANDBY", "LAYOVER", "DUTY"):
+            key = "duty"
+        elif r["Type"] == "DAY OFF":
+            key = "off"
+        elif r["Type"] == "LEAVE":
+            key = "leave"
+        elif r["Type"] == "TIMEOFF":
+            key = "tof"   # time-off block: not duty, not a day off
+        else:
+            continue
+        d = start
+        while d <= end:
+            day_status.setdefault(d, set()).add(key)
+            d += timedelta(days=1)
+    return day_status
+
+
+def _days_off_rule_breaks(day_status, lo, hi):
+    """Which 8.2.17(a/b/c) counting rules are breached across [lo, hi].
+    (a) run of >7 consecutive duty days; (b) a 14-day window with no adjacent
+    pair of off days; (c) a 28-day window with fewer than 7 off days."""
+    breaks = set()
+    run = 0
+    d = lo
+    while d <= hi:
+        if "duty" in day_status.get(d, set()):
+            run += 1
+            if run > 7:
+                breaks.add("a")
+                break
+        else:
+            run = 0
+        d += timedelta(days=1)
+    d = lo
+    while d + timedelta(days=13) <= hi:
+        if not any("off" in day_status.get(d + timedelta(days=k), set())
+                   and "off" in day_status.get(d + timedelta(days=k + 1), set())
+                   for k in range(13)):
+            breaks.add("b")
+            break
+        d += timedelta(days=1)
+    d = lo
+    while d + timedelta(days=27) <= hi:
+        if sum(1 for k in range(28) if "off" in day_status.get(d + timedelta(days=k), set())) < 7:
+            breaks.add("c")
+            break
+        d += timedelta(days=1)
+    return breaks
+
+
+def mandatory_off_days(rows):
+    """DAY OFF dates that are legally required by 8.2.17. Each off date is
+    individually stress-tested: if turning it into a duty day would breach
+    rule (a), (b) or (c), that date is mandatory. Conservative (one day at a
+    time), so a date is only marked when it is itself load-bearing. Returns
+    {date: [rule label, ...]}."""
+    day_status = _day_status_map(rows)
+    off_days = sorted(d for d, s in day_status.items() if "off" in s)
+    if not day_status or not off_days:
+        return {}
+    lo, hi = min(day_status), max(day_status)
+    labels = {"a": "8th-day off", "b": "2-off-in-14", "c": "7-off-in-28"}
+    mand = {}
+    for o in off_days:
+        alt = {d: set(v) for d, v in day_status.items()}
+        alt[o].discard("off")
+        alt[o].add("duty")
+        breaks = _days_off_rule_breaks(alt, lo, hi)
+        if breaks:
+            mand[o] = [labels[b] for b in sorted(breaks)]
+    return mand
+
+
+def off_day_rest_check(rows):
+    """8.2.17 day-off definition: each day-off block must give \u2265 34 h free of
+    duty AND 2 local nights (8 h within 2200\u20130800 local) for the first off day,
+    plus one further local night per extra consecutive off day. Free time runs
+    from the previous duty's check-out to the next duty's check-in (leave days
+    are free of duty, so they extend the window). Times treated as Colombo
+    local. Returns a list of (severity, message) findings."""
+    findings = []
+    day_status = _day_status_map(rows)
+    off_days = sorted(d for d, s in day_status.items() if "off" in s)
+    if not off_days:
+        return findings
+
+    duty_ivs = []
+    for r in rows:
+        if r["Type"] not in ("FLIGHT", "STANDBY", "LAYOVER", "DUTY"):
+            continue
+        s = r.get("CIdt") or r.get("DEPdt")
+        e = r.get("COdt") or r.get("ARRdt")
+        if isinstance(s, datetime) and isinstance(e, datetime):
+            if e <= s:
+                e = s + timedelta(minutes=1)
+            duty_ivs.append((s, e))
+    duty_ivs.sort(key=lambda x: x[0])
+
+    blocks, b0, b1 = [], off_days[0], off_days[0]
+    for o in off_days[1:]:
+        if o == b1 + timedelta(days=1):
+            b1 = o
+        else:
+            blocks.append((b0, b1))
+            b0 = b1 = o
+    blocks.append((b0, b1))
+
+    for b0, b1 in blocks:
+        n = (b1 - b0).days + 1
+        block_start = datetime.combine(b0, dtime(0, 0))
+        block_end = datetime.combine(b1 + timedelta(days=1), dtime(0, 0))
+        next_start = None
+        for s, _e in duty_ivs:
+            if s >= block_start:
+                next_start = s
+                break
+        free_end = next_start if next_start is not None else block_end
+        prev_end = max((e for _s, e in duty_ivs if e <= free_end), default=None)
+        free_start = prev_end if prev_end is not None else block_start
+        edge = []
+        if prev_end is None:
+            edge.append("previous duty not in this roster")
+        if next_start is None:
+            edge.append("next duty not in this roster")
+        hours = (free_end - free_start).total_seconds() / 3600
+        nights = _count_local_nights(free_start, free_end)
+        need_nights = n + 1
+        lbl = b0.strftime("%d %b") if n == 1 else f"{b0.strftime('%d %b')}\u2013{b1.strftime('%d %b')}"
+        problems = []
+        if hours < 34:
+            problems.append(f"only {hours:.1f}h free of duty (min 34h)")
+        if nights < need_nights:
+            problems.append(f"{nights} local night(s) vs {need_nights} required for {n} day(s) off")
+        if problems:
+            # A block that only fails because the previous/next duty lies outside
+            # this roster can't be verified, so it's a note rather than a breach.
+            sev = "note" if edge else "violation"
+            msg = f"Day off {lbl}: {'; '.join(problems)}."
+            if edge:
+                msg += f" (\u26a0\ufe0f {'; '.join(edge)} \u2014 cannot fully verify from this roster)."
+            findings.append((sev, msg))
+        elif edge:
+            findings.append(("note",
+                f"Day off {lbl}: {hours:.1f}h free, {nights} local night(s) \u2014 OK within this roster "
+                f"({'; '.join(edge)})."))
+    return findings
+
+
+def tof_conflict_check(rows):
+    """TOF = time-off block (not a day off). User rule: no duty may check in or
+    check out within a TOF window. Returns [(severity, message), ...]."""
+    findings = []
+    windows = []
+    for r in rows:
+        if r["Type"] != "TIMEOFF":
+            continue
+        s, e = r.get("DEPdt"), r.get("ARRdt")
+        if isinstance(s, datetime) and isinstance(e, datetime):
+            if e <= s:
+                e = s + timedelta(minutes=1)
+            windows.append((s, e))
+    if not windows:
+        return findings
+    for r in rows:
+        if r["Type"] != "FLIGHT":
+            continue
+        ci, co = r.get("CIdt"), r.get("COdt")
+        flt = (r.get("Flight / Code") or "").replace(" ", "")
+        for ws, we in windows:
+            hits = []
+            if isinstance(ci, datetime) and ws <= ci <= we:
+                hits.append(f"check-in {ci:%H:%M}")
+            if isinstance(co, datetime) and ws <= co <= we:
+                hits.append(f"check-out {co:%H:%M}")
+            if hits:
+                findings.append(("violation",
+                    f"Time-off block {ws:%d %b %H:%M}\u2013{we:%H:%M}: {flt} "
+                    f"{' and '.join(hits)} falls inside the TOF window \u2014 "
+                    "no duty may check in or check out during TOF."))
+    return findings
+
+
 def fdp_roster_audit(rows):
     """Chapter 08 FTL checks across the whole parsed roster: early/late/night
     classification, the 0100\u20130659 run limits, and cumulative duty hours
@@ -1821,24 +2023,7 @@ def fdp_roster_audit(rows):
                 "only OK if caused by unforeseen delays (\u2264 65 h)."))
 
     # --- days-off rules (8.2.17): duty-day status per calendar date ---
-    day_status = {}
-    for r in rows:
-        if not r.get("DateObj"):
-            continue
-        start = r["DateObj"].date()
-        end = (r["EndDateObj"].date() if r.get("EndDateObj") else start)
-        if r["Type"] in ("FLIGHT", "STANDBY", "LAYOVER", "DUTY"):
-            key = "duty"
-        elif r["Type"] == "DAY OFF":
-            key = "off"
-        elif r["Type"] == "LEAVE":
-            key = "leave"
-        else:
-            continue
-        d = start
-        while d <= end:
-            day_status.setdefault(d, set()).add(key)
-            d += timedelta(days=1)
+    day_status = _day_status_map(rows)
 
     days_off = {"off_days": 0, "max_duty_run": 0}
     if day_status:
@@ -1895,6 +2080,20 @@ def fdp_roster_audit(rows):
                 prev_viol = False
             d += timedelta(days=1)
 
+    # --- each day off must satisfy the 34h / 2-local-night definition ---
+    rest_findings = off_day_rest_check(rows)
+    findings.extend(rest_findings)
+    days_off["off_rest_bad"] = sum(1 for f in rest_findings if f[0] == "violation")
+    days_off["off_rest_notes"] = sum(1 for f in rest_findings if f[0] == "note")
+
+    # --- which off days are mandatory (required by 8.2.17 a/b/c) ---
+    mand = mandatory_off_days(rows)
+    days_off["mandatory_dates"] = sorted(mand)
+    days_off["mandatory_count"] = len(mand)
+
+    # --- TOF time-off blocks: no duty may check in/out within the window ---
+    findings.extend(tof_conflict_check(rows))
+
     return {"counts": counts, "cumulative": cumulative, "days_off": days_off, "findings": findings}
 
 
@@ -1933,6 +2132,14 @@ def _duty_cont_chip(sectors):
             else f"<div class='chip chip-cont'>↳ <b>{title}</b></div>")
 
 
+def _off_chip(mand_rules):
+    """DAY OFF chip — mandatory days (required by 8.2.17) are highlighted."""
+    if mand_rules:
+        return (f"<div class='chip chip-off-mand' title='Mandatory — {', '.join(mand_rules)}'>"
+                f"🔴 OFF · MAND</div>")
+    return "<div class='chip chip-off'>🟢 OFF</div>"
+
+
 def build_calendar_html(rows, span=None):
     valid = [r for r in rows if r["DateObj"] is not None]
     if not valid:
@@ -1940,6 +2147,7 @@ def build_calendar_html(rows, span=None):
     # Non-flight duties map onto every day they cover (multi-day HTL / SB / OFF);
     # flights are grouped into DUTIES so a turnaround shows as ONE chip with
     # both legs (e.g. 'UL404/5') instead of only the return leg.
+    mand_map = mandatory_off_days(rows)
     rmap = {}
     for r in rows:
         if not r["DateObj"] or r["Type"] == "FLIGHT":
@@ -1948,7 +2156,7 @@ def build_calendar_html(rows, span=None):
             stn = r["Route"] if r["Route"] != "-" else "Layover"
             chip = f"<div class='chip chip-lay'>🏨 {stn}</div>"
         elif r["Type"] == "DAY OFF":
-            chip = "<div class='chip chip-off'>🟢 OFF</div>"
+            chip = None   # built per-day so mandatory days can be highlighted
         elif r["Type"] == "STANDBY":
             code = r.get("Code") or "SB"
             s0 = r.get("CIdt") or r.get("DEPdt")
@@ -1961,6 +2169,13 @@ def build_calendar_html(rows, span=None):
             chip = f"<div class='chip chip-sby'>⏱ <b>{code}</b>{(' · ' + t) if t else ''}</div>"
         elif r["Type"] == "LEAVE":
             chip = "<div class='chip chip-lay'>🌴 Leave</div>"
+        elif r["Type"] == "TIMEOFF":
+            s0 = r.get("DEPdt") or r.get("CIdt")
+            s1 = r.get("ARRdt") or r.get("COdt")
+            t = ""
+            if isinstance(s0, datetime) and isinstance(s1, datetime):
+                t = f" {s0.strftime('%H:%M')}–{s1.strftime('%H:%M')}"
+            chip = f"<div class='chip chip-tof'>🕓 TOF{t}</div>"
         elif r["Type"] == "DUTY":
             chip = f"<div class='chip chip-duty'>📚 {r.get('Code') or 'Duty'}</div>"
         else:
@@ -1969,7 +2184,10 @@ def build_calendar_html(rows, span=None):
         d1 = r["EndDateObj"].date() if r.get("EndDateObj") else d0
         d = d0
         while d <= d1:
-            rmap.setdefault(d, []).append(chip)
+            if chip is None:
+                rmap.setdefault(d, []).append(_off_chip(mand_map.get(d)))
+            else:
+                rmap.setdefault(d, []).append(chip)
             d += timedelta(days=1)
     for grp in _calendar_duties(rows):
         first, last = grp[0], grp[-1]
@@ -2018,7 +2236,15 @@ def build_calendar_html(rows, span=None):
         cells.append(f"<div class='{cls}'><div class='cal-date'>{d.day} {d.strftime('%b') if d.day == 1 or d == start else ''}</div>{''.join(chips)}</div>")
         d += timedelta(days=1)
     cells.append("</div>")
-    return "".join(cells)
+    legend = (
+        "<div style='margin-top:8px;font-size:11px;color:#7e8ba0;'>"
+        "<span class='chip chip-off-mand' style='display:inline-block;margin:0 4px 0 0;'>🔴 OFF · MAND</span>"
+        "= required by §8.2.17 (7-day duty cap / 2-off-in-14 / 7-off-in-28) &nbsp;·&nbsp; "
+        "<span class='chip chip-off' style='display:inline-block;margin:0 4px 0 0;'>🟢 OFF</span>"
+        "= discretionary &nbsp;·&nbsp; "
+        "<span class='chip chip-tof' style='display:inline-block;margin:0 4px 0 0;'>🕓 TOF</span>"
+        "= time off (no check-in/check-out allowed in the window)</div>")
+    return "".join(cells) + legend
 
 
 # --- 3.7 SALARY ENGINE (ported from the FAU sheet formulas + code.gs) ---
@@ -2296,6 +2522,8 @@ st.markdown("""
     .chip-flt { background:#0d3340; color:#4dd0e1; }
     .chip-lay { background:#33260f; color:#ffb74d; }
     .chip-off { background:#12301f; color:#66bb6a; }
+    .chip-off-mand { background:#3a1220; color:#ff8a8a; border:1px solid #ff5252; }
+    .chip-tof { background:#1a2233; color:#90a4c8; border:1px dashed #3d4d6b; }
     .chip-sby { background:#251a38; color:#b39ddb; }
     .chip-duty { background:#1c2333; color:#9fb3c8; }
     .chip-none { background:transparent; color:#3b4a5e; }
@@ -2468,16 +2696,30 @@ else:
                         f"<div style='color:#ff8a8a;font-weight:700;'>{len(fviol)} FDP breach(es)</div>"
                         + (f"<div class='muted' style='font-size:11px;'>{len(fnote)} note(s)</div>" if fnote else "") +
                         "</div>", unsafe_allow_html=True)
+                do = fdp["days_off"]
+                if do["off_rest_bad"]:
+                    off_rest_txt = f"{do['off_rest_bad']} fail"
+                elif do["off_rest_notes"]:
+                    off_rest_txt = f"OK · {do['off_rest_notes']} unverified"
+                else:
+                    off_rest_txt = "all OK"
+                mand_dates = do.get("mandatory_dates", [])
+                mand_txt = f"{do['mandatory_count']} of {do['off_days']}"
+                mand_line = (", ".join(d.strftime("%d %b") for d in mand_dates)
+                             if mand_dates else "none individually required")
                 rows_html = (
                     f"<div class='bidrow'><span>Early / Late / Night</span><span>{cnt['early']} / {cnt['late']} / {cnt['night']}</span></div>"
                     f"<div class='bidrow'><span>7-day max (cap 60 h)</span><span>{_fmt_hm(cum['7d']['max'])}</span></div>"
                     f"<div class='bidrow'><span>14-day max (cap 105 h)</span><span>{_fmt_hm(cum['14d']['max'])}</span></div>"
                     f"<div class='bidrow'><span>28-day max (cap 210 h)</span><span>{_fmt_hm(cum['28d']['max'])}</span></div>"
-                    f"<div class='bidrow'><span>Days off · longest duty streak</span><span>{fdp['days_off']['off_days']} · {fdp['days_off']['max_duty_run']}d</span></div>"
+                    f"<div class='bidrow'><span>Days off · longest duty streak</span><span>{do['off_days']} · {do['max_duty_run']}d</span></div>"
+                    f"<div class='bidrow'><span>Off-day rest (≥34h · 2 nights)</span><span>{off_rest_txt}</span></div>"
+                    f"<div class='bidrow'><span>Mandatory days off (8.2.17)</span><span>{mand_txt}</span></div>"
                 )
                 st.markdown(
                     f"<div class='card'>{rows_html}"
-                    f"<div class='muted' style='font-size:11px;margin-top:4px;'>standby & duty days counted in full</div></div>",
+                    f"<div class='muted' style='font-size:11px;margin-top:4px;'>standby & duty days counted in full</div>"
+                    f"<div class='muted' style='font-size:11px;margin-top:2px;'>mandatory: {mand_line}</div></div>",
                     unsafe_allow_html=True)
                 for sev, msg in fdp["findings"]:
                     if sev == "violation":
@@ -3318,8 +3560,10 @@ else:
 - You must have **2 consecutive days off in every 14 days** — so by the **13th/14th day** of any stretch you
   must have had a 2-day-off block.
 - At least **7 days off in every 4 weeks**, and an **average of 8 days off per 4-week period** over three periods.
-
-**Standby & positioning**
+- The dashboard checks **every day off** against the 34 h / 2-local-night rule, and highlights the **mandatory** days
+  off (🔴 OFF · MAND = required by the rules above; 🟢 OFF = discretionary) right on the calendar.
+- **TOF = time off** — a protected window (e.g. 14:00–20:00), *not* a day off. It doesn't count toward your days off,
+  but **no duty may check in or check out during it** — the dashboard flags any flight that does.
 - **Standby** — you're on call, not off duty; it **counts in full** toward your cumulative totals.
 - **Positioning (deadheading)** — flying as a passenger at the company's request. It's duty time, but **not a sector**.
 
