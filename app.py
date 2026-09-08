@@ -278,6 +278,30 @@ def merged_history_rows(username, current_rows):
     out.sort(key=lambda r: r["DateObj"] or datetime.min)
     return out
 
+
+def calendar_rows(username, current_rows):
+    """Rows for the CALENDAR view: the current published roster as-is (unclipped,
+    so an adjacent-period tail day still shows) plus each FINALIZED past period's
+    performed rows (clipped to its period). The current period always comes from
+    the live roster, never from a finalized duplicate. Monitoring & Intel stay
+    on the current roster only — this is purely for calendar display."""
+    out = []
+    cur_start = None
+    if current_rows:
+        dates = [r["DateObj"].date() for r in current_rows if r.get("DateObj")]
+        if dates:
+            cur_start = roster_period_of_roster(dates)
+    hist = load_roster_history(username)
+    for h in hist:
+        if not h["finalized"] or not h["performed_text"] or h["period_start"] is None:
+            continue
+        if cur_start is not None and h["period_start"] == cur_start:
+            continue   # current period is shown live from the published roster
+        out += _rows_in_period(parse_roster_text(h["performed_text"]), h["period_start"])
+    out += list(current_rows)
+    out.sort(key=lambda r: r["DateObj"] or datetime.min)
+    return out
+
 def save_profile(username, data):
     conn = sqlite3.connect('crew_companion.db')
     c = conn.cursor()
@@ -3237,10 +3261,14 @@ else:
                     else:
                         st.warning("Paste the performed roster text first.")
 
-            # 28-day roster period navigation (anchored 13 Jul 2026: 07 Sep–04 Oct is current)
-            if valid_dates_all:
-                pmin = roster_period_bounds(min(valid_dates_all))[0]
-                pmax = roster_period_bounds(max(valid_dates_all))[0]
+            # 28-day roster period navigation (anchored 13 Jul 2026: 07 Sep–04 Oct is current).
+            # Calendar shows the current roster + finalized performed periods, so the
+            # nav range extends back over the archived periods too.
+            cal_rows = calendar_rows(st.session_state['username'], parsed_rows)
+            cal_dates = [r["DateObj"].date() for r in cal_rows if r["DateObj"] is not None]
+            if cal_dates:
+                pmin = roster_period_bounds(min(cal_dates))[0]
+                pmax = roster_period_bounds(max(cal_dates))[0]
                 periods, p = [], pmin
                 while p <= pmax:
                     # (start, last_day) — inclusive 28-day span for the calendar
@@ -3248,17 +3276,17 @@ else:
                     p += timedelta(days=ROSTER_PERIOD_DAYS)
                 starts = [x[0] for x in periods]
                 t0 = roster_period_bounds(datetime.now().date())[0]
-                if 'cal_period_idx' not in st.session_state or st.session_state['cal_period_idx'] >= len(periods):
-                    st.session_state['cal_period_idx'] = starts.index(t0) if t0 in starts else 0
-                idx = st.session_state['cal_period_idx']
+                if 'cal_period_sel' not in st.session_state or st.session_state['cal_period_sel'] not in starts:
+                    st.session_state['cal_period_sel'] = t0 if t0 in starts else starts[0]
+                idx = starts.index(st.session_state['cal_period_sel'])
                 nav1, nav2, nav3 = st.columns([1, 4, 1])
                 with nav1:
                     if st.button("‹", use_container_width=True, disabled=idx == 0):
-                        st.session_state['cal_period_idx'] -= 1
+                        st.session_state['cal_period_sel'] = starts[idx - 1]
                         st.rerun()
                 with nav3:
                     if st.button("›", use_container_width=True, disabled=idx == len(periods) - 1):
-                        st.session_state['cal_period_idx'] += 1
+                        st.session_state['cal_period_sel'] = starts[idx + 1]
                         st.rerun()
                 with nav2:
                     p0, p1 = periods[idx]
@@ -3267,7 +3295,7 @@ else:
             else:
                 sel_span = None
 
-            st.markdown(f"<div class='card'>{build_calendar_html(parsed_rows, span=sel_span)}</div>", unsafe_allow_html=True)
+            st.markdown(f"<div class='card'>{build_calendar_html(cal_rows, span=sel_span)}</div>", unsafe_allow_html=True)
 
             # Flight & Layover Intel — one selector for every duty AND layover
             intel_items = []   # (kind, payload, label)
