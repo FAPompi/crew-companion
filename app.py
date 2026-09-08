@@ -1552,7 +1552,10 @@ def compute_fatigue(rows):
 
     bad_rest = 0
     for i, du in enumerate(ordered):
-        tz_cross = any(abs(AIRPORT_OFFSET_H.get(s["o"], 5.5) - AIRPORT_OFFSET_H.get(s["d"], 5.5)) > 2
+        # "long flights crossing MANY time zones" (§8.5) — only count a
+        # crossing beyond 4h of offset difference (long-haul). NOTE: this
+        # threshold is fatigue-only; acclimatization stays at 2h per the FOM.
+        tz_cross = any(abs(AIRPORT_OFFSET_H.get(s["o"], 5.5) - AIRPORT_OFFSET_H.get(s["d"], 5.5)) > 4
                        for s in du["sectors"])
         if not tz_cross or i + 1 >= len(ordered):
             continue
