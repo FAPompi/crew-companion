@@ -1148,25 +1148,56 @@ def fetch_live_flight_telemetry(flight_no, flight_date, route, scheduled_dep):
             res["inbound_risk"] = risk
     return res
 
-def rest_impact_note(rows, flight_no, fdate, delay_mins):
-    """If a monitored flight is running late, recompute the rest period before
-    the NEXT duty and flag if it drops below MIN_REST_HOURS. Turnaround legs
-    (e.g. UL404/UL405 = one duty) are NOT a rest boundary — the 17h30m minimum
-    only applies between separate duties (and standby/duty reports)."""
-    if not delay_mins or delay_mins <= 0:
+def _roster_acclimatized(rows, report_dt, away_origin=None):
+    """Best-effort acclimatization state just before `report_dt`, from roster
+    history. A layover at a station > 2h off CMB de-acclimatizes; the crew
+    re-acclimatizes after 3 consecutive local nights at CMB (counted from the
+    return-leg arrival). A duty reporting from an outstation > 2h off CMB is
+    also not acclimatized. Defaults to acclimatized when history is thin."""
+    if away_origin:
+        off = AIRPORT_OFFSET_H.get(away_origin, 5.5)
+        if abs(off - 5.5) > 2:
+            return False
+    latest_return = None
+    for i, r in enumerate(rows):
+        if r["Type"] != "LAYOVER":
+            continue
+        stn = (r.get("Route") or "").strip()
+        off = AIRPORT_OFFSET_H.get(stn, 5.5)
+        if abs(off - 5.5) <= 2:
+            continue  # within the 2h zone → stays acclimatized
+        ret_arr = None
+        for j in range(i + 1, len(rows)):
+            nr = rows[j]
+            if nr["Type"] == "FLIGHT" and isinstance(nr.get("ARRdt"), datetime):
+                o, d = _route_od(nr.get("Route"))
+                if d == "CMB":
+                    ret_arr = nr["ARRdt"]
+                break
+        if isinstance(ret_arr, datetime) and ret_arr <= report_dt:
+            latest_return = ret_arr if latest_return is None else max(latest_return, ret_arr)
+    if latest_return is None:
+        return True
+    return _count_local_nights(latest_return, report_dt) >= 3
+
+
+def _preceding_rest_h(rows, report_dt):
+    """Rest (hours) before `report_dt`, from the last duty end in the roster."""
+    prev_end = None
+    for r in rows:
+        if r["Type"] in ("FLIGHT", "STANDBY", "DUTY"):
+            e = r.get("COdt") or r.get("ARRdt")
+            if isinstance(e, datetime) and e <= report_dt:
+                prev_end = e if prev_end is None else max(prev_end, e)
+    if prev_end is None:
         return None
-    duties = build_duties(rows)
-    fkey = flight_no.replace(" ", "")
-    duty = next((du for du in duties
-                 if any(s["flight"].replace(" ", "") == fkey and isinstance(s.get("dep"), datetime)
-                        and s["dep"].date() == fdate for s in du["sectors"])), None)
-    if duty is None:
-        return None
-    chocks = duty["chocks_on"]
-    if not isinstance(chocks, datetime):
-        return None
+    return max(0.0, (report_dt - prev_end).total_seconds() / 3600)
+
+
+def _next_report(rows, duties, after_dt):
+    """Next report time (duty check-in or standby start) strictly after after_dt."""
     cands = [{"dt": du["report"], "label": du["label"]} for du in duties
-             if isinstance(du.get("report"), datetime) and du["report"] > chocks]
+             if isinstance(du.get("report"), datetime) and du["report"] > after_dt]
     for sb in rows:
         if sb["Type"] != "STANDBY":
             continue
@@ -1176,18 +1207,75 @@ def rest_impact_note(rows, flight_no, fdate, delay_mins):
                 sdt = datetime.combine(sb["DateObj"].date(), datetime.strptime(sb["Departure"], "%H:%M").time())
             except ValueError:
                 sdt = None
-        if isinstance(sdt, datetime) and sdt > chocks:
+        if isinstance(sdt, datetime) and sdt > after_dt:
             cands.append({"dt": sdt, "label": f"Standby {sb.get('Code') or ''}".strip()})
-    if not cands:
+    return min(cands, key=lambda c: c["dt"]) if cands else None
+
+
+def delay_impact_note(rows, flight_no, fdate, delay_mins):
+    """FDP impact of a delay once the crew has reported (8.2.6 reported-then-
+    delayed). The FDP clock runs from check-in to the duty's FINAL on-chock, so a
+    delay on any sector (e.g. outbound UL404) pushes the return leg (UL405) later
+    and can exceed the duty's maximum FDP. The 17h30m rest guideline is checked
+    only AFTER the duty ends, against the next report."""
+    if not delay_mins or delay_mins <= 0:
         return None
-    nxt = min(cands, key=lambda c: c["dt"])
-    rest0 = (nxt["dt"] - chocks).total_seconds() / 3600
-    new_rest = rest0 - delay_mins / 60
-    if new_rest >= MIN_REST_HOURS:
-        return (f"🛏 Rest impact: {rest0:.1f}h → {new_rest:.1f}h before {nxt['label']} — "
-                f"rest NOT affected (min 17h30m).")
-    return (f"🛏 Rest impact: {rest0:.1f}h → {new_rest:.1f}h before {nxt['label']} — "
-            f"BELOW the 17h30m FAU MINIMUM. Contact crew control; report/pickup time must shift.")
+    duties = build_duties(rows)
+    fkey = flight_no.replace(" ", "")
+    duty = next((du for du in duties
+                 if any(s["flight"].replace(" ", "") == fkey and isinstance(s.get("dep"), datetime)
+                        and s["dep"].date() == fdate for s in du["sectors"])), None)
+    if duty is None:
+        return None
+    report, end = duty["report"], duty["chocks_on"]
+    if not isinstance(report, datetime) or not isinstance(end, datetime) or end <= report:
+        return None
+    n = len(duty["sectors"])
+    first_dep = duty["sectors"][0].get("dep")
+    band = fdp_band((first_dep - timedelta(hours=1)).time()) if isinstance(first_dep, datetime) else "0600-0759"
+    acclim = _roster_acclimatized(rows, report, away_origin=duty.get("origin"))
+    prec_rest = _preceding_rest_h(rows, report) if not acclim else None
+    max_fdp = fdp_limit_min(acclim, band, n, prec_rest)
+    delayed_end = end + timedelta(minutes=delay_mins)
+    fdp_del = int((delayed_end - report).total_seconds() // 60)
+    idx = next((i for i, s in enumerate(duty["sectors"])
+                if s["flight"].replace(" ", "") == fkey), 0)
+    rest_sectors = duty["sectors"][idx + 1:]
+    remaining = "/".join(s["flight"].replace(" ", "") for s in rest_sectors)
+    over = fdp_del - max_fdp
+    lines = []
+    if over > 0:
+        if remaining:
+            verb = (f"Operating <b>{remaining}</b> would exceed the duty FDP by {_fmt_hm(over)} "
+                    "— do not operate; replan / crew replacement required.")
+        else:
+            verb = (f"the duty would exceed its maximum by {_fmt_hm(over)} "
+                    "— do not depart; replan / crew replacement required.")
+        lines.append(
+            f"⚠️ <b>FDP impact:</b> a {delay_mins} min delay on {fkey} pushes this duty to "
+            f"{_fmt_hm(fdp_del)} (check-in {report:%H:%M} → final on-chock {delayed_end:%H:%M}) "
+            f"but the maximum is {_fmt_hm(max_fdp)} (Table {'A' if acclim else 'B'}, band {band}, "
+            f"{n} sector(s)). {verb}")
+    else:
+        spare_txt = f"{remaining} can still be operated" if remaining else "the duty still ends within FDP"
+        lines.append(
+            f"✅ <b>FDP impact:</b> a {delay_mins} min delay extends this duty to "
+            f"{_fmt_hm(fdp_del)} (final on-chock {delayed_end:%H:%M}) vs a {_fmt_hm(max_fdp)} maximum "
+            f"(Table {'A' if acclim else 'B'}) — {_fmt_hm(-over)} to spare, {spare_txt}.")
+    nxt = _next_report(rows, duties, delayed_end)
+    if nxt is not None:
+        rest = (nxt["dt"] - delayed_end).total_seconds() / 3600
+        if rest < MIN_REST_HOURS:
+            lines.append(
+                f"🛏 After this duty, rest before <b>{nxt['label']}</b> drops to {rest:.1f}h — "
+                f"BELOW the 17h30m FAU minimum.")
+        else:
+            lines.append(
+                f"🛏 Rest after this duty before <b>{nxt['label']}</b>: {rest:.1f}h (min 17h30m) — OK.")
+    lines.append(
+        "ℹ️ If the delay was announced <b>before</b> you reported, it is delayed reporting (8.2.6): "
+        "your report time shifts and the FDP clock starts at the new report time — this check does not apply.")
+    return "<br>".join(lines)
 
 
 def suggest_standby_for_cancel(row):
@@ -2906,15 +2994,15 @@ else:
                     for flight in active_target_flights:
                         telemetry = fetch_live_flight_telemetry(flight["flight_no"], flight["date_obj"],
                                                                 flight["route"], flight["dep_time"])
-                        # Rest-period impact for delayed/diverted flights
-                        rest_note = None
+                        # FDP & rest impact for delayed/diverted flights
+                        impact_note = None
                         if telemetry.get("severity") in ("delayed", "diverted"):
                             delay_guess = None
                             m = re.search(r'by ~(\d+) min', telemetry.get("status_message", ""))
                             if m:
                                 delay_guess = int(m.group(1))
-                            rest_note = rest_impact_note(parsed_rows, flight["flight_no"],
-                                                         flight["date_obj"], delay_guess or 0)
+                            impact_note = delay_impact_note(parsed_rows, flight["flight_no"],
+                                                            flight["date_obj"], delay_guess or 0)
                         # Cancellation → soft standby suggestion (roster unchanged)
                         sb_suggest = None
                         if telemetry.get("severity") == "cancelled":
@@ -2931,7 +3019,7 @@ else:
                                                      "status": telemetry["status_message"],
                                                      "inbound_note": telemetry.get("inbound_note"),
                                                      "inbound_risk": telemetry.get("inbound_risk", False),
-                                                     "rest_note": rest_note,
+                                                     "impact_note": impact_note,
                                                      "sb_suggest": sb_suggest})
             st.session_state['alert_count'] = sum(
                 1 for f in flight_check_results
@@ -2964,12 +3052,12 @@ else:
                         inb_bc = "#ff6d00" if df["inbound_risk"] else "#ffc107"
                         extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#2b2413;"
                                   f"border:1px solid {inb_bc};color:#ffd54f;font-size:11.5px;'>{df['inbound_note']}</div>")
-                    if df.get("rest_note"):
-                        rest_bad = "BELOW" in df["rest_note"]
-                        r_bc = "#ff5252" if rest_bad else "#4caf50"
-                        r_tc = "#ff8a8a" if rest_bad else "#a5d6a7"
+                    if df.get("impact_note"):
+                        impact_bad = ("⚠️" in df["impact_note"]) or ("BELOW" in df["impact_note"])
+                        r_bc = "#ff5252" if impact_bad else "#4caf50"
+                        r_tc = "#ff8a8a" if impact_bad else "#a5d6a7"
                         extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#131f2b;"
-                                  f"border:1px solid {r_bc};color:{r_tc};font-size:11.5px;'>{df['rest_note']}</div>")
+                                  f"border:1px solid {r_bc};color:{r_tc};font-size:11.5px;'>{df['impact_note']}</div>")
                     if df.get("sb_suggest"):
                         extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#2b2413;"
                                   f"border:1px solid #ffc107;color:#ffd54f;font-size:11.5px;'>"
@@ -3575,6 +3663,10 @@ else:
   **one third** (max 16 h cabin).
 - **Delayed reporting** — if told *before leaving rest*: delay **under 4 h** \u2192 max FDP from the original report band;
   delay **4 h or more** \u2192 the more limiting band, and the FDP clock starts 4 h after the original report time.
+- **Delayed after reporting** — once you've reported, the FDP clock runs from check-in to your duty's **final on-chock**.
+  A delay on the outbound leg (e.g. UL404) pushes the return leg (UL405) later, so the Agent Scan checks whether the
+  whole duty would still fit its maximum FDP — and warns *"operating UL405 would exceed the duty FDP"* if not. The
+  17h30m rest rule is only checked **after** the duty ends, before the next report (never mid-turnaround).
 
 **Annex A B.1 (LHR / CDG / FRA)**
 - CMB\u2013London/CDG/Frankfurt layovers reporting **2200\u20130559** local: max FDP **13:00**, extendable with in-flight
