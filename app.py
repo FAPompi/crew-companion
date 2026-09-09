@@ -4,6 +4,7 @@ import hashlib
 import re
 import json
 import requests
+import pandas as pd
 from datetime import datetime, timedelta, timezone, time as dtime
 
 # --- 0. TIMEZONE HANDLING ---
@@ -184,6 +185,19 @@ def _prev_months(ym, n):
         m -= 1
         if m == 0:
             m, y = 12, y - 1
+    return out
+
+
+def _months_from_2026(upto_ym):
+    """Every (year, month) from January 2026 through upto_ym, oldest first."""
+    y, m = upto_ym
+    out = []
+    cy, cm = 2026, 1
+    while (cy, cm) <= (y, m):
+        out.append((cy, cm))
+        cm += 1
+        if cm == 13:
+            cm, cy = 1, cy + 1
     return out
 
 
@@ -2779,6 +2793,65 @@ def fdp_roster_audit(rows):
     return {"counts": counts, "cumulative": cumulative, "days_off": days_off, "findings": findings}
 
 
+def compute_cumulative_hours(rows):
+    """Rolling 7/14/28-day cumulative duty hours (duty FDPs + standby & ground
+    duty in full, same convention as the FDP audit). Returns
+    {window: {max, date}}."""
+    duties = build_duties(rows)
+    for du in duties:
+        start, end = du["report"], du["chocks_on"]
+        if not isinstance(start, datetime) or not isinstance(end, datetime) or end <= start:
+            end = (start if isinstance(start, datetime) else datetime.now()) + timedelta(minutes=1)
+        du["start"], du["end"] = start, end
+    periods = [{"label": du["label"], "start": du["start"], "end": du["end"],
+                "minutes": int((du["end"] - du["start"]).total_seconds() // 60)} for du in duties]
+    for r in rows:
+        if r["Type"] in ("STANDBY", "DUTY") and r.get("CIdt"):
+            s = r["CIdt"]
+            e = r.get("COdt") or s
+            if not isinstance(e, datetime) or e <= s:
+                e = s + timedelta(minutes=1)
+            periods.append({"label": (r.get("Code") or r["Type"]).strip(), "start": s, "end": e,
+                            "minutes": int((e - s).total_seconds() // 60)})
+    periods.sort(key=lambda p: p["start"])
+    cumulative = {w: {"max": 0, "date": None} for w in ("7d", "14d", "28d")}
+    if periods:
+        anchors = sorted({p["start"].date() for p in periods})
+        for wkey, days in (("7d", 7), ("14d", 14), ("28d", 28)):
+            best, best_date = 0, None
+            for anchor in anchors:
+                lo = anchor - timedelta(days=days - 1)
+                total = sum(p["minutes"] for p in periods if lo <= p["start"].date() <= anchor)
+                if total > best:
+                    best, best_date = total, anchor
+            cumulative[wkey] = {"max": best, "date": best_date}
+    return cumulative
+
+
+def cross_period_cumulative(username, current_rows):
+    """Rolling 60/105/210 cumulative duty hours computed across finalized past
+    periods + the current roster — windows that straddle the 28-day period
+    boundaries a single-period view would miss. Returns
+    {cumulative, findings}."""
+    merged = merged_history_rows(username, current_rows)
+    empty = {w: {"max": 0, "date": None} for w in ("7d", "14d", "28d")}
+    if not merged:
+        return {"cumulative": empty, "findings": []}
+    cumulative = compute_cumulative_hours(merged)
+    findings = []
+    for wkey, limit, cap_txt, soft in (("7d", CUMULATIVE_LIMITS["7d"], "60 h (65 h with delays)", CUMULATIVE_7D_SOFT),
+                                       ("14d", CUMULATIVE_LIMITS["14d"], "105 h", None),
+                                       ("28d", CUMULATIVE_LIMITS["28d"], "210 h", None)):
+        c = cumulative[wkey]
+        if c["max"] > (soft or limit):
+            findings.append(f"Cross-period cumulative: {_fmt_hm(c['max'])} in {wkey.replace('d', '')} days "
+                            f"(ending {c['date']:%d %b}) exceeds the {cap_txt} cap.")
+        elif soft and c["max"] > limit:
+            findings.append(f"Cross-period cumulative: {_fmt_hm(c['max'])} in 7 days (ending {c['date']:%d %b}) "
+                            f"is over 60 h — only OK if caused by unforeseen delays (≤ 65 h).")
+    return {"cumulative": cumulative, "findings": findings}
+
+
 def _duty_chip(sectors):
     """One compact chip per duty: a turnaround collapses to 'UL404/5' with one
     line per sector — route + dep–arr times only (flying time, airport names and
@@ -3420,7 +3493,7 @@ else:
             st.session_state['logged_in'] = False
             st.rerun()
 
-    page_dash, page_salary, page_fdp = st.tabs(["📋 Dashboard", "💰 Salary Calculator", "⏱ FDP Calculator"])
+    page_dash, page_salary, page_analytics, page_fdp = st.tabs(["📋 Dashboard", "💰 Salary Calculator", "📊 Salary Analytics", "⏱ FDP Calculator"])
 
     with page_dash:
         _cur_period = roster_period_of_roster(valid_dates_all) if valid_dates_all else None
@@ -3541,6 +3614,22 @@ else:
                     "<div class='card' style='border-color:#607d8b;color:#9fb3c8;font-size:12.5px;'>"
                     "\u2139\ufe0f No archived roster saved for this period \u2014 finalize it in Roster History to see its FDP stats.</div>",
                     unsafe_allow_html=True)
+
+            # --- cross-period cumulative (60/105/210 across 28-day period boundaries) ---
+            if not viewing_past:
+                xpc = cross_period_cumulative(st.session_state['username'], parsed_rows)
+                xc = xpc["cumulative"]
+                xpc_html = (
+                    f"<div class='bidrow'><span>7-day max (cap 60 h)</span><span>{_fmt_hm(xc['7d']['max'])}</span></div>"
+                    f"<div class='bidrow'><span>14-day max (cap 105 h)</span><span>{_fmt_hm(xc['14d']['max'])}</span></div>"
+                    f"<div class='bidrow'><span>28-day max (cap 210 h)</span><span>{_fmt_hm(xc['28d']['max'])}</span></div>"
+                )
+                st.markdown(
+                    f"<div class='card'><h5>\U0001f517 Cross-period cumulative</h5>{xpc_html}"
+                    f"<div class='muted' style='font-size:11px;margin-top:2px;'>rolling 60/105/210 h across finalized periods + current roster (a window can span two 28-day periods)</div></div>",
+                    unsafe_allow_html=True)
+                for f in xpc["findings"]:
+                    st.markdown(f"<div style='font-size:12px;background:#2c1f1f;border:1px solid #ff5252;color:#ff8a8a;padding:8px;border-radius:8px;margin-bottom:6px;'>\u26a0\ufe0f {f}</div>", unsafe_allow_html=True)
 
             # Estimated allowances: current roster only
             if viewing_past:
@@ -3961,7 +4050,7 @@ else:
             # --- SALARY HISTORY: per-month performed rosters (manual pin, or auto-pull) ---
             salary_months = salary_available_months(st.session_state['username'], parsed_rows)
             today_ym = (datetime.now().year, datetime.now().month)
-            hist_months = sorted(set(_prev_months(today_ym, 24)) | set(salary_months))
+            hist_months = sorted(set(_months_from_2026(today_ym)) | set(salary_months))
             sh = load_salary_history(st.session_state['username'])
             with st.expander("🗓 Salary History (per-month)", expanded=False):
                 st.markdown(
@@ -3991,6 +4080,14 @@ else:
                     delete_salary_history(st.session_state['username'], sh_key)
                     st.success(datetime(sh_pick[0], sh_pick[1], 1).strftime("%B %Y") + " removed from salary history.")
                     st.rerun()
+                if hb3.button("👁 Show", use_container_width=True, key="sh_show"):
+                    _show_rows, _ = salary_month_rows(st.session_state['username'], sh_pick, parsed_rows)
+                    if any(r["Type"] == "FLIGHT" for r in _show_rows):
+                        st.session_state['salary_month_pick'] = datetime(sh_pick[0], sh_pick[1], 1).strftime("%B %Y")
+                        st.rerun()
+                    else:
+                        st.warning(datetime(sh_pick[0], sh_pick[1], 1).strftime("%B %Y")
+                                   + " has no performed data yet — save it here, or finalize that month's periods in the Dashboard's Roster History.")
 
             # --- performed roster input (salary is based on the PERFORMED month, not the live roster) ---
             if 'performed_roster' not in st.session_state:
@@ -4024,8 +4121,11 @@ else:
                     return sum(1 for r in rows if r["Type"] == "FLIGHT")
                 default_ym = max(months, key=lambda ym: (_mcount(ym), ym))   # busiest (most complete) month
                 labels = [datetime(y, m, 1).strftime("%B %Y") for y, m in months]
+                _pick_label = st.session_state.get('salary_month_pick')
+                if _pick_label not in labels:
+                    st.session_state['salary_month_pick'] = labels[months.index(default_ym)]
                 pick = st.selectbox("Salary month (1st – end of month)", labels,
-                                    index=months.index(default_ym))
+                                    key="salary_month_pick")
                 sel_month = months[labels.index(pick)]
                 perf_rows, src = salary_month_rows(st.session_state['username'], sel_month, parsed_rows)
             src_caption = {
@@ -4178,6 +4278,95 @@ else:
                             st.rerun()
 
                 st.markdown("<div class='muted' style='margin-top:8px;'>⚠️ Independent estimate for personal guidance only — refer to your official payslip for final figures.</div>", unsafe_allow_html=True)
+
+    # ================= 📊 SALARY ANALYTICS PAGE =================
+    with page_analytics:
+        st.markdown("#### 📊 Salary Analytics")
+        st.markdown("<div class='muted' style='margin-bottom:10px;'>Every month you have performed data for — assembled from finalized Roster History, saved salary history and the performed-roster slot. Charts use your saved crew profile.</div>", unsafe_allow_html=True)
+
+        a_saved = load_profile(st.session_state['username'])
+        a_prof = {
+            "cat": a_saved.get("cat", "C3") if a_saved.get("cat", "C3") in HOURLY_PAY else "C3",
+            "rate": float(a_saved.get("rate", 318.56) or 318.56),
+            "schblk_min": parse_hhmm_minutes(a_saved.get("schblk", "70h 00m")) or 4200,
+            "festival": bool(a_saved.get("festival", False)),
+            "basic": float(a_saved.get("basic", 0.0) or 0.0),
+            "crge": float(a_saved.get("crge", 10000.0) or 0.0),
+            "transport": float(a_saved.get("transport", 1000.0) or 0.0),
+            "medical": float(a_saved.get("medical", 500.0) or 0.0),
+            "fau": float(a_saved.get("fau", 2100.0) or 0.0),
+            "stamp": float(a_saved.get("stamp", 0.0) or 0.0),
+            "apiit": float(a_saved.get("apiit", 0.0) or 0.0),
+            "epf_pct": float(a_saved.get("epf_pct", 10.0) or 10.0),
+            "fbpp_overrides": a_saved.get("fbpp_overrides", {}) or {},
+        }
+        a_months = salary_available_months(st.session_state['username'], parsed_rows)
+        if not a_months:
+            st.info("No salary months yet — finalize past rosters in the Dashboard's Roster History, or save months in the Salary Calculator.")
+        else:
+            a_rows = []
+            for _ym in a_months:
+                _mrows, _src = salary_month_rows(st.session_state['username'], _ym, parsed_rows)
+                if not any(r["Type"] == "FLIGHT" for r in _mrows):
+                    continue
+                _s = compute_salary(_mrows, a_prof)
+                _n = sum(1 for r in _mrows if r["Type"] == "FLIGHT")
+                a_rows.append({
+                    "Month": datetime(_ym[0], _ym[1], 1).strftime("%b %y"),
+                    "Net (Rs)": round(_s["net"], 2),
+                    "Earnings (Rs)": round(_s["earnings"], 2),
+                    "Productivity (Rs)": round(_s["productivity_rs"], 2),
+                    "Premium (Rs)": round(_s["premium"], 2),
+                    "FBPP (Rs)": round(_s["fbpp_rs"], 2),
+                    "Acting (Rs)": round(_s["act_pay_rs"], 2),
+                    "Block hours": round(_s["block_min"] / 60, 2),
+                    "Meals ($)": _s["meal_usd"],
+                    "Layover ($)": _s["on_usd"],
+                    "T/A ($)": _s["ta_on_usd"],
+                    "Allowance ($)": _s["allow_usd_total"],
+                    "Sectors": _n,
+                    "Layover nights": _s["l_nights"],
+                    "Source": {"manual": "pinned", "history": "auto", "slot": "slot", "current": "live"}.get(_src, _src),
+                })
+            if not a_rows:
+                st.info("No complete months with flights found yet.")
+            else:
+                a_df = pd.DataFrame(a_rows)
+                a_df["Month"] = pd.Categorical(a_df["Month"], categories=[r["Month"] for r in a_rows], ordered=True)
+                a_df = a_df.sort_values("Month")
+
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    st.metric("Months tracked", len(a_df))
+                with c2:
+                    st.metric("Best month (net)", a_df.loc[a_df["Net (Rs)"].idxmax(), "Month"])
+                with c3:
+                    st.metric("Avg net / month", f"Rs {a_df['Net (Rs)'].mean():,.0f}")
+                with c4:
+                    st.metric("Total net", f"Rs {a_df['Net (Rs)'].sum():,.0f}")
+
+                st.markdown("##### Net salary by month")
+                st.bar_chart(a_df.set_index("Month")[["Net (Rs)"]], height=260)
+
+                st.markdown("##### Earnings composition (Rs)")
+                st.bar_chart(a_df.set_index("Month")[["Productivity (Rs)", "Premium (Rs)", "FBPP (Rs)", "Acting (Rs)"]], height=280)
+
+                st.markdown("##### Block hours & sectors")
+                st.line_chart(a_df.set_index("Month")[["Block hours", "Sectors"]], height=260)
+
+                st.markdown("##### Allowances (USD)")
+                st.bar_chart(a_df.set_index("Month")[["Meals ($)", "Layover ($)", "T/A ($)"]], height=260)
+
+                if len(a_df) >= 2:
+                    a_df["Δ Net (Rs)"] = a_df["Net (Rs)"].diff()
+                    st.markdown("##### Month-over-month net change (Rs)")
+                    st.bar_chart(a_df.set_index("Month")[["Δ Net (Rs)"]], height=240)
+
+                st.markdown("##### Monthly comparison")
+                show_cols = ["Month", "Net (Rs)", "Block hours", "Sectors", "Layover nights",
+                             "Allowance ($)", "Source"]
+                st.dataframe(a_df[show_cols].set_index("Month"))
+                st.markdown("<div class='muted' style='margin-top:8px;'>⚠️ Estimate from your saved profile & rostered times — refer to official payslips for final figures.</div>", unsafe_allow_html=True)
 
     # ================= \u23f1 FDP CALCULATOR PAGE =================
     with page_fdp:
