@@ -252,8 +252,8 @@ def _full_month_days(y, m):
 
 def _finalized_performed_rows(username, current_rows):
     """Finalized performed rows from PAST roster_history periods, clipped to
-    their 28-day periods and date-sorted. The current period is excluded — it
-    stays on the live published roster until it ends, so it must never feed a
+    their 28-day periods and date-sorted. The live/current period is excluded —
+    it stays on the published roster until it ends, so it must never feed a
     salary month."""
     cur_start = None
     if current_rows:
@@ -272,9 +272,10 @@ def _finalized_performed_rows(username, current_rows):
 
 
 def _month_full_performed_coverage(username, current_rows, y, m):
-    """True when finalized PAST roster periods collectively cover every day of
-    the calendar month. The current (still-live) period is excluded, so a month
-    that would need the live roster never counts as covered."""
+    """True when finalized roster periods collectively cover every day of the
+    calendar month by their 28-day spans (an off day with no row still counts
+    as covered by the period it sits inside). The live/current period is
+    excluded, so a month that would need the still-live roster never counts."""
     cur_start = None
     if current_rows:
         dates = [r["DateObj"].date() for r in current_rows if r.get("DateObj")]
@@ -300,27 +301,32 @@ def _month_full_performed_coverage(username, current_rows, y, m):
 
 
 def salary_month_rows(username, ym, current_rows):
-    """Rows to compute salary for a calendar month — ONLY when a FULL performed
-    month (1st through the last day) is available. By precedence:
-    1) a manual salary_history entry for that exact month (trusted — it is
-       pinned per-month by the user as a whole month);
+    """Rows to compute salary for a calendar month — ONLY when the month has
+    ENDED and a FULL performed month (1st through the last day) is available.
+    By precedence:
+    1) a manual salary_history entry for that exact month (trusted — pinned
+       per-month by the user as a whole month);
     2) finalized roster_history performed rows, but only if the finalized
        periods fully cover the calendar month (no merge with the live/current
        roster — a half-month or in-progress month is excluded);
-    3) the salary tab's performed-roster slot, only if it too covers the full
+    3) the salary tab's performed-roster slot, only if it covers the full
        month day-for-day.
-    Anything less than a full month returns ([], "none") so the UI shows
-    "no data" instead of silently computing from the wrong roster.
-    Returns (rows, source) where source ∈ {manual, history, slot, none}."""
+    An in-progress (or future) month returns ([], "ongoing") so the UI shows
+    "still in progress" instead of silently computing from a partial roster.
+    Returns (rows, source) where source ∈ {manual, history, slot, none, ongoing}."""
+    y, m = ym
+    now = datetime.now()
+    if (y, m) >= (now.year, now.month):
+        return [], "ongoing"       # month still in progress — no full performed month exists yet
     key = _month_key(ym)
     sh = load_salary_history(username)
     if key in sh and sh[key]["text"].strip():
         return _clip_rows_to_month(parse_roster_text(sh[key]["text"]), ym), "manual"
-    if _month_full_performed_coverage(username, current_rows, *ym):
+    if _month_full_performed_coverage(username, current_rows, y, m):
         hist = _clip_rows_to_month(_finalized_performed_rows(username, current_rows), ym)
         if any(r["Type"] == "FLIGHT" for r in hist):
             return hist, "history"
-    need = _full_month_days(*ym)
+    need = _full_month_days(y, m)
     slot = _clip_rows_to_month(parse_roster_text(load_performed_roster(username)), ym)
     if need <= {r["DateObj"].date() for r in slot if r.get("DateObj")} \
             and any(r["Type"] == "FLIGHT" for r in slot):
@@ -3912,7 +3918,8 @@ else:
             st.markdown("#### Main Roster Calendar View")
             with st.expander("📝 Paste Roster (Instant Parse)"):
                 roster_input = st.text_area("Paste Raw Roster Here", value=st.session_state['current_roster'], height=120)
-                if st.button("Auto-Process Roster"):
+                rp1, rp2 = st.columns([2, 1])
+                if rp1.button("Auto-Process Roster", use_container_width=True):
                     if roster_input.strip():
                         save_roster_to_db(st.session_state['username'], roster_input)
                         st.session_state['current_roster'] = roster_input
@@ -3920,6 +3927,12 @@ else:
                         st.rerun()
                     else:
                         st.warning("Please paste roster text.")
+                if rp2.button("🗑 Clear roster", use_container_width=True):
+                    save_roster_to_db(st.session_state['username'], '')
+                    st.session_state['current_roster'] = ''
+                    st.session_state.pop('cal_period_sel', None)
+                    st.success("Roster cleared — paste your real roster to replace it.")
+                    st.rerun()
 
             # ---------- ROSTER HISTORY: finalize ended periods ----------
             if valid_dates_all:
@@ -3953,60 +3966,53 @@ else:
                             else:
                                 st.warning("Paste the performed roster text first.")
 
-            # Roster history view + finalize ANY period (current or past)
+            # Roster history — paste & finalize (period auto-detected), list & delete
             with st.expander("🗂 Roster History"):
                 hist_rows = load_roster_history(st.session_state['username'])
-                now_ref = (roster_period_of_roster(valid_dates_all) if valid_dates_all
-                           else roster_period_bounds(datetime.now().date())[0])
-                # PAST periods only — the current period stays as the published
-                # roster until its period ends (finalized via the end-of-period
-                # banner above), so it can never shadow the live fatigue /
-                # intel / monitoring data.
-                avail = [now_ref - timedelta(days=ROSTER_PERIOD_DAYS * k) for k in range(1, 5)]
-                for h in hist_rows:
-                    if h["period_start"] and h["period_start"] != now_ref and h["period_start"] not in avail:
-                        avail.append(h["period_start"])
-                avail = sorted(set(avail), reverse=True)   # newest first
+                st.markdown(
+                    "<div class='muted' style='margin-bottom:8px;'>Paste your <b>performed</b> rosters (portal's performed view) below — the 28-day period is <b>auto-detected</b> from the dates you paste, so there's nothing to select. Every saved period is listed with a 🗑 to delete it. These performed rosters feed the 8.2.17(d) average &amp; rolling checks and, once a full 1st–end calendar month is performed, the Salary Calculator. Periods before 2026 are auto-removed.</div>",
+                    unsafe_allow_html=True)
 
-                st.markdown("<div class='muted' style='margin-bottom:6px;'>Paste your <b>performed</b> rosters (portal's performed view) for <b>past</b> periods here — the 8.2.17(d) 3-period average and rolling checks use these, not the published plan. The period is <b>auto-detected</b> from the dates you paste, so a stray pattern lands under its real period (marked ⚠️ partial) and can be selected &amp; deleted. The current period is kept as the published roster above and is finalized automatically when it ends. Periods before 2026 are auto-removed.</div>", unsafe_allow_html=True)
-
-                def _summarize(s):
-                    """One-line status for a period: finalized/partial + row count
-                    + the date span its saved text actually covers."""
-                    h = next((x for x in hist_rows if x["period_start"] == s), None)
-                    if not h or not (h["performed_text"] or "").strip():
-                        return "—"
+                def _summarize(h):
+                    if not (h["performed_text"] or "").strip():
+                        return "saved, no performed text"
                     rows = parse_roster_text(h["performed_text"])
                     dates = [r["DateObj"].date() for r in rows if r.get("DateObj")]
                     days = len(set(dates))
                     span = (f"{min(dates).strftime('%d %b')}–{max(dates).strftime('%d %b')}"
                             if dates else "no dates")
-                    if 0 < days < 14:
-                        tag = "⚠️ partial"
-                    else:
-                        tag = "✅ finalized" if h["finalized"] else "⏳ not finalized"
+                    tag = "⚠️ partial" if 0 < days < 14 else ("✅ finalized" if h["finalized"] else "⏳ not finalized")
                     return f"{tag} · {len(rows)} row(s) · {span}"
 
-                for s in avail:
-                    last = s + timedelta(days=ROSTER_PERIOD_DAYS - 1)
-                    st.markdown(
-                        f"<div class='bidrow'><span>{s.strftime('%d %b')} – {last.strftime('%d %b %Y')}</span>"
-                        f"<span>{_summarize(s)}</span></div>", unsafe_allow_html=True)
+                saved = sorted([h for h in hist_rows if h["period_start"] is not None
+                                and ((h["performed_text"] or "").strip()
+                                     or (h["published_text"] or "").strip())],
+                               key=lambda h: h["period_start"], reverse=True)
+                if saved:
+                    for h in saved:
+                        s = h["period_start"]
+                        last = s + timedelta(days=ROSTER_PERIOD_DAYS - 1)
+                        sc1, sc2 = st.columns([6, 1])
+                        with sc1:
+                            st.markdown(
+                                f"<div class='bidrow'><span>{s.strftime('%d %b')} – {last.strftime('%d %b %Y')}</span>"
+                                f"<span>{_summarize(h)}</span></div>", unsafe_allow_html=True)
+                        with sc2:
+                            if st.button("🗑", key=f"hist_del_{s.strftime('%Y%m%d')}",
+                                         help=f"Delete the {s.strftime('%d %b')} period"):
+                                delete_roster_history(st.session_state['username'], s)
+                                st.session_state.pop('cal_period_sel', None)
+                                st.success(f"Period {s.strftime('%d %b')} deleted from Roster History.")
+                                st.rerun()
+                else:
+                    st.markdown("<div class='muted' style='margin-bottom:8px;'>No saved periods yet.</div>",
+                                unsafe_allow_html=True)
 
-                sel_start = st.selectbox(
-                    "Finalize which period?",
-                    avail,
-                    format_func=lambda s: (s.strftime('%d %b') + " – " +
-                                           (s + timedelta(days=ROSTER_PERIOD_DAYS - 1)).strftime('%d %b %Y') +
-                                           "  ·  " + _summarize(s)),
-                    key="history_sel_period")
-                tgt = next((h for h in hist_rows if h["period_start"] == sel_start), None)
                 man_in = st.text_area(
-                    "Performed roster text (this period)",
-                    value=(tgt["performed_text"] if tgt else ""), height=140,
-                    key=f"hist_perf_{sel_start.strftime('%Y%m%d')}")
+                    "Paste performed roster (period auto-detected)", height=140,
+                    key="hist_perf_input",
+                    placeholder="Paste a performed roster here — the app figures out which 28-day period it belongs to…")
 
-                # Auto-detect which 28-day period the pasted text falls into.
                 _det_rows = parse_roster_text(man_in) if man_in.strip() else []
                 _det_dates = [r["DateObj"].date() for r in _det_rows if r.get("DateObj")]
                 _detected = roster_period_of_roster(_det_dates) if _det_dates else None
@@ -4018,36 +4024,26 @@ else:
                             f"<div style='font-size:12px;background:#331414;border:1px solid #ff5252;color:#ff8a8a;padding:8px;border-radius:8px;margin-bottom:6px;'>"
                             f"📍 Detected period <b>{_det_label}</b> is before 2026 — pre-2026 history is auto-removed on load, so it won't persist. The app only supports 2026 onward.</div>",
                             unsafe_allow_html=True)
-                    elif _detected == sel_start:
-                        st.markdown(f"<div class='muted' style='font-size:12px;margin-bottom:6px;'>📍 Detected period: {_det_label} (matches the selection above).</div>", unsafe_allow_html=True)
                     else:
                         st.markdown(
                             f"<div style='font-size:12px;background:#12301f;border:1px solid #4caf50;color:#a5d6a7;padding:8px;border-radius:8px;margin-bottom:6px;'>"
-                            f"📍 Detected period: <b>{_det_label}</b> — this will be saved under that period (auto-detected from the pasted dates), not the selection above.</div>",
+                            f"📍 Detected period: <b>{_det_label}</b></div>",
                             unsafe_allow_html=True)
                 elif man_in.strip():
-                    st.markdown("<div class='muted' style='font-size:12px;margin-bottom:6px;'>⚠️ No dates detected in the pasted text — saving under the selected period.</div>", unsafe_allow_html=True)
+                    st.markdown("<div class='muted' style='font-size:12px;margin-bottom:6px;'>⚠️ No dates detected in the pasted text — check it parses.</div>", unsafe_allow_html=True)
 
-                hb_save, hb_del = st.columns([1, 1])
-                if hb_save.button("💾 Save performed roster", use_container_width=True, key="history_manual_btn"):
-                    if man_in.strip():
-                        save_start = _detected if _detected is not None else sel_start
-                        save_roster_history(st.session_state['username'], save_start,
-                                            published_text=(tgt["published_text"] if tgt and tgt["period_start"] == save_start else None),
+                if st.button("💾 Save as performed (finalize)", use_container_width=True, key="history_manual_btn"):
+                    if not man_in.strip():
+                        st.warning("Paste the performed roster text first.")
+                    elif _detected is None:
+                        st.warning("Couldn't detect a period from the pasted text — check the dates and try again.")
+                    else:
+                        save_roster_history(st.session_state['username'], _detected,
                                             performed_text=man_in, finalized=True)
-                        _slabel = (f"{save_start.strftime('%d %b')} – "
-                                   f"{(save_start + timedelta(days=ROSTER_PERIOD_DAYS - 1)).strftime('%d %b %Y')}")
+                        _slabel = (f"{_detected.strftime('%d %b')} – "
+                                   f"{(_detected + timedelta(days=ROSTER_PERIOD_DAYS - 1)).strftime('%d %b %Y')}")
                         st.success(f"Period {_slabel} finalized — rolling checks now use the performed roster.")
                         st.rerun()
-                    else:
-                        st.warning("Paste the performed roster text first.")
-                _del_ok = hb_del.checkbox("⚠️ Allow delete", key="history_del_confirm")
-                if hb_del.button("🗑 Delete this period", use_container_width=True, key="history_delete_btn",
-                                 disabled=not _del_ok):
-                    delete_roster_history(st.session_state['username'], sel_start)
-                    st.session_state.pop('cal_period_sel', None)
-                    st.success(f"Period {sel_start.strftime('%d %b')} deleted from Roster History.")
-                    st.rerun()
 
             # 28-day roster period navigation (anchored 13 Jul 2026: 07 Sep–04 Oct is current).
             # Calendar shows the current roster + finalized performed periods, so the
@@ -4449,7 +4445,13 @@ else:
                     rows, _ = salary_month_rows(st.session_state['username'], ym, parsed_rows)
                     return sum(1 for r in rows if r["Type"] == "FLIGHT")
                 full_months = [ym for ym in months if _mcount(ym) > 0]
-                default_ym = max(full_months) if full_months else today_ym
+                # Default to the latest COMPLETED month with data, else the latest
+                # completed month — never the ongoing month (it can't be full yet).
+                if full_months:
+                    default_ym = max(full_months)
+                else:
+                    _prev_ym = _prev_months(today_ym, 2)[0]
+                    default_ym = _prev_ym if _prev_ym in months else months[-1]
                 _pick_label = st.session_state.get('salary_month_pick')
                 if _pick_label not in labels:
                     st.session_state['salary_month_pick'] = labels[months.index(default_ym)]
@@ -4461,6 +4463,7 @@ else:
                 "manual": "📌 From your saved salary history for this month.",
                 "history": "🗂 Auto-pulled from the Dashboard's finalized Roster History — the full performed month.",
                 "slot": "📋 From the performed-roster slot above (full month).",
+                "ongoing": "⏳ This month is still in progress — salary only computes completed months.",
             }.get(src, "")
             flights_exist = any(r["Type"] == "FLIGHT" for r in perf_rows)
             if src_caption:
@@ -4468,7 +4471,10 @@ else:
                             unsafe_allow_html=True)
             if not flights_exist:
                 _mlabel = datetime(sel_month[0], sel_month[1], 1).strftime("%B %Y") if sel_month else "this month"
-                st.info(f"No full performed month for {_mlabel} yet — salary only computes once the whole month (1st – end) is performed. Finalize that month's 28-day periods in the Dashboard's Roster History, or save the full month in 🗓 Salary History.")
+                if src == "ongoing":
+                    st.info(f"⏳ {_mlabel} is still in progress — salary only computes a month once it has ended and the full 1st – end performed roster is available.")
+                else:
+                    st.info(f"No full performed month for {_mlabel} yet — salary only computes once the whole month (1st – end) is performed. Finalize that month's 28-day periods in the Dashboard's Roster History, or save the full month in 🗓 Salary History.")
             else:
                 _pd = [r["DateObj"].date() for r in perf_rows if r.get("DateObj")]
                 if _pd:
