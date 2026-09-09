@@ -94,6 +94,15 @@ def init_db():
         )
     ''')
     c.execute('''
+        CREATE TABLE IF NOT EXISTS salary_history (
+            username TEXT,
+            month TEXT,
+            roster_text TEXT,
+            saved_at TEXT,
+            PRIMARY KEY (username, month)
+        )
+    ''')
+    c.execute('''
         CREATE TABLE IF NOT EXISTS roster_history (
             username TEXT,
             period_start TEXT,
@@ -157,6 +166,136 @@ def load_performed_roster(username):
     d = c.fetchone()
     conn.close()
     return d[0] if d else ''
+
+
+# --- salary history (per-calendar-month performed rosters, manual or pulled) ---
+
+def _month_key(ym):
+    """(year, month) -> 'YYYY-MM'."""
+    return f"{ym[0]:04d}-{ym[1]:02d}"
+
+
+def _prev_months(ym, n):
+    """The n most recent (year, month) pairs ending at ym (inclusive), oldest last."""
+    y, m = ym
+    out = []
+    for _ in range(n):
+        out.append((y, m))
+        m -= 1
+        if m == 0:
+            m, y = 12, y - 1
+    return out
+
+
+def save_salary_history(username, month_key, text):
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    c.execute('''INSERT INTO salary_history (username, month, roster_text, saved_at)
+                 VALUES (?, ?, ?, ?)
+                 ON CONFLICT(username, month) DO UPDATE SET
+                   roster_text = excluded.roster_text, saved_at = excluded.saved_at''',
+              (username, month_key, text, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+    conn.commit()
+    conn.close()
+
+
+def delete_salary_history(username, month_key):
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    c.execute('DELETE FROM salary_history WHERE username = ? AND month = ?', (username, month_key))
+    conn.commit()
+    conn.close()
+
+
+def load_salary_history(username):
+    """{month_key: {'text': ..., 'saved_at': ...}} for the user."""
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    c.execute('SELECT month, roster_text, saved_at FROM salary_history WHERE username = ?', (username,))
+    out = {mk: {"text": txt or "", "saved_at": sa} for mk, txt, sa in c.fetchall()}
+    conn.close()
+    return out
+
+
+def _clip_rows_to_month(rows, ym):
+    """Rows whose DateObj falls within the calendar month (year, month)."""
+    y, m = ym
+    lo = datetime(y, m, 1)
+    hi = datetime(y, m + 1, 1) if m < 12 else datetime(y + 1, 1, 1)
+    return [r for r in rows if r.get("DateObj") and lo <= r["DateObj"] < hi]
+
+
+def _salary_history_merged(username, current_rows):
+    """Finalized performed rows from past roster_history periods + the live
+    current roster clipped to its period, merged and deduped — the same sources
+    `calendar_rows()` uses. This lets a calendar month straddle two 28-day
+    periods (e.g. August = tail of 13 Jul period + head of 10 Aug period) and
+    still be assembled correctly, and keeps the running period on the live
+    published roster until it is finalized."""
+    cur_start = None
+    if current_rows:
+        dates = [r["DateObj"].date() for r in current_rows if r.get("DateObj")]
+        if dates:
+            cur_start = roster_period_of_roster(dates)
+    merged = []
+    for h in load_roster_history(username):
+        if h["finalized"] and h["performed_text"] and h["period_start"] is not None:
+            if cur_start is not None and h["period_start"] == cur_start:
+                continue   # current period stays live until finalized
+            merged += _rows_in_period(parse_roster_text(h["performed_text"]), h["period_start"])
+    if cur_start is not None:
+        merged += _rows_in_period(current_rows, cur_start)
+    seen, dedup = set(), []
+    for r in merged:
+        key = (r["DateObj"].date() if r.get("DateObj") else None, r["Type"], r.get("Code"))
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(r)
+    return dedup
+
+
+def salary_month_rows(username, ym, current_rows):
+    """Rows to compute salary for a calendar month, by precedence:
+    1) manual salary_history entry for that exact month;
+    2) finalized roster_history performed rows merged with the live current
+       roster (see `_salary_history_merged`) — so a whole month's salary can be
+       pulled even if nothing was pasted into the salary tab;
+    3) the salary tab's existing performed-roster slot;
+    4) the current published roster alone.
+    Returns (rows, source) where source ∈ {manual, history, slot, current}."""
+    key = _month_key(ym)
+    sh = load_salary_history(username)
+    if key in sh and sh[key]["text"].strip():
+        return _clip_rows_to_month(parse_roster_text(sh[key]["text"]), ym), "manual"
+    hist = _clip_rows_to_month(_salary_history_merged(username, current_rows), ym)
+    if any(r["Type"] == "FLIGHT" for r in hist):
+        return hist, "history"
+    slot = _clip_rows_to_month(parse_roster_text(load_performed_roster(username)), ym)
+    if any(r["Type"] == "FLIGHT" for r in slot):
+        return slot, "slot"
+    return _clip_rows_to_month(current_rows or [], ym), "current"
+
+
+def salary_available_months(username, current_rows):
+    """All (year, month) pairs the salary calculator can offer, across every
+    source (manual history, roster_history + live, performed slot)."""
+    months = set()
+    for key in load_salary_history(username):
+        try:
+            months.add((int(key[:4]), int(key[5:7])))
+        except ValueError:
+            pass
+    for r in _salary_history_merged(username, current_rows):
+        if r.get("DateObj"):
+            months.add((r["DateObj"].year, r["DateObj"].month))
+    for r in parse_roster_text(load_performed_roster(username)):
+        if r.get("DateObj"):
+            months.add((r["DateObj"].year, r["DateObj"].month))
+    for r in (current_rows or []):
+        if r.get("DateObj"):
+            months.add((r["DateObj"].year, r["DateObj"].month))
+    return sorted(months)
 
 
 # --- roster periods ---
@@ -3819,6 +3958,40 @@ else:
                 st.success("Profile saved — it will load automatically next time.")
 
         with rcol:
+            # --- SALARY HISTORY: per-month performed rosters (manual pin, or auto-pull) ---
+            salary_months = salary_available_months(st.session_state['username'], parsed_rows)
+            today_ym = (datetime.now().year, datetime.now().month)
+            hist_months = sorted(set(_prev_months(today_ym, 24)) | set(salary_months))
+            sh = load_salary_history(st.session_state['username'])
+            with st.expander("🗓 Salary History (per-month)", expanded=False):
+                st.markdown(
+                    "<div class='muted' style='margin-bottom:6px;'>Pin a whole calendar month's <b>performed</b> "
+                    "roster here to lock in its payslip. Months already <b>finalized</b> in the Dashboard's 🗂 Roster "
+                    "History are pulled automatically for salary \u2014 no re-paste needed.</div>",
+                    unsafe_allow_html=True)
+                sh_pick = st.selectbox(
+                    "History month", hist_months,
+                    format_func=lambda ym: datetime(ym[0], ym[1], 1).strftime("%B %Y"),
+                    index=(hist_months.index(today_ym) if today_ym in hist_months else len(hist_months) - 1),
+                    key="salary_hist_month")
+                sh_key = _month_key(sh_pick)
+                sh_text = st.text_area(
+                    "Performed roster for this month",
+                    value=sh.get(sh_key, {}).get("text", ""),
+                    height=140, key=f"sh_text_{sh_key}")
+                hb1, hb2, hb3 = st.columns([1, 1, 1])
+                if hb1.button("💾 Save month", use_container_width=True, key="sh_save"):
+                    if sh_text.strip():
+                        save_salary_history(st.session_state['username'], sh_key, sh_text)
+                        st.success(datetime(sh_pick[0], sh_pick[1], 1).strftime("%B %Y") + " saved to salary history.")
+                        st.rerun()
+                    else:
+                        st.warning("Paste the performed roster text first.")
+                if hb2.button("🗑 Delete", use_container_width=True, key="sh_del"):
+                    delete_salary_history(st.session_state['username'], sh_key)
+                    st.success(datetime(sh_pick[0], sh_pick[1], 1).strftime("%B %Y") + " removed from salary history.")
+                    st.rerun()
+
             # --- performed roster input (salary is based on the PERFORMED month, not the live roster) ---
             if 'performed_roster' not in st.session_state:
                 st.session_state['performed_roster'] = load_performed_roster(st.session_state['username'])
@@ -3838,29 +4011,35 @@ else:
                     save_performed_roster(st.session_state['username'], '')
                     st.rerun()
 
-            perf_text = st.session_state.get('performed_roster', '')
-            perf_rows_all = parse_roster_text(perf_text) if perf_text.strip() else []
             # Salary is per CALENDAR MONTH (1st–end), while rosters run in 28-day
-            # periods that straddle months — so filter duties to the chosen month.
-            months = sorted({(r["DateObj"].year, r["DateObj"].month)
-                             for r in perf_rows_all if r.get("DateObj")})
-            perf_rows = perf_rows_all
+            # periods that straddle months — the month list spans every source
+            # (manual history, finalized Roster History, performed slot, live roster).
+            months = salary_available_months(st.session_state['username'], parsed_rows)
+            perf_rows = []
             sel_month = None
+            src = "current"
             if months:
                 def _mcount(ym):
-                    return sum(1 for r in perf_rows_all if r.get("DateObj")
-                               and (r["DateObj"].year, r["DateObj"].month) == ym
-                               and r["Type"] == "FLIGHT")
-                default_ym = max(months, key=lambda ym: (_mcount(ym), ym))
+                    rows, _ = salary_month_rows(st.session_state['username'], ym, parsed_rows)
+                    return sum(1 for r in rows if r["Type"] == "FLIGHT")
+                default_ym = max(months, key=lambda ym: (_mcount(ym), ym))   # busiest (most complete) month
                 labels = [datetime(y, m, 1).strftime("%B %Y") for y, m in months]
                 pick = st.selectbox("Salary month (1st – end of month)", labels,
                                     index=months.index(default_ym))
                 sel_month = months[labels.index(pick)]
-                perf_rows = [r for r in perf_rows_all if r.get("DateObj")
-                             and (r["DateObj"].year, r["DateObj"].month) == sel_month]
+                perf_rows, src = salary_month_rows(st.session_state['username'], sel_month, parsed_rows)
+            src_caption = {
+                "manual": "📌 From your saved salary history for this month.",
+                "history": "🗂 Auto-pulled from the Dashboard's finalized Roster History (performed rosters) — no re-paste needed.",
+                "slot": "📋 From the performed-roster slot above.",
+                "current": "📅 Live current roster (published plan).",
+            }.get(src, "")
             flights_exist = any(r["Type"] == "FLIGHT" for r in perf_rows)
+            if src_caption:
+                st.markdown(f"<div class='muted' style='font-size:11.5px;margin-bottom:6px;'>{src_caption}</div>",
+                            unsafe_allow_html=True)
             if not flights_exist:
-                st.info("Paste your performed roster above and hit Process & Save — the payslip is computed from it instantly.")
+                st.info("No flights found for this month yet — save it in 🗓 Salary History, finalize it in the Dashboard's Roster History, or paste it into the performed-roster slot above.")
             else:
                 _pd = [r["DateObj"].date() for r in perf_rows if r.get("DateObj")]
                 if _pd:
