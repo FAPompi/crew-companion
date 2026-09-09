@@ -249,10 +249,15 @@ def roster_periods_off_days(username, current_rows):
     return out
 
 
-def days_off_average_8_2_17_d(username, current_rows):
+def days_off_average_8_2_17_d(username, current_rows, upto=None):
     """8.2.17(d): average days off per 4-week period over the last 3 periods.
-    Returns {n_periods, avg, ok, per} — avg/ok are None unless ≥ 3 periods."""
+    When `upto` (a period start date) is given, only periods up to and including
+    it are considered — used when browsing a past period so the rolling average
+    reflects history as of that period. Returns {n_periods, avg, ok, per} —
+    avg/ok are None unless ≥ 3 periods."""
     per = roster_periods_off_days(username, current_rows)
+    if upto is not None:
+        per = [p for p in per if p["start"] <= upto]
     if len(per) < 3:
         return {"n_periods": len(per), "avg": None, "ok": None, "per": per}
     last3 = per[-3:]
@@ -317,6 +322,23 @@ def calendar_rows(username, current_rows):
         dedup.append(r)
     return dedup
 
+
+def period_rows_for_display(username, current_rows, period_start):
+    """Rows for a SPECIFIC period, for the analytics/fatigue/FDP panels when the
+    calendar is browsing that period. The current period returns the live
+    published rows; past periods return their finalized performed rows (clipped
+    to the period). Empty list if the period has no finalized roster."""
+    if current_rows:
+        dates = [r["DateObj"].date() for r in current_rows if r.get("DateObj")]
+        cur_start = roster_period_of_roster(dates) if dates else None
+        if cur_start == period_start:
+            return _rows_in_period(current_rows, period_start)
+    for h in load_roster_history(username):
+        if h["period_start"] == period_start and h["finalized"] and h["performed_text"]:
+            return _rows_in_period(parse_roster_text(h["performed_text"]), period_start)
+    return []
+
+
 def save_profile(username, data):
     conn = sqlite3.connect('crew_companion.db')
     c = conn.cursor()
@@ -378,7 +400,7 @@ def preprocess_roster_text(raw_text):
         return t
     t = re.sub(r'[ \t]*HTL', '\nHTL', t)
     _code_alt = "|".join(re.escape(c) for c in _GROUND_CODES_SORTED)
-    t = re.sub(r'(\d{2}[A-Z]{3}\d{2}[ \t]*\d{2}:\d{2})[ \t]*(?=UL\s*\d|SB\d|' + _code_alt + r')', r'\n\1', t)
+    t = re.sub(r'(\d{2}[A-Z]{3}\d{2}[ \t]*\d{2}:\d{2})[ \t]*(?=(?<![A-Z0-9])UL\s*\d|SB\d|' + _code_alt + r')', r'\n\1', t)
     return t
 
 # --- Ground / activity codes (from the user's "Ground Code" reference) ---
@@ -391,6 +413,7 @@ def preprocess_roster_text(raw_text):
 GROUND_CODES = {
     # day off
     "OFF": ("off", "Legal off day"), "ROF": ("off", "Request off"),
+    "HOT": ("off", "Outstation off"), "OVO": ("off", "Overseas off day"),
     # layover / time off
     "HTL": ("layover", "Hotel"),
     "TOF": ("tof", "Time off"), "HTO": ("tof", "Time off after FAU meeting"),
@@ -399,7 +422,7 @@ GROUND_CODES = {
     "SB3": ("standby", "Standby 3"), "SB4": ("standby", "Standby 4"),
     "SSY": ("standby", "Standby for SNY"), "LSB": ("standby", "London standby"),
     "ASB": ("standby", "Airport standby"),
-    # sick (leave bucket)
+    # sick — company counts sick towards off days (see _day_status_map)
     "S/L": ("sick", "Illness"), "FSL": ("sick", "Flexible sick"),
     "LMS": ("sick", "Last minute sick"), "SAR": ("sick", "Sick after ROFF"),
     "SBR": ("sick", "Sick before ROFF"), "SAC": ("sick", "Sick after casual leave"),
@@ -408,20 +431,19 @@ GROUND_CODES = {
     "SCM": ("sick", "Sick combined w/ leave"), "SOD": ("sick", "Sick on duty swap"),
     "SSC": ("sick", "Sick set off from CLV"), "SSA": ("sick", "Sick set off from ALV"),
     "S/R": ("sick", "Sick leave request"),
+    "EML": ("sick", "Emergency leave"), "ACL": ("sick", "Accident leave"),
     # leave
     "ALV": ("leave", "Annual leave"), "RLV": ("leave", "Annual leave (after publish)"),
     "ALP": ("leave", "Annual leave (planned)"), "CLV": ("leave", "Casual leave"),
-    "C/R": ("leave", "Casual leave request"), "EML": ("leave", "Emergency leave"),
-    "LWP": ("leave", "No-pay leave"), "SPL": ("leave", "Special leave"),
+    "SPL": ("leave", "Special leave"),
     "MTL": ("leave", "Maternity leave"), "MTP": ("leave", "Maternity leave (paid)"),
     "MTO": ("leave", "Maternity leave (office)"), "MTN": ("leave", "Maternity leave (no pay)"),
-    "ACL": ("leave", "Accident leave"), "NAN": ("leave", "Non-authorized no-pay"),
-    "A/N": ("leave", "Authorized no-pay leave"),
     # neutral (not duty, not a day off)
+    "C/R": ("neutral", "Casual leave request"), "LWP": ("neutral", "No-pay leave"),
+    "NAN": ("neutral", "Non-authorized no-pay"), "A/N": ("neutral", "Authorized no-pay leave"),
     "AWL": ("neutral", "Absent without leave"), "GRD": ("neutral", "Grounding (discipline)"),
     "GRW": ("neutral", "Grounding (weight)"), "GRC": ("neutral", "Grounding (cosmetic)"),
-    "OTR": ("neutral", "Off the roster"), "HOT": ("neutral", "Outstation off"),
-    "OVO": ("neutral", "Overseas off day"), "CHO": ("neutral", "Company holiday"),
+    "OTR": ("neutral", "Off the roster"), "CHO": ("neutral", "Company holiday"),
     "AB1": ("neutral", "Block before ALV"), "AB2": ("neutral", "Block after ALV"),
     "CNL": ("neutral", "Cancelled"), "NTS/QRN": ("neutral", "Quarantine"),
     "QRC": ("neutral", "Quarantine (first contact)"), "QRW": ("neutral", "Waiting for PCR results"),
@@ -705,8 +727,11 @@ def parse_roster_text(raw_text):
             except ValueError:
                 pass
 
-        act_code = _detect_code(line_str)
-        is_flight = (act_code is None and re.search(r'UL\s*\d{1,4}', line_str) is not None)
+        is_flight = re.search(r'(?<![A-Z0-9])UL\s*\d{1,4}', line_str) is not None
+        # Flight detection takes priority so a route IATA code that collides
+        # with a ground code (e.g. PER = Perth vs "Personality development")
+        # can't misclassify a flight line as a ground duty.
+        act_code = None if is_flight else _detect_code(line_str)
         if act_code is not None or is_flight:
             activity_type = "OTHER"
             flight_no = "-"
@@ -723,7 +748,7 @@ def parse_roster_text(raw_text):
             if is_flight:
                 activity_type = "FLIGHT"
                 # Bounded so 'UL60622SEP26' parses as UL606 + date, not UL60622
-                m = re.search(r'UL\s*(\d{1,4}?)(?=\d{2}[A-Z]{3}\d{2}|\D|$)', line_str)
+                m = re.search(r'(?<![A-Z0-9])UL\s*(\d{1,4}?)(?=\d{2}[A-Z]{3}\d{2}|\D|$)', line_str)
                 if m:
                     flight_no = f"UL {m.group(1)}"
             else:
@@ -2198,9 +2223,11 @@ def _group_runs(items, keyfn, break_h=34.0):
 
 
 def _day_status_map(rows):
-    """Calendar-date \u2192 set(status). FLIGHT/STANDBY/LAYOVER/DUTY \u2192 'duty',
-    DAY OFF \u2192 'off', LEAVE \u2192 'leave'. Multi-day rows span every date they
-    cover (8.2.17 counting: layover days count as duty, leave is not a day off)."""
+    """Calendar-date → set(status). FLIGHT/STANDBY/LAYOVER/DUTY → 'duty',
+    DAY OFF (OFF/ROF/HOT/OVO) → 'off', sick-codes → 'off' (company counts sick
+    towards days off), other leave/neutral → 'leave', TIMEOFF → 'tof'. Multi-day
+    rows span every date they cover (8.2.17 counting: layover days count as
+    duty; leave/neutral is not a day off and not duty)."""
     day_status = {}
     for r in rows:
         if not r.get("DateObj"):
@@ -2212,7 +2239,8 @@ def _day_status_map(rows):
         elif r["Type"] == "DAY OFF":
             key = "off"
         elif r["Type"] == "LEAVE":
-            key = "leave"
+            # company rule: sick counts towards off days; other leave doesn't
+            key = "off" if ground_code_bucket(r.get("Code")) == "sick" else "leave"
         elif r["Type"] == "TIMEOFF":
             key = "tof"   # time-off block: not duty, not a day off
         else:
@@ -2285,9 +2313,13 @@ def mandatory_off_days(rows):
     duty day would BREACH it (new-breach-vs-base), so an already-short roster
     doesn't mark every day. Rule (c) uses the user-confirmed per-roster reading:
     an aligned 28-day period with exactly 7 off days makes all 7 load-bearing.
+    Only PLANNED off days (OFF/ROF/HOT/OVO) are ever flagged mandatory — sick
+    days count towards the off-day totals but are never themselves 'mandatory'.
     Returns {date: [rule label, ...]}."""
     day_status = _day_status_map(rows)
     off_days = sorted(d for d, s in day_status.items() if "off" in s)
+    planned = sorted({r["DateObj"].date() for r in rows
+                      if r["Type"] == "DAY OFF" and r.get("DateObj")})
     if not day_status or not off_days:
         return {}
     lo, hi = min(day_status), max(day_status)
@@ -2296,7 +2328,7 @@ def mandatory_off_days(rows):
     base_b = _no_pair_14_windows(day_status, lo, hi)
 
     mand = {}
-    for o in off_days:
+    for o in planned:
         alt = {d: set(v) for d, v in day_status.items()}
         alt[o].discard("off")
         alt[o].add("duty")
@@ -2647,9 +2679,9 @@ def _current_only_note(label):
 
 
 def _off_chip(mand_rules, code="OFF"):
-    """DAY OFF chip — OFF vs ROF kept distinct; mandatory days (required by
-    8.2.17) are highlighted red."""
-    lbl = code if code in ("OFF", "ROF") else "OFF"
+    """DAY OFF chip — the portal code is kept (OFF/ROF/HOT/OVO); mandatory days
+    (required by 8.2.17) are highlighted red."""
+    lbl = code if code in ("OFF", "ROF", "HOT", "OVO") else "OFF"
     if mand_rules:
         return (f"<div class='chip chip-off-mand' title='Mandatory — {', '.join(mand_rules)}'>"
                 f"🔴 {lbl} · MAND</div>")
@@ -2834,9 +2866,11 @@ def build_calendar_html(rows, span=None):
         "<span class='chip chip-off' style='display:inline-block;margin:0 4px 0 0;'>🟢 OFF</span>"
         "= discretionary &nbsp;·&nbsp; "
         "<span class='chip chip-off' style='display:inline-block;margin:0 4px 0 0;'>🟢 ROF</span>"
-        "= rest-off day &nbsp;·&nbsp; "
+        "= rest-off &nbsp;·&nbsp; "
+        "<span class='chip chip-off' style='display:inline-block;margin:0 4px 0 0;'>🟢 HOT/OVO</span>"
+        "= outstation/overseas off (counts as a day off) &nbsp;·&nbsp; "
         "<span class='chip chip-lay' style='display:inline-block;margin:0 4px 0 0;'>🌴/🤒/😷 code</span>"
-        "= leave / sick / other ground codes &nbsp;·&nbsp; "
+        "= leave / sick (sick counts as a day off) / other ground codes &nbsp;·&nbsp; "
         "<span class='chip chip-duty' style='display:inline-block;margin:0 4px 0 0;'>📚 code</span>"
         "= training / ground duty &nbsp;·&nbsp; "
         "<span class='chip chip-tof' style='display:inline-block;margin:0 4px 0 0;'>🕓 TOF</span>"
@@ -3255,122 +3289,145 @@ else:
         viewing_past = bool(_cur_period is not None and _view_sel is not None
                              and _view_sel != _cur_period)
 
+        # Analytics / fatigue / FDP panels reflect the SELECTED period: the live
+        # current roster normally, the finalized performed roster when browsing a
+        # past period. (Intel / Guardian / live monitoring stay current-only.)
+        if viewing_past and _view_sel is not None:
+            view_rows = period_rows_for_display(st.session_state['username'], parsed_rows, _view_sel)
+        else:
+            view_rows = parsed_rows
+        view_analytics = compute_analytics(view_rows)
+        _view_label = (f"{_view_sel.strftime('%d %b')} – "
+                       f"{(_view_sel + timedelta(days=ROSTER_PERIOD_DAYS - 1)).strftime('%d %b %Y')}"
+                       if viewing_past and _view_sel is not None else None)
+
         left_col, main_col, right_col = st.columns([1, 2.3, 1.3])
 
         # ---------- LEFT: ANALYTICS & FATIGUE ----------
         with left_col:
             st.markdown("#### Analytics & Fatigue Tracker")
-            if viewing_past:
-                st.markdown(_current_only_note("Analytics, fatigue & FDP compliance"), unsafe_allow_html=True)
-            else:
-                pct = analytics["block_hrs"] / analytics["block_target"] if analytics["block_target"] else 0
-                donut = donut_svg(pct, str(analytics["block_hrs"]), f"of {analytics['block_target']} hrs")
+            if _view_label:
                 st.markdown(
-                    f"<div class='card' style='text-align:center;'><h5>Cumulative Block Hours</h5>"
-                    f"{donut}"
-                    f"<div class='muted'>this roster ({pct*100:.0f}%) · {analytics['flights']} sectors</div></div>",
+                    f"<div class='muted' style='font-size:12px;margin-bottom:8px;'>"
+                    f"Showing <b>{_view_label}</b> (performed) \u2014 archived period.</div>",
                     unsafe_allow_html=True)
-                spark = sparkline_svg([analytics['daily_min'].get(d, 0) for d in sorted(analytics['daily_min'])] or [0])
-                fat_color = "#4caf50" if analytics['fatigue'] < 4 else ("#ff9800" if analytics['fatigue'] < 7 else "#ff5252")
-                fat_parts = sorted(analytics.get("fatigue_parts", []), key=lambda p: -p["pts"])
-                parts_html = ""
-                for p in fat_parts:
-                    if p["pts"] <= 0:
-                        continue
-                    parts_html += (f"<div class='bidrow'><span>{p['label']}</span>"
-                                   f"<span>{p['detail']} · +{p['pts']}</span></div>")
-                st.markdown(
-                    f"<div class='card'><h5 style='text-align:center;'>Fatigue Score</h5>"
-                    f"<div style='text-align:center;'>{gauge_svg(analytics['fatigue'])}</div>"
-                    f"<div style='color:{fat_color};font-weight:700;font-size:14px;text-align:center;'>{analytics['fatigue_label']} ({analytics['fatigue']}/10)</div>"
-                    f"<div style='margin-top:6px;text-align:center;'>{spark}</div>"
-                    f"<div class='muted' style='text-align:center;'>{analytics['redeyes']} red-eye dep · {analytics['max_streak']} consecutive duty days</div>"
-                    f"<div style='margin-top:8px;'>{parts_html}</div>"
-                    f"<div class='muted' style='margin-top:4px;'>heuristic from FOM Ch.08 fatigue drivers (early/late/night duties, 0100–0659 runs, day/night alternation, 18–30h rests after TZ flights, cumulative load, recovery) — not a regulatory limit.</div></div>",
-                    unsafe_allow_html=True)
+            pct = view_analytics["block_hrs"] / view_analytics["block_target"] if view_analytics["block_target"] else 0
+            donut = donut_svg(pct, str(view_analytics["block_hrs"]), f"of {view_analytics['block_target']} hrs")
+            st.markdown(
+                f"<div class='card' style='text-align:center;'><h5>Cumulative Block Hours</h5>"
+                f"{donut}"
+                f"<div class='muted'>this {'period' if _view_label else 'roster'} ({pct*100:.0f}%) \u00b7 {view_analytics['flights']} sectors</div></div>",
+                unsafe_allow_html=True)
+            spark = sparkline_svg([view_analytics['daily_min'].get(d, 0) for d in sorted(view_analytics['daily_min'])] or [0])
+            fat_color = "#4caf50" if view_analytics['fatigue'] < 4 else ("#ff9800" if view_analytics['fatigue'] < 7 else "#ff5252")
+            fat_parts = sorted(view_analytics.get("fatigue_parts", []), key=lambda p: -p["pts"])
+            parts_html = ""
+            for p in fat_parts:
+                if p["pts"] <= 0:
+                    continue
+                parts_html += (f"<div class='bidrow'><span>{p['label']}</span>"
+                               f"<span>{p['detail']} \u00b7 +{p['pts']}</span></div>")
+            st.markdown(
+                f"<div class='card'><h5 style='text-align:center;'>Fatigue Score</h5>"
+                f"<div style='text-align:center;'>{gauge_svg(view_analytics['fatigue'])}</div>"
+                f"<div style='color:{fat_color};font-weight:700;font-size:14px;text-align:center;'>{view_analytics['fatigue_label']} ({view_analytics['fatigue']}/10)</div>"
+                f"<div style='margin-top:6px;text-align:center;'>{spark}</div>"
+                f"<div class='muted' style='text-align:center;'>{view_analytics['redeyes']} red-eye dep \u00b7 {view_analytics['max_streak']} consecutive duty days</div>"
+                f"<div style='margin-top:8px;'>{parts_html}</div>"
+                f"<div class='muted' style='margin-top:4px;'>heuristic from FOM Ch.08 fatigue drivers (early/late/night duties, 0100\u20130659 runs, day/night alternation, 18\u201330h rests after TZ flights, cumulative load, recovery) \u2014 not a regulatory limit.</div></div>",
+                unsafe_allow_html=True)
 
-                # ---------- LEFT: FDP COMPLIANCE (Chapter 08) ----------
-                if parsed_rows:
-                    st.markdown("#### ⚖ FDP Compliance")
-                    fdp = fdp_roster_audit(parsed_rows)
-                    fviol = [f for f in fdp["findings"] if f[0] == "violation"]
-                    fnote = [f for f in fdp["findings"] if f[0] == "note"]
-                    cnt = fdp["counts"]
-                    cum = fdp["cumulative"]
-                    if not fdp["findings"]:
-                        st.markdown(
-                            "<div class='card' style='border-color:#4caf50;text-align:center;'>"
-                            "<div style='color:#a5d6a7;font-weight:700;'>✅ FDP limits OK</div>"
-                            "<div class='muted' style='font-size:11px;'>no early/late/night or cumulative breaches</div></div>",
-                            unsafe_allow_html=True)
-                    else:
-                        st.markdown(
-                            f"<div class='card' style='border-color:#ff5252;text-align:center;'>"
-                            f"<div style='color:#ff8a8a;font-weight:700;'>{len(fviol)} FDP breach(es)</div>"
-                            + (f"<div class='muted' style='font-size:11px;'>{len(fnote)} note(s)</div>" if fnote else "") +
-                            "</div>", unsafe_allow_html=True)
-                    do = fdp["days_off"]
-                    if do["off_rest_bad"]:
-                        off_rest_txt = f"{do['off_rest_bad']} fail"
-                    elif do["off_rest_notes"]:
-                        off_rest_txt = f"OK · {do['off_rest_notes']} unverified"
-                    else:
-                        off_rest_txt = "all OK"
-                    mand_dates = do.get("mandatory_dates", [])
-                    mand_txt = f"{do['mandatory_count']} of {do['off_days']}"
-                    mand_line = (", ".join(d.strftime("%d %b") for d in mand_dates)
-                                 if mand_dates else "none individually required")
-                    davg = days_off_average_8_2_17_d(st.session_state['username'], parsed_rows)
-                    if davg["avg"] is None:
-                        davg_txt = f"N/A · {davg['n_periods']}/3 periods"
-                        davg_color = "#9fb3c8"
-                    else:
-                        davg_txt = f"{davg['avg']} avg · {'OK' if davg['ok'] else 'BELOW 8'}"
-                        davg_color = "#a5d6a7" if davg["ok"] else "#ff8a8a"
-                    rows_html = (
-                        f"<div class='bidrow'><span>Early / Late / Night</span><span>{cnt['early']} / {cnt['late']} / {cnt['night']}</span></div>"
-                        f"<div class='bidrow'><span>7-day max (cap 60 h)</span><span>{_fmt_hm(cum['7d']['max'])}</span></div>"
-                        f"<div class='bidrow'><span>14-day max (cap 105 h)</span><span>{_fmt_hm(cum['14d']['max'])}</span></div>"
-                        f"<div class='bidrow'><span>28-day max (cap 210 h)</span><span>{_fmt_hm(cum['28d']['max'])}</span></div>"
-                        f"<div class='bidrow'><span>Days off · longest duty streak</span><span>{do['off_days']} · {do['max_duty_run']}d</span></div>"
-                        f"<div class='bidrow'><span>Off-day rest (≥34h · 2 nights)</span><span>{off_rest_txt}</span></div>"
-                        f"<div class='bidrow'><span>Mandatory days off (8.2.17)</span><span>{mand_txt}</span></div>"
-                        f"<div class='bidrow'><span>Days off avg / 4wk (8.2.17.d)</span><span style='color:{davg_color};'>{davg_txt}</span></div>"
-                    )
+            # ---------- LEFT: FDP COMPLIANCE (Chapter 08) ----------
+            if view_rows:
+                st.markdown("#### \u2696 FDP Compliance")
+                fdp = fdp_roster_audit(view_rows)
+                fviol = [f for f in fdp["findings"] if f[0] == "violation"]
+                fnote = [f for f in fdp["findings"] if f[0] == "note"]
+                cnt = fdp["counts"]
+                cum = fdp["cumulative"]
+                if not fdp["findings"]:
                     st.markdown(
-                        f"<div class='card'>{rows_html}"
-                        f"<div class='muted' style='font-size:11px;margin-top:4px;'>standby & duty days counted in full</div>"
-                        f"<div class='muted' style='font-size:11px;margin-top:2px;'>mandatory: {mand_line}</div>"
-                        f"<div class='muted' style='font-size:11px;margin-top:2px;'>(d) needs 3 finalized periods — finalize past rosters in Roster History.</div></div>",
-                        unsafe_allow_html=True)
-                    for sev, msg in fdp["findings"]:
-                        if sev == "violation":
-                            st.markdown(f"<div style='font-size:12px;background:#2c1f1f;border:1px solid #ff5252;color:#ff8a8a;padding:8px;border-radius:8px;margin-bottom:6px;'>⚠️ {msg}</div>", unsafe_allow_html=True)
-                        else:
-                            st.markdown(f"<div style='font-size:12px;background:#33260f;border:1px solid #ffc107;color:#ffd54f;padding:8px;border-radius:8px;margin-bottom:6px;'>ℹ️ {msg}</div>", unsafe_allow_html=True)
-
-                if est_sal:
-                    est_total = est_sal["meal_usd"] + est_sal["on_usd"]
-                    rows_html = ""
-                    for lv in est_sal.get("layover_allow", []):
-                        city = STATION_INFO.get(lv["station"], (lv["station"],))[0]
-                        rows_html += (
-                            f"<div class='bidrow'><span>{city} ({lv['station']})"
-                            f"<span class='muted'> · {lv['nights']} night(s), {lv['meals']} meals</span></span>"
-                            f"<span>~${lv['usd']:,.0f}</span></div>"
-                        )
-                    if not rows_html:
-                        rows_html = "<div class='muted'>No layovers in this roster.</div>"
-                    st.markdown(
-                        f"<div class='card'><h5>Estimated Allowances</h5>"
-                        f"<div style='font-size:26px;font-weight:800;color:#4caf50;'>${est_total:,.0f} USD</div>"
-                        f"<div class='muted' style='margin-bottom:6px;'>Per-layover breakdown (meals + overnights)</div>{rows_html}</div>",
+                        "<div class='card' style='border-color:#4caf50;text-align:center;'>"
+                        "<div style='color:#a5d6a7;font-weight:700;'>\u2705 FDP limits OK</div>"
+                        "<div class='muted' style='font-size:11px;'>no early/late/night or cumulative breaches</div></div>",
                         unsafe_allow_html=True)
                 else:
                     st.markdown(
-                        f"<div class='card'><h5>Estimated Allowances</h5>"
-                        f"<div class='muted'>No roster parsed — paste your roster above.</div></div>",
-                        unsafe_allow_html=True)
+                        f"<div class='card' style='border-color:#ff5252;text-align:center;'>"
+                        f"<div style='color:#ff8a8a;font-weight:700;'>{len(fviol)} FDP breach(es)</div>"
+                        + (f"<div class='muted' style='font-size:11px;'>{len(fnote)} note(s)</div>" if fnote else "") +
+                        "</div>", unsafe_allow_html=True)
+                do = fdp["days_off"]
+                if do["off_rest_bad"]:
+                    off_rest_txt = f"{do['off_rest_bad']} fail"
+                elif do["off_rest_notes"]:
+                    off_rest_txt = f"OK \u00b7 {do['off_rest_notes']} unverified"
+                else:
+                    off_rest_txt = "all OK"
+                mand_dates = do.get("mandatory_dates", [])
+                mand_txt = f"{do['mandatory_count']} of {do['off_days']}"
+                mand_line = (", ".join(d.strftime("%d %b") for d in mand_dates)
+                             if mand_dates else "none individually required")
+                davg = days_off_average_8_2_17_d(st.session_state['username'], parsed_rows,
+                                                 upto=(_view_sel if viewing_past else None))
+                if davg["avg"] is None:
+                    davg_txt = f"N/A \u00b7 {davg['n_periods']}/3 periods"
+                    davg_color = "#9fb3c8"
+                else:
+                    davg_txt = f"{davg['avg']} avg \u00b7 {'OK' if davg['ok'] else 'BELOW 8'}"
+                    davg_color = "#a5d6a7" if davg["ok"] else "#ff8a8a"
+                rows_html = (
+                    f"<div class='bidrow'><span>Early / Late / Night</span><span>{cnt['early']} / {cnt['late']} / {cnt['night']}</span></div>"
+                    f"<div class='bidrow'><span>7-day max (cap 60 h)</span><span>{_fmt_hm(cum['7d']['max'])}</span></div>"
+                    f"<div class='bidrow'><span>14-day max (cap 105 h)</span><span>{_fmt_hm(cum['14d']['max'])}</span></div>"
+                    f"<div class='bidrow'><span>28-day max (cap 210 h)</span><span>{_fmt_hm(cum['28d']['max'])}</span></div>"
+                    f"<div class='bidrow'><span>Days off \u00b7 longest duty streak</span><span>{do['off_days']} \u00b7 {do['max_duty_run']}d</span></div>"
+                    f"<div class='bidrow'><span>Off-day rest (\u226534h \u00b7 2 nights)</span><span>{off_rest_txt}</span></div>"
+                    f"<div class='bidrow'><span>Mandatory days off (8.2.17)</span><span>{mand_txt}</span></div>"
+                    f"<div class='bidrow'><span>Days off avg / 4wk (8.2.17.d)</span><span style='color:{davg_color};'>{davg_txt}</span></div>"
+                )
+                st.markdown(
+                    f"<div class='card'>{rows_html}"
+                    f"<div class='muted' style='font-size:11px;margin-top:4px;'>standby & duty days counted in full \u00b7 sick counts as a day off</div>"
+                    f"<div class='muted' style='font-size:11px;margin-top:2px;'>mandatory: {mand_line}</div>"
+                    f"<div class='muted' style='font-size:11px;margin-top:2px;'>(d) needs 3 finalized periods \u2014 finalize past rosters in Roster History.</div></div>",
+                    unsafe_allow_html=True)
+                for sev, msg in fdp["findings"]:
+                    if sev == "violation":
+                        st.markdown(f"<div style='font-size:12px;background:#2c1f1f;border:1px solid #ff5252;color:#ff8a8a;padding:8px;border-radius:8px;margin-bottom:6px;'>\u26a0\ufe0f {msg}</div>", unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"<div style='font-size:12px;background:#33260f;border:1px solid #ffc107;color:#ffd54f;padding:8px;border-radius:8px;margin-bottom:6px;'>\u2139\ufe0f {msg}</div>", unsafe_allow_html=True)
+            elif viewing_past:
+                st.markdown(
+                    "<div class='card' style='border-color:#607d8b;color:#9fb3c8;font-size:12.5px;'>"
+                    "\u2139\ufe0f No archived roster saved for this period \u2014 finalize it in Roster History to see its FDP stats.</div>",
+                    unsafe_allow_html=True)
+
+            # Estimated allowances: current roster only
+            if viewing_past:
+                st.markdown(_current_only_note("Estimated allowances"), unsafe_allow_html=True)
+            elif est_sal:
+                est_total = est_sal["meal_usd"] + est_sal["on_usd"]
+                rows_html = ""
+                for lv in est_sal.get("layover_allow", []):
+                    city = STATION_INFO.get(lv["station"], (lv["station"],))[0]
+                    rows_html += (
+                        f"<div class='bidrow'><span>{city} ({lv['station']})"
+                        f"<span class='muted'> \u00b7 {lv['nights']} night(s), {lv['meals']} meals</span></span>"
+                        f"<span>~${lv['usd']:,.0f}</span></div>"
+                    )
+                if not rows_html:
+                    rows_html = "<div class='muted'>No layovers in this roster.</div>"
+                st.markdown(
+                    f"<div class='card'><h5>Estimated Allowances</h5>"
+                    f"<div style='font-size:26px;font-weight:800;color:#4caf50;'>${est_total:,.0f} USD</div>"
+                    f"<div class='muted' style='margin-bottom:6px;'>Per-layover breakdown (meals + overnights)</div>{rows_html}</div>",
+                    unsafe_allow_html=True)
+            else:
+                st.markdown(
+                    f"<div class='card'><h5>Estimated Allowances</h5>"
+                    f"<div class='muted'>No roster parsed \u2014 paste your roster above.</div></div>",
+                    unsafe_allow_html=True)
         # ---------- CENTER: CALENDAR + LAYOVER INTEL ----------
         with main_col:
             st.markdown("#### Main Roster Calendar View")
