@@ -5,6 +5,10 @@ import re
 import json
 import requests
 import pandas as pd
+try:
+    import plotly.graph_objects as go
+except Exception:            # test harnesses may stub plotly; analytics falls back gracefully
+    go = None
 from datetime import datetime, timedelta, timezone, time as dtime
 
 # --- 0. TIMEZONE HANDLING ---
@@ -239,76 +243,106 @@ def _clip_rows_to_month(rows, ym):
     return [r for r in rows if r.get("DateObj") and lo <= r["DateObj"] < hi]
 
 
-def _salary_history_merged(username, current_rows):
-    """Finalized performed rows from past roster_history periods + the live
-    current roster clipped to its period, merged and deduped — the same sources
-    `calendar_rows()` uses. This lets a calendar month straddle two 28-day
-    periods (e.g. August = tail of 13 Jul period + head of 10 Aug period) and
-    still be assembled correctly, and keeps the running period on the live
-    published roster until it is finalized."""
+def _full_month_days(y, m):
+    """Every date in the calendar month (year, month)."""
+    lo = datetime(y, m, 1).date()
+    hi = (datetime(y, m + 1, 1) if m < 12 else datetime(y + 1, 1, 1)).date()
+    return {lo + timedelta(days=i) for i in range((hi - lo).days)}
+
+
+def _finalized_performed_rows(username, current_rows):
+    """Finalized performed rows from PAST roster_history periods, clipped to
+    their 28-day periods and date-sorted. The current period is excluded — it
+    stays on the live published roster until it ends, so it must never feed a
+    salary month."""
     cur_start = None
     if current_rows:
         dates = [r["DateObj"].date() for r in current_rows if r.get("DateObj")]
         if dates:
             cur_start = roster_period_of_roster(dates)
-    merged = []
+    out = []
     for h in load_roster_history(username):
-        if h["finalized"] and h["performed_text"] and h["period_start"] is not None:
-            if cur_start is not None and h["period_start"] == cur_start:
-                continue   # current period stays live until finalized
-            merged += _rows_in_period(parse_roster_text(h["performed_text"]), h["period_start"])
-    if cur_start is not None:
-        merged += _rows_in_period(current_rows, cur_start)
-    seen, dedup = set(), []
-    for r in merged:
-        key = (r["DateObj"].date() if r.get("DateObj") else None, r["Type"], r.get("Code"))
-        if key in seen:
+        if not h["finalized"] or not h["performed_text"] or h["period_start"] is None:
             continue
-        seen.add(key)
-        dedup.append(r)
-    return dedup
+        if cur_start is not None and h["period_start"] == cur_start:
+            continue   # current period stays live until finalized
+        out += _rows_in_period(parse_roster_text(h["performed_text"]), h["period_start"])
+    out.sort(key=lambda r: r["DateObj"] or datetime.min)
+    return out
+
+
+def _month_full_performed_coverage(username, current_rows, y, m):
+    """True when finalized PAST roster periods collectively cover every day of
+    the calendar month. The current (still-live) period is excluded, so a month
+    that would need the live roster never counts as covered."""
+    cur_start = None
+    if current_rows:
+        dates = [r["DateObj"].date() for r in current_rows if r.get("DateObj")]
+        if dates:
+            cur_start = roster_period_of_roster(dates)
+    lo = datetime(y, m, 1).date()
+    hi = (datetime(y, m + 1, 1) if m < 12 else datetime(y + 1, 1, 1)).date()
+    spans = []
+    for h in load_roster_history(username):
+        if not h["finalized"] or not h["performed_text"] or h["period_start"] is None:
+            continue
+        if cur_start is not None and h["period_start"] == cur_start:
+            continue   # current period stays live until finalized
+        spans.append((h["period_start"], h["period_start"] + timedelta(days=ROSTER_PERIOD_DAYS - 1)))
+    if not spans:
+        return False
+    day = lo
+    while day < hi:
+        if not any(s <= day <= e for s, e in spans):
+            return False
+        day += timedelta(days=1)
+    return True
 
 
 def salary_month_rows(username, ym, current_rows):
-    """Rows to compute salary for a calendar month, by precedence:
-    1) manual salary_history entry for that exact month;
-    2) finalized roster_history performed rows merged with the live current
-       roster (see `_salary_history_merged`) — so a whole month's salary can be
-       pulled even if nothing was pasted into the salary tab;
-    3) the salary tab's existing performed-roster slot;
-    4) the current published roster alone.
-    Returns (rows, source) where source ∈ {manual, history, slot, current}."""
+    """Rows to compute salary for a calendar month — ONLY when a FULL performed
+    month (1st through the last day) is available. By precedence:
+    1) a manual salary_history entry for that exact month (trusted — it is
+       pinned per-month by the user as a whole month);
+    2) finalized roster_history performed rows, but only if the finalized
+       periods fully cover the calendar month (no merge with the live/current
+       roster — a half-month or in-progress month is excluded);
+    3) the salary tab's performed-roster slot, only if it too covers the full
+       month day-for-day.
+    Anything less than a full month returns ([], "none") so the UI shows
+    "no data" instead of silently computing from the wrong roster.
+    Returns (rows, source) where source ∈ {manual, history, slot, none}."""
     key = _month_key(ym)
     sh = load_salary_history(username)
     if key in sh and sh[key]["text"].strip():
         return _clip_rows_to_month(parse_roster_text(sh[key]["text"]), ym), "manual"
-    hist = _clip_rows_to_month(_salary_history_merged(username, current_rows), ym)
-    if any(r["Type"] == "FLIGHT" for r in hist):
-        return hist, "history"
+    if _month_full_performed_coverage(username, current_rows, *ym):
+        hist = _clip_rows_to_month(_finalized_performed_rows(username, current_rows), ym)
+        if any(r["Type"] == "FLIGHT" for r in hist):
+            return hist, "history"
+    need = _full_month_days(*ym)
     slot = _clip_rows_to_month(parse_roster_text(load_performed_roster(username)), ym)
-    if any(r["Type"] == "FLIGHT" for r in slot):
+    if need <= {r["DateObj"].date() for r in slot if r.get("DateObj")} \
+            and any(r["Type"] == "FLIGHT" for r in slot):
         return slot, "slot"
-    return _clip_rows_to_month(current_rows or [], ym), "current"
+    return [], "none"
 
 
 def salary_available_months(username, current_rows):
-    """All (year, month) pairs the salary calculator can offer, across every
-    source (manual history, roster_history + live, performed slot)."""
+    """Months the salary calculator can actually compute: manual saves plus any
+    calendar month fully covered by finalized performed rosters or a full-month
+    performed-slot paste. Partial months are NOT offered."""
     months = set()
     for key in load_salary_history(username):
         try:
             months.add((int(key[:4]), int(key[5:7])))
         except ValueError:
             pass
-    for r in _salary_history_merged(username, current_rows):
-        if r.get("DateObj"):
-            months.add((r["DateObj"].year, r["DateObj"].month))
-    for r in parse_roster_text(load_performed_roster(username)):
-        if r.get("DateObj"):
-            months.add((r["DateObj"].year, r["DateObj"].month))
-    for r in (current_rows or []):
-        if r.get("DateObj"):
-            months.add((r["DateObj"].year, r["DateObj"].month))
+    y, m = datetime.now().year, datetime.now().month
+    for ym in _months_from_2026((y, m)):
+        rows, _ = salary_month_rows(username, ym, current_rows)
+        if any(r["Type"] == "FLIGHT" for r in rows):
+            months.add(ym)
     return sorted(months)
 
 
@@ -403,19 +437,21 @@ def roster_periods_off_days(username, current_rows):
 
 
 def days_off_average_8_2_17_d(username, current_rows, upto=None):
-    """8.2.17(d): average days off per 4-week period over the last 3 periods.
-    When `upto` (a period start date) is given, only periods up to and including
-    it are considered — used when browsing a past period so the rolling average
-    reflects history as of that period. Returns {n_periods, avg, ok, per} —
-    avg/ok are None unless ≥ 3 periods."""
+    """8.2.17(d): off days over the last 3 finalized 4-week periods must reach
+    24 (8 per period), and every period must carry its own minimum of 7. When
+    `upto` (a period start date) is given, only periods up to and including it
+    are considered — used when browsing a past period so the rolling check
+    reflects history as of that period. Returns {n_periods, avg, ok, per,
+    total} — avg/ok/total are None unless ≥ 3 periods; ok = total ≥ 24."""
     per = roster_periods_off_days(username, current_rows)
     if upto is not None:
         per = [p for p in per if p["start"] <= upto]
     if len(per) < 3:
-        return {"n_periods": len(per), "avg": None, "ok": None, "per": per}
+        return {"n_periods": len(per), "avg": None, "ok": None, "per": per, "total": None}
     last3 = per[-3:]
-    avg = round(sum(p["off"] for p in last3) / 3.0, 1)
-    return {"n_periods": len(per), "avg": avg, "ok": avg >= 8, "per": per}
+    total = sum(p["off"] for p in last3)
+    avg = round(total / 3.0, 1)
+    return {"n_periods": len(per), "avg": avg, "ok": total >= 24, "per": per, "total": total}
 
 
 def merged_history_rows(username, current_rows):
@@ -3585,9 +3621,16 @@ else:
                 if davg["avg"] is None:
                     davg_txt = f"N/A \u00b7 {davg['n_periods']}/3 periods"
                     davg_color = "#9fb3c8"
+                    davg_foot = ""
                 else:
-                    davg_txt = f"{davg['avg']} avg \u00b7 {'OK' if davg['ok'] else 'BELOW 8'}"
+                    last3 = davg["per"][-3:]
+                    per_parts = " \u00b7 ".join(f"{p['off']}" for p in last3)
+                    if any(p["off"] < 7 for p in last3):
+                        per_parts = f"<span style='color:#ff8a8a;'>{per_parts}</span>"
+                    davg_txt = f"{davg['total']} of 24 \u00b7 {'OK' if davg['ok'] else 'SHORT'}"
                     davg_color = "#a5d6a7" if davg["ok"] else "#ff8a8a"
+                    davg_foot = (f"<div class='muted' style='font-size:11px;margin-top:2px;'>last 3 periods' off-days: "
+                                 f"{per_parts} <span style='color:#8aa0b8;'>(min 7 each \u00b7 24 over 3)</span></div>")
                 rows_html = (
                     f"<div class='bidrow'><span>Early / Late / Night</span><span>{cnt['early']} / {cnt['late']} / {cnt['night']}</span></div>"
                     f"<div class='bidrow'><span>7-day max (cap 60 h)</span><span>{_fmt_hm(cum['7d']['max'])}</span></div>"
@@ -3596,12 +3639,13 @@ else:
                     f"<div class='bidrow'><span>Days off \u00b7 longest duty streak</span><span>{do['off_days']} \u00b7 {do['max_duty_run']}d</span></div>"
                     f"<div class='bidrow'><span>Off-day rest (\u226534h \u00b7 2 nights)</span><span>{off_rest_txt}</span></div>"
                     f"<div class='bidrow'><span>Mandatory days off (8.2.17)</span><span>{mand_txt}</span></div>"
-                    f"<div class='bidrow'><span>Days off avg / 4wk (8.2.17.d)</span><span style='color:{davg_color};'>{davg_txt}</span></div>"
+                    f"<div class='bidrow'><span>Days off \u00b7 last 3 periods (8.2.17.d)</span><span style='color:{davg_color};'>{davg_txt}</span></div>"
                 )
                 st.markdown(
                     f"<div class='card'>{rows_html}"
                     f"<div class='muted' style='font-size:11px;margin-top:4px;'>standby & duty days counted in full \u00b7 sick counts as a day off</div>"
                     f"<div class='muted' style='font-size:11px;margin-top:2px;'>mandatory: {mand_line}</div>"
+                    f"{davg_foot}"
                     f"<div class='muted' style='font-size:11px;margin-top:2px;'>(d) needs 3 finalized periods \u2014 finalize past rosters in Roster History.</div></div>",
                     unsafe_allow_html=True)
                 for sev, msg in fdp["findings"]:
@@ -4056,7 +4100,8 @@ else:
                 st.markdown(
                     "<div class='muted' style='margin-bottom:6px;'>Pin a whole calendar month's <b>performed</b> "
                     "roster here to lock in its payslip. Months already <b>finalized</b> in the Dashboard's 🗂 Roster "
-                    "History are pulled automatically for salary \u2014 no re-paste needed.</div>",
+                    "History are pulled automatically — but only once the <b>full month (1st – end)</b> is performed. "
+                    "A half-month, or a month still on the live roster, shows \u201cno data\u201d — never a guess.</div>",
                     unsafe_allow_html=True)
                 sh_pick = st.selectbox(
                     "History month", hist_months,
@@ -4087,14 +4132,14 @@ else:
                         st.rerun()
                     else:
                         st.warning(datetime(sh_pick[0], sh_pick[1], 1).strftime("%B %Y")
-                                   + " has no performed data yet — save it here, or finalize that month's periods in the Dashboard's Roster History.")
+                                   + " has no full performed month yet — save it here, or finalize that month's periods in the Dashboard's Roster History.")
 
             # --- performed roster input (salary is based on the PERFORMED month, not the live roster) ---
             if 'performed_roster' not in st.session_state:
                 st.session_state['performed_roster'] = load_performed_roster(st.session_state['username'])
             perf_saved = st.session_state.get('performed_roster', '')
             with st.expander("📋 Performed Roster (paste here)", expanded=not bool(perf_saved)):
-                st.markdown("<div class='muted' style='margin-bottom:6px;'>Salary is calculated per <b>calendar month (1st – end)</b>. Paste your <b>performed</b> roster from the crew portal — it can span two months / roster periods; you'll pick the salary month below. Saved separately from your live roster.</div>", unsafe_allow_html=True)
+                st.markdown("<div class='muted' style='margin-bottom:6px;'>Salary is calculated per <b>calendar month (1st – end)</b>, and only when the <b>whole month</b> is performed — a half-month shows \u201cno data\u201d. Paste your <b>performed</b> roster from the crew portal; it's used here only if it covers the full month. Saved separately from your live roster.</div>", unsafe_allow_html=True)
                 perf_input = st.text_area("Performed roster text", value=perf_saved, height=160,
                                           label_visibility="collapsed",
                                           placeholder="Paste your performed roster for the month here...")
@@ -4108,19 +4153,22 @@ else:
                     save_performed_roster(st.session_state['username'], '')
                     st.rerun()
 
-            # Salary is per CALENDAR MONTH (1st–end), while rosters run in 28-day
-            # periods that straddle months — the month list spans every source
-            # (manual history, finalized Roster History, performed slot, live roster).
-            months = salary_available_months(st.session_state['username'], parsed_rows)
+            # Salary is per CALENDAR MONTH (1st–end). ONLY a full performed month
+            # (1st through the last day) is computed — a partial month or one
+            # still on the live roster shows "no data" instead of guessing from
+            # the wrong roster. Every month Jan 2026 → now is offered so a
+            # month with no data yet is visible as such.
+            months = _months_from_2026(today_ym)
             perf_rows = []
             sel_month = None
-            src = "current"
+            src = "none"
             if months:
+                labels = [datetime(y, m, 1).strftime("%B %Y") for y, m in months]
                 def _mcount(ym):
                     rows, _ = salary_month_rows(st.session_state['username'], ym, parsed_rows)
                     return sum(1 for r in rows if r["Type"] == "FLIGHT")
-                default_ym = max(months, key=lambda ym: (_mcount(ym), ym))   # busiest (most complete) month
-                labels = [datetime(y, m, 1).strftime("%B %Y") for y, m in months]
+                full_months = [ym for ym in months if _mcount(ym) > 0]
+                default_ym = max(full_months) if full_months else today_ym
                 _pick_label = st.session_state.get('salary_month_pick')
                 if _pick_label not in labels:
                     st.session_state['salary_month_pick'] = labels[months.index(default_ym)]
@@ -4130,16 +4178,16 @@ else:
                 perf_rows, src = salary_month_rows(st.session_state['username'], sel_month, parsed_rows)
             src_caption = {
                 "manual": "📌 From your saved salary history for this month.",
-                "history": "🗂 Auto-pulled from the Dashboard's finalized Roster History (performed rosters) — no re-paste needed.",
-                "slot": "📋 From the performed-roster slot above.",
-                "current": "📅 Live current roster (published plan).",
+                "history": "🗂 Auto-pulled from the Dashboard's finalized Roster History — the full performed month.",
+                "slot": "📋 From the performed-roster slot above (full month).",
             }.get(src, "")
             flights_exist = any(r["Type"] == "FLIGHT" for r in perf_rows)
             if src_caption:
                 st.markdown(f"<div class='muted' style='font-size:11.5px;margin-bottom:6px;'>{src_caption}</div>",
                             unsafe_allow_html=True)
             if not flights_exist:
-                st.info("No flights found for this month yet — save it in 🗓 Salary History, finalize it in the Dashboard's Roster History, or paste it into the performed-roster slot above.")
+                _mlabel = datetime(sel_month[0], sel_month[1], 1).strftime("%B %Y") if sel_month else "this month"
+                st.info(f"No full performed month for {_mlabel} yet — salary only computes once the whole month (1st – end) is performed. Finalize that month's 28-day periods in the Dashboard's Roster History, or save the full month in 🗓 Salary History.")
             else:
                 _pd = [r["DateObj"].date() for r in perf_rows if r.get("DateObj")]
                 if _pd:
@@ -4282,7 +4330,7 @@ else:
     # ================= 📊 SALARY ANALYTICS PAGE =================
     with page_analytics:
         st.markdown("#### 📊 Salary Analytics")
-        st.markdown("<div class='muted' style='margin-bottom:10px;'>Every month you have performed data for — assembled from finalized Roster History, saved salary history and the performed-roster slot. Charts use your saved crew profile.</div>", unsafe_allow_html=True)
+        st.markdown("<div class='muted' style='margin-bottom:10px;'>Full performed months only (1st – end), from finalized Roster History or saved salary history — partial months are excluded. Charts use your saved crew profile.</div>", unsafe_allow_html=True)
 
         a_saved = load_profile(st.session_state['username'])
         a_prof = {
@@ -4326,7 +4374,7 @@ else:
                     "Allowance ($)": _s["allow_usd_total"],
                     "Sectors": _n,
                     "Layover nights": _s["l_nights"],
-                    "Source": {"manual": "pinned", "history": "auto", "slot": "slot", "current": "live"}.get(_src, _src),
+                    "Source": {"manual": "pinned", "history": "auto", "slot": "slot"}.get(_src, _src),
                 })
             if not a_rows:
                 st.info("No complete months with flights found yet.")
@@ -4345,27 +4393,138 @@ else:
                 with c4:
                     st.metric("Total net", f"Rs {a_df['Net (Rs)'].sum():,.0f}")
 
+                a_df["Δ Net (Rs)"] = a_df["Net (Rs)"].diff()
+
+                PAL = {"cyan": "#22d3ee", "green": "#34d399", "amber": "#fbbf24",
+                       "pink": "#f472b6", "violet": "#a78bfa", "blue": "#60a5fa"}
+                FONT = dict(family="Segoe UI, Arial, sans-serif", size=12, color="#9fb3c8")
+
+                def _style_axes(fig, height=300, legend=True):
+                    fig.update_layout(
+                        height=height, margin=dict(l=10, r=10, t=26, b=10),
+                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                        font=FONT, showlegend=legend, hovermode="x unified",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left",
+                                    x=0, font=dict(size=11)))
+                    fig.update_xaxes(showgrid=False, zeroline=False, linecolor="rgba(159,179,200,0.25)")
+                    fig.update_yaxes(showgrid=True, gridcolor="rgba(159,179,200,0.12)", zeroline=False)
+                    return fig
+
+                # 1 · Net trend — smooth area line
+                net = go.Figure(go.Scatter(
+                    x=a_df["Month"], y=a_df["Net (Rs)"], mode="lines+markers",
+                    line=dict(color=PAL["cyan"], width=2.5, shape="spline", smoothing=0.6),
+                    marker=dict(size=7, color=PAL["cyan"], line=dict(width=2, color="#0b1622")),
+                    fill="tozeroy", fillcolor="rgba(34,211,238,0.12)",
+                    hovertemplate="%{x}<br>Net Rs %{y:,.0f}<extra></extra>"))
+                _style_axes(net, height=300, legend=False)
                 st.markdown("##### Net salary by month")
-                st.bar_chart(a_df.set_index("Month")[["Net (Rs)"]], height=260)
+                st.plotly_chart(net, width="stretch")
 
-                st.markdown("##### Earnings composition (Rs)")
-                st.bar_chart(a_df.set_index("Month")[["Productivity (Rs)", "Premium (Rs)", "FBPP (Rs)", "Acting (Rs)"]], height=280)
+                # 2 · Composition donut + block/sectors dual axis, side by side
+                cL, cR = st.columns([1, 1])
+                with cL:
+                    comp = [("Productivity", "Productivity (Rs)", PAL["cyan"]),
+                            ("Premium", "Premium (Rs)", PAL["green"]),
+                            ("FBPP", "FBPP (Rs)", PAL["pink"]),
+                            ("Acting", "Acting (Rs)", PAL["violet"])]
+                    keep = [(l, a_df[c].sum(), col) for l, c, col in comp if a_df[c].sum() > 0]
+                    if keep:
+                        donut = go.Figure(go.Pie(
+                            labels=[k[0] for k in keep], values=[k[1] for k in keep],
+                            hole=0.62, marker=dict(colors=[k[2] for k in keep],
+                                                   line=dict(color="#0b1622", width=2)),
+                            textinfo="label+percent", textfont=dict(size=11, color="#c9d6e3"),
+                            hovertemplate="%{label}<br>Rs %{value:,.0f}<extra></extra>"))
+                        donut.update_layout(
+                            height=300, margin=dict(l=10, r=10, t=26, b=10),
+                            paper_bgcolor="rgba(0,0,0,0)", font=FONT, showlegend=False,
+                            annotations=[dict(
+                                text=f"Rs {sum(k[1] for k in keep):,.0f}"
+                                     f"<br><span style='font-size:11px;color:#9fb3c8'>total earnings</span>",
+                                x=0.5, y=0.5, showarrow=False, font=dict(size=15, color="#e6edf3"))])
+                        st.markdown("##### Earnings composition")
+                        st.plotly_chart(donut, width="stretch")
+                    else:
+                        st.info("No earnings components to show yet.")
+                with cR:
+                    bh = go.Figure()
+                    bh.add_trace(go.Scatter(
+                        x=a_df["Month"], y=a_df["Block hours"], name="Block hours",
+                        mode="lines+markers", line=dict(color=PAL["blue"], width=2.5),
+                        marker=dict(size=7, line=dict(width=2, color="#0b1622")), yaxis="y",
+                        hovertemplate="%{x}<br>Block %{y:.1f} h<extra></extra>"))
+                    bh.add_trace(go.Scatter(
+                        x=a_df["Month"], y=a_df["Sectors"], name="Sectors",
+                        mode="lines+markers", line=dict(color=PAL["amber"], width=2.5, dash="dot"),
+                        marker=dict(size=7, line=dict(width=2, color="#0b1622")), yaxis="y2",
+                        hovertemplate="%{x}<br>%{y} sectors<extra></extra>"))
+                    bh.update_layout(
+                        height=300, margin=dict(l=10, r=10, t=26, b=10),
+                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                        font=FONT, hovermode="x unified",
+                        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left",
+                                    x=0, font=dict(size=11)),
+                        yaxis=dict(title=dict(text="hours", font=dict(color=PAL["blue"], size=11)),
+                                   gridcolor="rgba(159,179,200,0.12)", zeroline=False),
+                        yaxis2=dict(title=dict(text="sectors", font=dict(color=PAL["amber"], size=11)),
+                                    overlaying="y", side="right", showgrid=False))
+                    bh.update_xaxes(showgrid=False, zeroline=False, linecolor="rgba(159,179,200,0.25)")
+                    st.markdown("##### Block hours & sectors")
+                    st.plotly_chart(bh, width="stretch")
 
-                st.markdown("##### Block hours & sectors")
-                st.line_chart(a_df.set_index("Month")[["Block hours", "Sectors"]], height=260)
-
+                # 3 · Allowances — clean lines
+                allow = go.Figure()
+                for col, name, color in [("Meals ($)", "Meals", PAL["cyan"]),
+                                         ("Layover ($)", "Layover", PAL["violet"]),
+                                         ("T/A ($)", "T/A overnight", PAL["pink"])]:
+                    allow.add_trace(go.Scatter(
+                        x=a_df["Month"], y=a_df[col], name=name, mode="lines+markers",
+                        line=dict(color=color, width=2.5),
+                        marker=dict(size=7, line=dict(width=2, color="#0b1622")),
+                        hovertemplate="%{x}<br>" + name + " $%{y:,.0f}<extra></extra>"))
+                _style_axes(allow, height=280)
                 st.markdown("##### Allowances (USD)")
-                st.bar_chart(a_df.set_index("Month")[["Meals ($)", "Layover ($)", "T/A ($)"]], height=260)
+                st.plotly_chart(allow, width="stretch")
 
-                if len(a_df) >= 2:
-                    a_df["Δ Net (Rs)"] = a_df["Net (Rs)"].diff()
-                    st.markdown("##### Month-over-month net change (Rs)")
-                    st.bar_chart(a_df.set_index("Month")[["Δ Net (Rs)"]], height=240)
-
+                # 4 · Comparison table with MoM delta arrows
                 st.markdown("##### Monthly comparison")
-                show_cols = ["Month", "Net (Rs)", "Block hours", "Sectors", "Layover nights",
-                             "Allowance ($)", "Source"]
-                st.dataframe(a_df[show_cols].set_index("Month"))
+                _rows_html = ""
+                for _, r in a_df.iterrows():
+                    d = r["Δ Net (Rs)"]
+                    if pd.isna(d):
+                        dcell = "<span style='color:#8aa0b8;'>—</span>"
+                    else:
+                        dcell = (f"<span style='color:{'#34d399' if d >= 0 else '#f87171'};'>"
+                                 f"{'▲ +' if d >= 0 else '▼ '}{abs(d):,.0f}</span>")
+                    src_badge = {"pinned": "📌 pinned", "auto": "🗂 auto", "slot": "📋 slot"}.get(r["Source"], r["Source"])
+                    _rows_html += (
+                        f"<tr>"
+                        f"<td style='padding:6px 10px;border-bottom:1px solid #223144;'>{r['Month']}</td>"
+                        f"<td style='padding:6px 10px;border-bottom:1px solid #223144;text-align:right;font-weight:700;color:#4caf50;'>Rs {r['Net (Rs)']:,.0f}</td>"
+                        f"<td style='padding:6px 10px;border-bottom:1px solid #223144;text-align:right;'>{dcell}</td>"
+                        f"<td style='padding:6px 10px;border-bottom:1px solid #223144;text-align:right;'>{r['Block hours']:,.1f}h</td>"
+                        f"<td style='padding:6px 10px;border-bottom:1px solid #223144;text-align:right;'>{int(r['Sectors'])}</td>"
+                        f"<td style='padding:6px 10px;border-bottom:1px solid #223144;text-align:right;'>{int(r['Layover nights'])}</td>"
+                        f"<td style='padding:6px 10px;border-bottom:1px solid #223144;text-align:right;'>${r['Allowance ($)']:,.0f}</td>"
+                        f"<td style='padding:6px 10px;border-bottom:1px solid #223144;'>{src_badge}</td>"
+                        f"</tr>")
+                _table_html = (
+                    "<div class='card' style='padding:8px 10px;'>"
+                    "<table style='width:100%;border-collapse:collapse;font-size:13px;'>"
+                    "<thead><tr style='color:#9fb3c8;font-size:11px;text-transform:uppercase;letter-spacing:.4px;'>"
+                    "<th style='text-align:left;padding:6px 10px;'>Month</th>"
+                    "<th style='text-align:right;padding:6px 10px;'>Net (Rs)</th>"
+                    "<th style='text-align:right;padding:6px 10px;'>Δ vs prev</th>"
+                    "<th style='text-align:right;padding:6px 10px;'>Block h</th>"
+                    "<th style='text-align:right;padding:6px 10px;'>Sectors</th>"
+                    "<th style='text-align:right;padding:6px 10px;'>L/O nights</th>"
+                    "<th style='text-align:right;padding:6px 10px;'>Allowance ($)</th>"
+                    "<th style='text-align:left;padding:6px 10px;'>Source</th>"
+                    "</tr></thead><tbody>"
+                    + _rows_html +
+                    "</tbody></table></div>")
+                st.markdown(_table_html, unsafe_allow_html=True)
                 st.markdown("<div class='muted' style='margin-top:8px;'>⚠️ Estimate from your saved profile & rostered times — refer to official payslips for final figures.</div>", unsafe_allow_html=True)
 
     # ================= \u23f1 FDP CALCULATOR PAGE =================
