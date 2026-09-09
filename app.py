@@ -377,16 +377,113 @@ def preprocess_roster_text(raw_text):
     if "\t" in t:
         return t
     t = re.sub(r'[ \t]*HTL', '\nHTL', t)
-    t = re.sub(r'(\d{2}[A-Z]{3}\d{2}[ \t]*\d{2}:\d{2})[ \t]*(?=UL\s*\d|SB|OFF|ROF|TOF)', r'\n\1', t)
+    _code_alt = "|".join(re.escape(c) for c in _GROUND_CODES_SORTED)
+    t = re.sub(r'(\d{2}[A-Z]{3}\d{2}[ \t]*\d{2}:\d{2})[ \t]*(?=UL\s*\d|SB\d|' + _code_alt + r')', r'\n\1', t)
     return t
 
-# Training / recurrent / ground-duty codes that count as a DUTY DAY (not a
-# day off): SEP, SEC, CRM, DGR, F/A, OBT, SPC, SVC, GNT, CBT, CDE, CSE, CFD,
-# CSS, PEF, LSW, BCT, CSW, SER, DFT, ICT, CMW, CSP, CMP, CSC, DLV, OFG, DTL.
-DUTY_CODES = ["SEP", "SEC", "CRM", "DGR", "F/A", "OBT", "SPC", "SVC", "GNT", "CBT",
-              "CDE", "CSE", "CFD", "CSS", "PEF", "LSW", "BCT", "CSW", "SER", "DFT",
-              "ICT", "CMW", "CSP", "CMP", "CSC", "DLV", "OFG", "DTL"]
-_DUTY_PAT = "|".join(re.escape(c) for c in DUTY_CODES)
+# --- Ground / activity codes (from the user's "Ground Code" reference) ---
+# Every code the portal can emit is recognised so nothing is silently dropped.
+# bucket: 'off' = legal/request day off (the ONLY codes that count as a day off
+# for 8.2.17); 'layover'; 'standby'; 'sick' (leave bucket); 'leave'; 'neutral'
+# (neither duty nor a day off); 'tof' (time-off window); 'duty' (training /
+# office / meeting / positioning / standby call-out — counts as a duty day).
+# 'UL…' flights are handled separately by the parsers.
+GROUND_CODES = {
+    # day off
+    "OFF": ("off", "Legal off day"), "ROF": ("off", "Request off"),
+    # layover / time off
+    "HTL": ("layover", "Hotel"),
+    "TOF": ("tof", "Time off"), "HTO": ("tof", "Time off after FAU meeting"),
+    # standby
+    "SB1": ("standby", "Standby 1"), "SB2": ("standby", "Standby 2"),
+    "SB3": ("standby", "Standby 3"), "SB4": ("standby", "Standby 4"),
+    "SSY": ("standby", "Standby for SNY"), "LSB": ("standby", "London standby"),
+    "ASB": ("standby", "Airport standby"),
+    # sick (leave bucket)
+    "S/L": ("sick", "Illness"), "FSL": ("sick", "Flexible sick"),
+    "LMS": ("sick", "Last minute sick"), "SAR": ("sick", "Sick after ROFF"),
+    "SBR": ("sick", "Sick before ROFF"), "SAC": ("sick", "Sick after casual leave"),
+    "SBC": ("sick", "Sick before casual leave"), "SAA": ("sick", "Sick after annual leave"),
+    "SBA": ("sick", "Sick before annual leave"), "SAS": ("sick", "Sick after standby"),
+    "SCM": ("sick", "Sick combined w/ leave"), "SOD": ("sick", "Sick on duty swap"),
+    "SSC": ("sick", "Sick set off from CLV"), "SSA": ("sick", "Sick set off from ALV"),
+    "S/R": ("sick", "Sick leave request"),
+    # leave
+    "ALV": ("leave", "Annual leave"), "RLV": ("leave", "Annual leave (after publish)"),
+    "ALP": ("leave", "Annual leave (planned)"), "CLV": ("leave", "Casual leave"),
+    "C/R": ("leave", "Casual leave request"), "EML": ("leave", "Emergency leave"),
+    "LWP": ("leave", "No-pay leave"), "SPL": ("leave", "Special leave"),
+    "MTL": ("leave", "Maternity leave"), "MTP": ("leave", "Maternity leave (paid)"),
+    "MTO": ("leave", "Maternity leave (office)"), "MTN": ("leave", "Maternity leave (no pay)"),
+    "ACL": ("leave", "Accident leave"), "NAN": ("leave", "Non-authorized no-pay"),
+    "A/N": ("leave", "Authorized no-pay leave"),
+    # neutral (not duty, not a day off)
+    "AWL": ("neutral", "Absent without leave"), "GRD": ("neutral", "Grounding (discipline)"),
+    "GRW": ("neutral", "Grounding (weight)"), "GRC": ("neutral", "Grounding (cosmetic)"),
+    "OTR": ("neutral", "Off the roster"), "HOT": ("neutral", "Outstation off"),
+    "OVO": ("neutral", "Overseas off day"), "CHO": ("neutral", "Company holiday"),
+    "AB1": ("neutral", "Block before ALV"), "AB2": ("neutral", "Block after ALV"),
+    "CNL": ("neutral", "Cancelled"), "NTS/QRN": ("neutral", "Quarantine"),
+    "QRC": ("neutral", "Quarantine (first contact)"), "QRW": ("neutral", "Waiting for PCR results"),
+    "PCO": ("neutral", "PCR on arrival"), "PCR/PCL": ("neutral", "PCR at hospital"),
+    "YFV": ("neutral", "Yellow fever vaccine"),
+    # duty (training / office / meeting / positioning / standby call-out)
+    "DLV": ("duty", "Company assignment"), "OFG": ("duty", "Office duty"),
+    "OFH": ("duty", "Office duty (half day)"), "MTG": ("duty", "Meeting"),
+    "GND": ("duty", "Ground duty"), "PRG": ("duty", "Ground duty (pregnancy)"),
+    "ADM": ("duty", "Admin"), "ENQ": ("duty", "Enquiry"), "SDN": ("duty", "Step down"),
+    "MED": ("duty", "Medical check"), "GTP": ("duty", "Ground transport"),
+    "OAL": ("duty", "Positioning (other carrier)"), "SCO": ("duty", "Called on standby"),
+    "DTL": ("duty", "Duty leave"), "FAU": ("duty", "FAU meeting"),
+    "IMM": ("duty", "Inflight mgmt meeting"), "SEP": ("duty", "SEP training"),
+    "SEC": ("duty", "Security refresher"), "CRM": ("duty", "CRM"),
+    "DGR": ("duty", "DGR refresher"), "F/A": ("duty", "First aid training"),
+    "TTT": ("duty", "Train the trainer"), "OBT": ("duty", "Outbound training"),
+    "SPC": ("duty", "Announcement training"), "SVC": ("duty", "Service training"),
+    "GNT": ("duty", "General training"), "RST": ("duty", "Re-sit"),
+    "CBT": ("duty", "Computer based training"), "CDE": ("duty", "Ditching evacuation"),
+    "CSE": ("duty", "Slide evacuation"), "CFD": ("duty", "Fire drill"),
+    "FSE": ("duty", "Slide evacuation FD"), "FDE": ("duty", "Ditching evacuation FD"),
+    "FFD": ("duty", "Fire drill FD"), "CSS": ("duty", "CRM, security & safety"),
+    "PEF": ("duty", "Performance training"), "SOP": ("duty", "SOP / FMGS training"),
+    "EXM": ("duty", "Crew exam"), "ONE": ("duty", "One World training"),
+    "PAX": ("duty", "Pax interaction"), "CSW": ("duty", "CS workshop"),
+    "INT": ("duty", "Crew interview"), "TD1": ("duty", "Training D1 (DGR/SEC)"),
+    "TD2": ("duty", "Training D2 (safety/fd/slevac)"), "TD3": ("duty", "Training D2 (CRM/ditching)"),
+    "IBC": ("duty", "Initial BC training"), "TMD": ("duty", "Team dynamics"),
+    "EMI": ("duty", "Emotional intelligence"), "WNA": ("duty", "Wine appreciation"),
+    "LSW": ("duty", "Leadership workshop"), "BCT": ("duty", "BC training"),
+    "321": ("duty", "A321 training"), "MLS": ("duty", "Meal service training"),
+    "SPH": ("duty", "Special pax handling"), "EVA": ("duty", "On-board eval"),
+    "ETQ": ("duty", "Etiquette training"), "PER": ("duty", "Personality development"),
+    "GRN": ("duty", "Graduation"), "PDM": ("duty", "Personality development"),
+    "F&B": ("duty", "Food & bev training"), "SER": ("duty", "Service recurrent"),
+    "DFS": ("duty", "Duty free training"), "CSR": ("duty", "CSR"),
+    "ICT": ("duty", "In-charge crew training"), "CMW": ("duty", "Cabin manager workshop"),
+    "CSP": ("duty", "Cabin supervisor promotion"), "CMP": ("duty", "Cabin manager workshop"),
+    "CSC": ("duty", "Security"), "DFT": ("duty", "Training/duty"),
+}
+
+_GROUND_CODES_SORTED = sorted(GROUND_CODES, key=len, reverse=True)
+_GROUND_CODE_PAT = "|".join(re.escape(c) for c in _GROUND_CODES_SORTED)
+
+
+def ground_code_bucket(code):
+    info = GROUND_CODES.get(code)
+    return info[0] if info else None
+
+
+def ground_code_label(code):
+    info = GROUND_CODES.get(code)
+    return info[1] if info else (code or "")
+
+
+def _detect_code(line_str):
+    """Longest-first ground-code token match with alnum/slash boundaries."""
+    for c in _GROUND_CODES_SORTED:
+        if re.search(r'(?<![A-Z0-9/])' + re.escape(c) + r'(?![A-Z0-9/])', line_str):
+            return c
+    return None
 
 
 def _clamp_exclusive_end(dep_dt, arr_dt):
@@ -417,7 +514,7 @@ def _parse_tab_line(line_str):
     act_idx = act = None
     for i, f in enumerate(fields):
         s = f.strip()
-        if re.match(r'^(UL\s*\d{1,4}|HTL|OFF|ROF|TOF|SB\d*|ALV|RLV|ALP|CLV|S/L|' + _DUTY_PAT + r')$', s):
+        if re.match(r'^(UL\s*\d{1,4}|SB\d*|' + _GROUND_CODE_PAT + r')$', s):
             act_idx, act = i, s.upper()
             break
     if act is None:
@@ -457,50 +554,52 @@ def _parse_tab_line(line_str):
             if len(after_arr) > 1:
                 co_dt = after_arr[1]
         ci_dt = next((d for (i, d) in dts if dep_dt and d < dep_dt), None)
-    elif act == "HTL":
-        atype, code = "LAYOVER", "HTL"
-        station = iatas[0][1] if iatas else "-"
-        dep_iata = arr_iata = station
-        if dts:
-            dep_dt, arr_dt = dts[0][1], dts[-1][1]
-        ci_dt, co_dt = dep_dt, arr_dt
-    elif act in ("OFF", "ROF"):
-        atype, code = "DAY OFF", act
-        if dts:
-            dep_dt, arr_dt = _clamp_exclusive_end(dts[0][1], dts[-1][1])
-    elif act == "TOF":
-        # Time OFF — a protected time-off window (NOT a full day off). No duty
-        # may check in or check out within the window (user rule).
-        atype, code = "TIMEOFF", act
-        if dts:
-            dep_dt, arr_dt = dts[0][1], dts[-1][1]
-    elif re.match(r'^SB\d*$', act):
-        atype, code = "STANDBY", act
-        if len(dts) >= 4:
-            ci_dt, dep_dt, arr_dt, co_dt = dts[0][1], dts[1][1], dts[2][1], dts[3][1]
-        elif len(dts) == 3:
-            ci_dt = dep_dt = dts[0][1]
-            arr_dt, co_dt = dts[1][1], dts[2][1]
-        elif dts:
-            ci_dt = dep_dt = dts[0][1]
-            arr_dt = co_dt = dts[-1][1]
-    elif act in ("ALV", "RLV", "ALP", "CLV", "S/L"):
-        atype, code = "LEAVE", act
-        if dts:
-            dep_dt, arr_dt = _clamp_exclusive_end(dts[0][1], dts[-1][1])
-    elif act in DUTY_CODES:
-        # training/duty day — carries check-in, start, end & check-out stamps
-        atype, code = "DUTY", act
-        if len(dts) >= 4:
-            ci_dt, dep_dt, arr_dt, co_dt = dts[0][1], dts[1][1], dts[2][1], dts[3][1]
-        elif len(dts) == 3:
-            ci_dt = dep_dt = dts[0][1]
-            arr_dt, co_dt = dts[1][1], dts[2][1]
-        elif dts:
-            ci_dt = dep_dt = dts[0][1]
-            arr_dt = co_dt = dts[-1][1]
     else:
-        return None
+        bucket = ground_code_bucket(act)
+        if bucket == "layover":
+            atype, code = "LAYOVER", act
+            station = iatas[0][1] if iatas else "-"
+            dep_iata = arr_iata = station
+            if dts:
+                dep_dt, arr_dt = dts[0][1], dts[-1][1]
+            ci_dt, co_dt = dep_dt, arr_dt
+        elif bucket == "off":
+            atype, code = "DAY OFF", act
+            if dts:
+                dep_dt, arr_dt = _clamp_exclusive_end(dts[0][1], dts[-1][1])
+        elif bucket == "tof":
+            # Time OFF — a protected time-off window (NOT a full day off). No duty
+            # may check in or check out within the window (user rule).
+            atype, code = "TIMEOFF", act
+            if dts:
+                dep_dt, arr_dt = dts[0][1], dts[-1][1]
+        elif bucket == "standby" or re.match(r'^SB\d*$', act):
+            atype, code = "STANDBY", act
+            if len(dts) >= 4:
+                ci_dt, dep_dt, arr_dt, co_dt = dts[0][1], dts[1][1], dts[2][1], dts[3][1]
+            elif len(dts) == 3:
+                ci_dt = dep_dt = dts[0][1]
+                arr_dt, co_dt = dts[1][1], dts[2][1]
+            elif dts:
+                ci_dt = dep_dt = dts[0][1]
+                arr_dt = co_dt = dts[-1][1]
+        elif bucket in ("sick", "leave", "neutral"):
+            atype, code = "LEAVE", act
+            if dts:
+                dep_dt, arr_dt = _clamp_exclusive_end(dts[0][1], dts[-1][1])
+        elif bucket == "duty":
+            # training/duty day — carries check-in, start, end & check-out stamps
+            atype, code = "DUTY", act
+            if len(dts) >= 4:
+                ci_dt, dep_dt, arr_dt, co_dt = dts[0][1], dts[1][1], dts[2][1], dts[3][1]
+            elif len(dts) == 3:
+                ci_dt = dep_dt = dts[0][1]
+                arr_dt, co_dt = dts[1][1], dts[2][1]
+            elif dts:
+                ci_dt = dep_dt = dts[0][1]
+                arr_dt = co_dt = dts[-1][1]
+        else:
+            return None
 
     # route / station & timezone origin/destination
     if atype == "FLIGHT":
@@ -606,7 +705,9 @@ def parse_roster_text(raw_text):
             except ValueError:
                 pass
 
-        if any(keyword in line_str for keyword in ["UL", "OFF", "HTL", "SB", "ROF", "TOF", "ALV", "RLV", "ALP", "CLV", "S/L"]):
+        act_code = _detect_code(line_str)
+        is_flight = (act_code is None and re.search(r'UL\s*\d{1,4}', line_str) is not None)
+        if act_code is not None or is_flight:
             activity_type = "OTHER"
             flight_no = "-"
             checkin_time = "-"
@@ -619,40 +720,36 @@ def parse_roster_text(raw_text):
 
             time_matches = re.findall(r'(\d{2}:\d{2})', line_str)
 
-            if "OFF" in line_str or "ROF" in line_str:
-                activity_type = "DAY OFF"
-            elif "TOF" in line_str:
-                activity_type = "TIMEOFF"
-            elif any(c in line_str for c in ("ALV", "RLV", "ALP", "CLV", "S/L")):
-                activity_type = "LEAVE"
-            elif "HTL" in line_str:
-                activity_type = "LAYOVER"
-            elif "SB" in line_str:
-                activity_type = "STANDBY"
-            elif "UL" in line_str:
+            if is_flight:
                 activity_type = "FLIGHT"
                 # Bounded so 'UL60622SEP26' parses as UL606 + date, not UL60622
                 m = re.search(r'UL\s*(\d{1,4}?)(?=\d{2}[A-Z]{3}\d{2}|\D|$)', line_str)
                 if m:
                     flight_no = f"UL {m.group(1)}"
+            else:
+                bucket = ground_code_bucket(act_code)
+                if bucket == "off":
+                    activity_type = "DAY OFF"
+                elif bucket == "tof":
+                    activity_type = "TIMEOFF"
+                elif bucket == "layover":
+                    activity_type = "LAYOVER"
+                elif bucket == "standby":
+                    activity_type = "STANDBY"
+                elif bucket in ("sick", "leave", "neutral"):
+                    activity_type = "LEAVE"
+                elif bucket == "duty":
+                    activity_type = "DUTY"
+                else:
+                    activity_type = "OTHER"
 
-            # Raw activity code — needed for CLV exclusion & acting-duty marking
+            # Raw activity code — needed for chip labels & acting-duty marking
             if activity_type == "FLIGHT":
                 code = flight_no.replace(" ", "")
             elif activity_type == "LAYOVER":
                 code = "HTL"
-            elif activity_type == "DAY OFF":
-                code = next((c for c in ("ROF", "OFF") if c in line_str), "OFF")
-            elif activity_type == "TIMEOFF":
-                code = "TOF"
-            elif activity_type == "STANDBY":
-                m = re.search(r'\bSB\d*\b', line_str)
-                code = m.group(0) if m else "SB"
-            elif activity_type == "LEAVE":
-                m = re.search(r'\b(ALV|RLV|ALP|CLV|S/L)\b', line_str)
-                code = m.group(1) if m else "LEAVE"
             else:
-                code = "OTHER"
+                code = act_code or activity_type
 
             # Multi-day span support (layover/standby/off blocks with start+end stamps)
             if dt_stamps:
@@ -703,7 +800,9 @@ def parse_roster_text(raw_text):
 
             parts = line_str.split()
             for p in parts:
-                if len(p) == 3 and p.isalnum() and p not in ["FA", "J28", "CMB", "CAN", "BKK", "TRZ", "MAA", "MLE", "DMM", "BLR", "DXB", "RUH", "LHE", "ICN", "DEL", "PUR"]:
+                if (len(p) == 3 and p.isalnum() and re.search(r'\d', p)
+                        and p not in ["FA", "J28", "CMB", "CAN", "BKK", "TRZ", "MAA", "MLE",
+                                      "DMM", "BLR", "DXB", "RUH", "LHE", "ICN", "DEL", "PUR"]):
                     ac_type = p
 
             # Exact datetimes for the rules engine (portal stamps preferred,
@@ -736,7 +835,7 @@ def parse_roster_text(raw_text):
                             co_dt = datetime.combine(arr_dt.date(), tco)
                             if co_dt < arr_dt:
                                 co_dt += timedelta(days=1)
-            elif activity_type in ("STANDBY", "LAYOVER") and dt_stamps:
+            elif activity_type in ("STANDBY", "LAYOVER", "DUTY") and dt_stamps:
                 ci_dt, co_dt = min(dt_stamps), max(dt_stamps)
 
             # --- timezone normalization ---
@@ -2538,6 +2637,15 @@ def _duty_cont_chip(sectors):
             else f"<div class='chip chip-cont'>↳ <b>{title}</b></div>")
 
 
+def _current_only_note(label):
+    """Muted placeholder shown in place of a current-roster panel's details when
+    the calendar is browsing a PAST (archived) period — crew shouldn't mistake
+    current-roster data for the archived period on screen."""
+    return (f"<div class='card' style='border-color:#607d8b;color:#9fb3c8;font-size:12.5px;'>"
+            f"ℹ️ <b>{label}</b> reflects the <b>current</b> roster only — switch the calendar "
+            f"back to the current period to view it.</div>")
+
+
 def _off_chip(mand_rules, code="OFF"):
     """DAY OFF chip — OFF vs ROF kept distinct; mandatory days (required by
     8.2.17) are highlighted red."""
@@ -2628,19 +2736,39 @@ def build_calendar_html(rows, span=None):
                 t = f"{s0.strftime('%H:%M')}–{s1.strftime('%H:%M')}"
                 if s1.date() != s0.date():
                     t = f"{s0.day} {s0.strftime('%H:%M')}–{s1.day} {s1.strftime('%H:%M')}"
-            chip = f"<div class='chip chip-sby'>⏱ <b>{code}</b>{(' · ' + t) if t else ''}</div>"
+            chip = (f"<div class='chip chip-sby' title='{ground_code_label(code)}'>"
+                    f"⏱ <b>{code}</b>{(' · ' + t) if t else ''}</div>")
         elif r["Type"] == "LEAVE":
-            chip = ("<div class='chip chip-lay'>🤒 S/L (sick)</div>" if r.get("Code") == "S/L"
-                    else "<div class='chip chip-lay'>🌴 Leave</div>")
+            _code = r.get("Code") or "LEAVE"
+            _bucket = ground_code_bucket(_code) or "leave"
+            _lbl = ground_code_label(_code)
+            if _bucket == "sick":
+                chip = f"<div class='chip chip-lay' title='{_lbl}'>🤒 {_code}</div>"
+            elif _bucket == "neutral":
+                if _code == "CNL":
+                    _em = "🚫"
+                elif _code in ("NTS/QRN", "QRC", "QRW", "PCO", "PCR/PCL", "YFV"):
+                    _em = "😷"
+                elif _code == "CHO":
+                    _em = "🎉"
+                elif _code in ("HOT", "OVO"):
+                    _em = "🏖"
+                else:
+                    _em = "▪"
+                chip = f"<div class='chip chip-lay' title='{_lbl}'>{_em} {_code}</div>"
+            else:
+                chip = f"<div class='chip chip-lay' title='{_lbl}'>🌴 {_code}</div>"
         elif r["Type"] == "TIMEOFF":
             s0 = r.get("DEPdt") or r.get("CIdt")
             s1 = r.get("ARRdt") or r.get("COdt")
             t = ""
             if isinstance(s0, datetime) and isinstance(s1, datetime):
                 t = f" {s0.strftime('%H:%M')}–{s1.strftime('%H:%M')}"
-            chip = f"<div class='chip chip-tof'>🕓 TOF{t}</div>"
+            _tcode = r.get("Code") or "TOF"
+            chip = f"<div class='chip chip-tof' title='{ground_code_label(_tcode)}'>🕓 {_tcode}{t}</div>"
         elif r["Type"] == "DUTY":
-            chip = f"<div class='chip chip-duty'>📚 {r.get('Code') or 'Duty'}</div>"
+            _dcode = r.get('Code') or 'Duty'
+            chip = f"<div class='chip chip-duty' title='{ground_code_label(_dcode)}'>📚 {_dcode}</div>"
         else:
             continue
         d0 = r["DateObj"].date()
@@ -2707,8 +2835,10 @@ def build_calendar_html(rows, span=None):
         "= discretionary &nbsp;·&nbsp; "
         "<span class='chip chip-off' style='display:inline-block;margin:0 4px 0 0;'>🟢 ROF</span>"
         "= rest-off day &nbsp;·&nbsp; "
-        "<span class='chip chip-lay' style='display:inline-block;margin:0 4px 0 0;'>🤒 S/L</span>"
-        "= sick leave &nbsp;·&nbsp; "
+        "<span class='chip chip-lay' style='display:inline-block;margin:0 4px 0 0;'>🌴/🤒/😷 code</span>"
+        "= leave / sick / other ground codes &nbsp;·&nbsp; "
+        "<span class='chip chip-duty' style='display:inline-block;margin:0 4px 0 0;'>📚 code</span>"
+        "= training / ground duty &nbsp;·&nbsp; "
         "<span class='chip chip-tof' style='display:inline-block;margin:0 4px 0 0;'>🕓 TOF</span>"
         "= time off (no check-in/check-out allowed in the window)</div>")
     return "".join(cells) + legend
@@ -3120,120 +3250,127 @@ else:
     page_dash, page_salary, page_fdp = st.tabs(["📋 Dashboard", "💰 Salary Calculator", "⏱ FDP Calculator"])
 
     with page_dash:
+        _cur_period = roster_period_of_roster(valid_dates_all) if valid_dates_all else None
+        _view_sel = st.session_state.get('cal_period_sel')
+        viewing_past = bool(_cur_period is not None and _view_sel is not None
+                             and _view_sel != _cur_period)
+
         left_col, main_col, right_col = st.columns([1, 2.3, 1.3])
 
         # ---------- LEFT: ANALYTICS & FATIGUE ----------
         with left_col:
             st.markdown("#### Analytics & Fatigue Tracker")
-            pct = analytics["block_hrs"] / analytics["block_target"] if analytics["block_target"] else 0
-            donut = donut_svg(pct, str(analytics["block_hrs"]), f"of {analytics['block_target']} hrs")
-            st.markdown(
-                f"<div class='card' style='text-align:center;'><h5>Cumulative Block Hours</h5>"
-                f"{donut}"
-                f"<div class='muted'>this roster ({pct*100:.0f}%) · {analytics['flights']} sectors</div></div>",
-                unsafe_allow_html=True)
-            spark = sparkline_svg([analytics['daily_min'].get(d, 0) for d in sorted(analytics['daily_min'])] or [0])
-            fat_color = "#4caf50" if analytics['fatigue'] < 4 else ("#ff9800" if analytics['fatigue'] < 7 else "#ff5252")
-            fat_parts = sorted(analytics.get("fatigue_parts", []), key=lambda p: -p["pts"])
-            parts_html = ""
-            for p in fat_parts:
-                if p["pts"] <= 0:
-                    continue
-                parts_html += (f"<div class='bidrow'><span>{p['label']}</span>"
-                               f"<span>{p['detail']} · +{p['pts']}</span></div>")
-            st.markdown(
-                f"<div class='card'><h5 style='text-align:center;'>Fatigue Score</h5>"
-                f"<div style='text-align:center;'>{gauge_svg(analytics['fatigue'])}</div>"
-                f"<div style='color:{fat_color};font-weight:700;font-size:14px;text-align:center;'>{analytics['fatigue_label']} ({analytics['fatigue']}/10)</div>"
-                f"<div style='margin-top:6px;text-align:center;'>{spark}</div>"
-                f"<div class='muted' style='text-align:center;'>{analytics['redeyes']} red-eye dep · {analytics['max_streak']} consecutive duty days</div>"
-                f"<div style='margin-top:8px;'>{parts_html}</div>"
-                f"<div class='muted' style='margin-top:4px;'>heuristic from FOM Ch.08 fatigue drivers (early/late/night duties, 0100–0659 runs, day/night alternation, 18–30h rests after TZ flights, cumulative load, recovery) — not a regulatory limit.</div></div>",
-                unsafe_allow_html=True)
+            if viewing_past:
+                st.markdown(_current_only_note("Analytics, fatigue & FDP compliance"), unsafe_allow_html=True)
+            else:
+                pct = analytics["block_hrs"] / analytics["block_target"] if analytics["block_target"] else 0
+                donut = donut_svg(pct, str(analytics["block_hrs"]), f"of {analytics['block_target']} hrs")
+                st.markdown(
+                    f"<div class='card' style='text-align:center;'><h5>Cumulative Block Hours</h5>"
+                    f"{donut}"
+                    f"<div class='muted'>this roster ({pct*100:.0f}%) · {analytics['flights']} sectors</div></div>",
+                    unsafe_allow_html=True)
+                spark = sparkline_svg([analytics['daily_min'].get(d, 0) for d in sorted(analytics['daily_min'])] or [0])
+                fat_color = "#4caf50" if analytics['fatigue'] < 4 else ("#ff9800" if analytics['fatigue'] < 7 else "#ff5252")
+                fat_parts = sorted(analytics.get("fatigue_parts", []), key=lambda p: -p["pts"])
+                parts_html = ""
+                for p in fat_parts:
+                    if p["pts"] <= 0:
+                        continue
+                    parts_html += (f"<div class='bidrow'><span>{p['label']}</span>"
+                                   f"<span>{p['detail']} · +{p['pts']}</span></div>")
+                st.markdown(
+                    f"<div class='card'><h5 style='text-align:center;'>Fatigue Score</h5>"
+                    f"<div style='text-align:center;'>{gauge_svg(analytics['fatigue'])}</div>"
+                    f"<div style='color:{fat_color};font-weight:700;font-size:14px;text-align:center;'>{analytics['fatigue_label']} ({analytics['fatigue']}/10)</div>"
+                    f"<div style='margin-top:6px;text-align:center;'>{spark}</div>"
+                    f"<div class='muted' style='text-align:center;'>{analytics['redeyes']} red-eye dep · {analytics['max_streak']} consecutive duty days</div>"
+                    f"<div style='margin-top:8px;'>{parts_html}</div>"
+                    f"<div class='muted' style='margin-top:4px;'>heuristic from FOM Ch.08 fatigue drivers (early/late/night duties, 0100–0659 runs, day/night alternation, 18–30h rests after TZ flights, cumulative load, recovery) — not a regulatory limit.</div></div>",
+                    unsafe_allow_html=True)
 
-            # ---------- LEFT: FDP COMPLIANCE (Chapter 08) ----------
-            if parsed_rows:
-                st.markdown("#### ⚖ FDP Compliance")
-                fdp = fdp_roster_audit(parsed_rows)
-                fviol = [f for f in fdp["findings"] if f[0] == "violation"]
-                fnote = [f for f in fdp["findings"] if f[0] == "note"]
-                cnt = fdp["counts"]
-                cum = fdp["cumulative"]
-                if not fdp["findings"]:
+                # ---------- LEFT: FDP COMPLIANCE (Chapter 08) ----------
+                if parsed_rows:
+                    st.markdown("#### ⚖ FDP Compliance")
+                    fdp = fdp_roster_audit(parsed_rows)
+                    fviol = [f for f in fdp["findings"] if f[0] == "violation"]
+                    fnote = [f for f in fdp["findings"] if f[0] == "note"]
+                    cnt = fdp["counts"]
+                    cum = fdp["cumulative"]
+                    if not fdp["findings"]:
+                        st.markdown(
+                            "<div class='card' style='border-color:#4caf50;text-align:center;'>"
+                            "<div style='color:#a5d6a7;font-weight:700;'>✅ FDP limits OK</div>"
+                            "<div class='muted' style='font-size:11px;'>no early/late/night or cumulative breaches</div></div>",
+                            unsafe_allow_html=True)
+                    else:
+                        st.markdown(
+                            f"<div class='card' style='border-color:#ff5252;text-align:center;'>"
+                            f"<div style='color:#ff8a8a;font-weight:700;'>{len(fviol)} FDP breach(es)</div>"
+                            + (f"<div class='muted' style='font-size:11px;'>{len(fnote)} note(s)</div>" if fnote else "") +
+                            "</div>", unsafe_allow_html=True)
+                    do = fdp["days_off"]
+                    if do["off_rest_bad"]:
+                        off_rest_txt = f"{do['off_rest_bad']} fail"
+                    elif do["off_rest_notes"]:
+                        off_rest_txt = f"OK · {do['off_rest_notes']} unverified"
+                    else:
+                        off_rest_txt = "all OK"
+                    mand_dates = do.get("mandatory_dates", [])
+                    mand_txt = f"{do['mandatory_count']} of {do['off_days']}"
+                    mand_line = (", ".join(d.strftime("%d %b") for d in mand_dates)
+                                 if mand_dates else "none individually required")
+                    davg = days_off_average_8_2_17_d(st.session_state['username'], parsed_rows)
+                    if davg["avg"] is None:
+                        davg_txt = f"N/A · {davg['n_periods']}/3 periods"
+                        davg_color = "#9fb3c8"
+                    else:
+                        davg_txt = f"{davg['avg']} avg · {'OK' if davg['ok'] else 'BELOW 8'}"
+                        davg_color = "#a5d6a7" if davg["ok"] else "#ff8a8a"
+                    rows_html = (
+                        f"<div class='bidrow'><span>Early / Late / Night</span><span>{cnt['early']} / {cnt['late']} / {cnt['night']}</span></div>"
+                        f"<div class='bidrow'><span>7-day max (cap 60 h)</span><span>{_fmt_hm(cum['7d']['max'])}</span></div>"
+                        f"<div class='bidrow'><span>14-day max (cap 105 h)</span><span>{_fmt_hm(cum['14d']['max'])}</span></div>"
+                        f"<div class='bidrow'><span>28-day max (cap 210 h)</span><span>{_fmt_hm(cum['28d']['max'])}</span></div>"
+                        f"<div class='bidrow'><span>Days off · longest duty streak</span><span>{do['off_days']} · {do['max_duty_run']}d</span></div>"
+                        f"<div class='bidrow'><span>Off-day rest (≥34h · 2 nights)</span><span>{off_rest_txt}</span></div>"
+                        f"<div class='bidrow'><span>Mandatory days off (8.2.17)</span><span>{mand_txt}</span></div>"
+                        f"<div class='bidrow'><span>Days off avg / 4wk (8.2.17.d)</span><span style='color:{davg_color};'>{davg_txt}</span></div>"
+                    )
                     st.markdown(
-                        "<div class='card' style='border-color:#4caf50;text-align:center;'>"
-                        "<div style='color:#a5d6a7;font-weight:700;'>✅ FDP limits OK</div>"
-                        "<div class='muted' style='font-size:11px;'>no early/late/night or cumulative breaches</div></div>",
+                        f"<div class='card'>{rows_html}"
+                        f"<div class='muted' style='font-size:11px;margin-top:4px;'>standby & duty days counted in full</div>"
+                        f"<div class='muted' style='font-size:11px;margin-top:2px;'>mandatory: {mand_line}</div>"
+                        f"<div class='muted' style='font-size:11px;margin-top:2px;'>(d) needs 3 finalized periods — finalize past rosters in Roster History.</div></div>",
+                        unsafe_allow_html=True)
+                    for sev, msg in fdp["findings"]:
+                        if sev == "violation":
+                            st.markdown(f"<div style='font-size:12px;background:#2c1f1f;border:1px solid #ff5252;color:#ff8a8a;padding:8px;border-radius:8px;margin-bottom:6px;'>⚠️ {msg}</div>", unsafe_allow_html=True)
+                        else:
+                            st.markdown(f"<div style='font-size:12px;background:#33260f;border:1px solid #ffc107;color:#ffd54f;padding:8px;border-radius:8px;margin-bottom:6px;'>ℹ️ {msg}</div>", unsafe_allow_html=True)
+
+                if est_sal:
+                    est_total = est_sal["meal_usd"] + est_sal["on_usd"]
+                    rows_html = ""
+                    for lv in est_sal.get("layover_allow", []):
+                        city = STATION_INFO.get(lv["station"], (lv["station"],))[0]
+                        rows_html += (
+                            f"<div class='bidrow'><span>{city} ({lv['station']})"
+                            f"<span class='muted'> · {lv['nights']} night(s), {lv['meals']} meals</span></span>"
+                            f"<span>~${lv['usd']:,.0f}</span></div>"
+                        )
+                    if not rows_html:
+                        rows_html = "<div class='muted'>No layovers in this roster.</div>"
+                    st.markdown(
+                        f"<div class='card'><h5>Estimated Allowances</h5>"
+                        f"<div style='font-size:26px;font-weight:800;color:#4caf50;'>${est_total:,.0f} USD</div>"
+                        f"<div class='muted' style='margin-bottom:6px;'>Per-layover breakdown (meals + overnights)</div>{rows_html}</div>",
                         unsafe_allow_html=True)
                 else:
                     st.markdown(
-                        f"<div class='card' style='border-color:#ff5252;text-align:center;'>"
-                        f"<div style='color:#ff8a8a;font-weight:700;'>{len(fviol)} FDP breach(es)</div>"
-                        + (f"<div class='muted' style='font-size:11px;'>{len(fnote)} note(s)</div>" if fnote else "") +
-                        "</div>", unsafe_allow_html=True)
-                do = fdp["days_off"]
-                if do["off_rest_bad"]:
-                    off_rest_txt = f"{do['off_rest_bad']} fail"
-                elif do["off_rest_notes"]:
-                    off_rest_txt = f"OK · {do['off_rest_notes']} unverified"
-                else:
-                    off_rest_txt = "all OK"
-                mand_dates = do.get("mandatory_dates", [])
-                mand_txt = f"{do['mandatory_count']} of {do['off_days']}"
-                mand_line = (", ".join(d.strftime("%d %b") for d in mand_dates)
-                             if mand_dates else "none individually required")
-                davg = days_off_average_8_2_17_d(st.session_state['username'], parsed_rows)
-                if davg["avg"] is None:
-                    davg_txt = f"N/A · {davg['n_periods']}/3 periods"
-                    davg_color = "#9fb3c8"
-                else:
-                    davg_txt = f"{davg['avg']} avg · {'OK' if davg['ok'] else 'BELOW 8'}"
-                    davg_color = "#a5d6a7" if davg["ok"] else "#ff8a8a"
-                rows_html = (
-                    f"<div class='bidrow'><span>Early / Late / Night</span><span>{cnt['early']} / {cnt['late']} / {cnt['night']}</span></div>"
-                    f"<div class='bidrow'><span>7-day max (cap 60 h)</span><span>{_fmt_hm(cum['7d']['max'])}</span></div>"
-                    f"<div class='bidrow'><span>14-day max (cap 105 h)</span><span>{_fmt_hm(cum['14d']['max'])}</span></div>"
-                    f"<div class='bidrow'><span>28-day max (cap 210 h)</span><span>{_fmt_hm(cum['28d']['max'])}</span></div>"
-                    f"<div class='bidrow'><span>Days off · longest duty streak</span><span>{do['off_days']} · {do['max_duty_run']}d</span></div>"
-                    f"<div class='bidrow'><span>Off-day rest (≥34h · 2 nights)</span><span>{off_rest_txt}</span></div>"
-                    f"<div class='bidrow'><span>Mandatory days off (8.2.17)</span><span>{mand_txt}</span></div>"
-                    f"<div class='bidrow'><span>Days off avg / 4wk (8.2.17.d)</span><span style='color:{davg_color};'>{davg_txt}</span></div>"
-                )
-                st.markdown(
-                    f"<div class='card'>{rows_html}"
-                    f"<div class='muted' style='font-size:11px;margin-top:4px;'>standby & duty days counted in full</div>"
-                    f"<div class='muted' style='font-size:11px;margin-top:2px;'>mandatory: {mand_line}</div>"
-                    f"<div class='muted' style='font-size:11px;margin-top:2px;'>(d) needs 3 finalized periods — finalize past rosters in Roster History.</div></div>",
-                    unsafe_allow_html=True)
-                for sev, msg in fdp["findings"]:
-                    if sev == "violation":
-                        st.markdown(f"<div style='font-size:12px;background:#2c1f1f;border:1px solid #ff5252;color:#ff8a8a;padding:8px;border-radius:8px;margin-bottom:6px;'>⚠️ {msg}</div>", unsafe_allow_html=True)
-                    else:
-                        st.markdown(f"<div style='font-size:12px;background:#33260f;border:1px solid #ffc107;color:#ffd54f;padding:8px;border-radius:8px;margin-bottom:6px;'>ℹ️ {msg}</div>", unsafe_allow_html=True)
-
-            if est_sal:
-                est_total = est_sal["meal_usd"] + est_sal["on_usd"]
-                rows_html = ""
-                for lv in est_sal.get("layover_allow", []):
-                    city = STATION_INFO.get(lv["station"], (lv["station"],))[0]
-                    rows_html += (
-                        f"<div class='bidrow'><span>{city} ({lv['station']})"
-                        f"<span class='muted'> · {lv['nights']} night(s), {lv['meals']} meals</span></span>"
-                        f"<span>~${lv['usd']:,.0f}</span></div>"
-                    )
-                if not rows_html:
-                    rows_html = "<div class='muted'>No layovers in this roster.</div>"
-                st.markdown(
-                    f"<div class='card'><h5>Estimated Allowances</h5>"
-                    f"<div style='font-size:26px;font-weight:800;color:#4caf50;'>${est_total:,.0f} USD</div>"
-                    f"<div class='muted' style='margin-bottom:6px;'>Per-layover breakdown (meals + overnights)</div>{rows_html}</div>",
-                    unsafe_allow_html=True)
-            else:
-                st.markdown(
-                    f"<div class='card'><h5>Estimated Allowances</h5>"
-                    f"<div class='muted'>No roster parsed — paste your roster above.</div></div>",
-                    unsafe_allow_html=True)
-
+                        f"<div class='card'><h5>Estimated Allowances</h5>"
+                        f"<div class='muted'>No roster parsed — paste your roster above.</div></div>",
+                        unsafe_allow_html=True)
         # ---------- CENTER: CALENDAR + LAYOVER INTEL ----------
         with main_col:
             st.markdown("#### Main Roster Calendar View")
@@ -3367,226 +3504,231 @@ else:
             st.markdown(f"<div class='card'>{build_calendar_html(cal_rows, span=sel_span)}</div>", unsafe_allow_html=True)
 
             # Flight & Layover Intel — one selector for every duty AND layover
-            intel_items = []   # (kind, payload, label)
-            for du in build_duties(parsed_rows):
-                d0 = (du["sectors"][0]["dep"].date().strftime("%d %b")
-                      if isinstance(du["sectors"][0].get("dep"), datetime) else "")
-                intel_items.append(("flight", du, f"✈ {du['label']}" + (f" — {d0}" if d0 else "")))
-            for lv in analytics["layovers"]:
-                if not lv["station"]:
-                    continue
-                city = STATION_INFO.get(lv["station"], (lv["station"],))[0]
-                intel_items.append(("layover", lv,
-                                    f"🏨 {city} ({lv['station']}) — {lv['date'].strftime('%d %b') if lv['date'] else '?'}"))
-            if intel_items:
-                today = datetime.now().date()
-                def_idx = 0
-                for i, (kind, payload, _lbl) in enumerate(intel_items):
-                    if kind == "flight":
-                        dep = payload["sectors"][0].get("dep")
-                        d = dep.date() if isinstance(dep, datetime) else None
-                    else:
-                        lvd = payload.get("date")
-                        d = lvd.date() if isinstance(lvd, datetime) else None
-                    if d is not None and d >= today:
-                        def_idx = i
-                        break
-                sel = st.selectbox("Flight & Layover Intel:", list(range(len(intel_items))), index=def_idx,
-                                   format_func=lambda i: intel_items[i][2])
-                kind, payload, _lbl = intel_items[sel]
-                if kind == "flight":
-                    st.markdown(flight_intel_card(payload, parsed_rows), unsafe_allow_html=True)
-                else:
-                    lv = payload
-                    wx = fetch_station_weather(lv["station"])
-                    info = STATION_INFO.get(lv["station"])
-                    spots = (info[4] if info and info[4] else DEFAULT_SPOTS)
-                    city = wx["city"] if wx else lv["station"]
-                    apname = AIRPORT_NAME.get(lv["station"], "")
-                    wx_html = (f"{wx['icon']} {wx['temp']}°C · {wx['desc']}" if wx and wx["temp"] is not None else "n/a")
-                    lt_html = f"{wx['local_time']} ({wx['gmt']})" if wx else "-"
-                    gt_html = f"{lv['ground_hrs']} hrs" if lv["ground_hrs"] else "-"
-                    spots_html = "".join(f"<span class='spot'>{s}</span>" for s in spots)
-                    st.markdown(
-                        f"<div class='card' style='border-color:#00bcd4;'>"
-                        f"<h5>🏨 Layover Intel: {city} ({lv['station']})" + (f" — {lv['date'].strftime('%d %b')}" if lv['date'] else "") + "</h5>"
-                        + (f"<div class='muted' style='margin-bottom:8px;'>✈ {apname}</div>" if apname else "")
-                        + f"<div style='display:flex;gap:28px;font-size:13px;margin-bottom:10px;'>"
-                        f"<div><div class='muted'>Weather (live)</div>{wx_html}</div>"
-                        f"<div><div class='muted'>Local Time</div>{lt_html}</div>"
-                        f"<div><div class='muted'>Ground Time</div>{gt_html}</div></div>"
-                        f"<div class='muted' style='margin-bottom:4px;'>Explore Spots</div>{spots_html}</div>",
-                        unsafe_allow_html=True)
-            elif active_text:
-                st.info("No flights or layovers detected in this roster for Intel.")
+            if viewing_past:
+                st.markdown(_current_only_note("Flight & layover intel"), unsafe_allow_html=True)
             else:
-                st.info("Paste your roster above to populate the calendar, analytics and flight & layover intel.")
-
-            # ---------- ROSTER GUARDIAN: FAU SOFT-RULES AUDIT ----------
-            if parsed_rows:
-                st.markdown("#### 🛡 Roster Guardian — FAU Soft-Rules Audit")
-                findings = audit_roster(parsed_rows)
-                violations = [f for f in findings if f[0] == "violation"]
-                notes = [f for f in findings if f[0] == "note"]
-                if not findings:
-                    st.markdown(
-                        "<div class='card' style='border-color:#4caf50;'><span style='color:#a5d6a7;'>✅ No soft-rule breaches detected in this roster "
-                        "(min rest, post-flight day-off entitlements, next-day assignment limits all OK).</span></div>",
-                        unsafe_allow_html=True)
-                else:
-                    st.markdown(
-                        f"<div class='card' style='border-color:#ff5252;'><b style='color:#ff8a8a;'>{len(violations)} possible breach(es)</b>"
-                        + (f" · <span style='color:#ffb74d;'>{len(notes)} advisory note(s)</span>" if notes else "") +
-                        "<div class='muted' style='margin-top:4px;'>Cross-check with crew control before filing — parser-based audit, scheduled times only.</div></div>",
-                        unsafe_allow_html=True)
-                    for sev, msg in findings:
-                        if sev == "violation":
-                            st.markdown(f"<div style='font-size:12.5px;background:#2c1f1f;border:1px solid #ff5252;color:#ff8a8a;padding:10px;border-radius:8px;margin-bottom:8px;'>⚠️ {msg}</div>", unsafe_allow_html=True)
+                intel_items = []   # (kind, payload, label)
+                for du in build_duties(parsed_rows):
+                    d0 = (du["sectors"][0]["dep"].date().strftime("%d %b")
+                          if isinstance(du["sectors"][0].get("dep"), datetime) else "")
+                    intel_items.append(("flight", du, f"✈ {du['label']}" + (f" — {d0}" if d0 else "")))
+                for lv in analytics["layovers"]:
+                    if not lv["station"]:
+                        continue
+                    city = STATION_INFO.get(lv["station"], (lv["station"],))[0]
+                    intel_items.append(("layover", lv,
+                                        f"🏨 {city} ({lv['station']}) — {lv['date'].strftime('%d %b') if lv['date'] else '?'}"))
+                if intel_items:
+                    today = datetime.now().date()
+                    def_idx = 0
+                    for i, (kind, payload, _lbl) in enumerate(intel_items):
+                        if kind == "flight":
+                            dep = payload["sectors"][0].get("dep")
+                            d = dep.date() if isinstance(dep, datetime) else None
                         else:
-                            st.markdown(f"<div style='font-size:12.5px;background:#33260f;border:1px solid #ffc107;color:#ffd54f;padding:10px;border-radius:8px;margin-bottom:8px;'>ℹ️ {msg}</div>", unsafe_allow_html=True)
-                with st.expander("📖 FAU quick reference (standby insertion & rules summary)"):
-                    st.markdown("""
-    - **Min base rest:** 17h30 from chocks-on to next flight/ground-duty report (not ground→ground).
-    - **DEL / BOM / KHI turnarounds** arriving 12:00–23:59 → next day: no flight (turnaround **or** layover) before 23:00 report; 23:00–05:59 regional (<4h sector) only; anything after 06:00 on day 2.
-    - **DEL / BOM / KHI turnarounds** arriving 00:01–11:59 → **24h rest** chocks-on to next report.
-    - **Four-sector days** (arrival before 17:30) → next day: 1-sector layover after 18:00 only; same turnaround limits as above; **SBY4 only**.
-    - **DXB / AUH / MCT turnarounds** → next day: 1-sector layover after 16:00 only; same turnaround limits; **SBY4 only**.
-    - **UL231/232 (DXB)** → next day only SBY2 (06:00–18:00) or a flight within that window.
-    - **LHR / FRA / CDG / FCO / MXP / NRT / SYD / MEL layovers & JED turnaround** → arrival day + **2 days off**.
-    - **DOH / BAH / DMM turnarounds** → arrival day + **1 day off**.
-    - **SIN / KUL / CGK morning turnarounds** (UL314/UL364, or a CMB–SIN departure 07:00–08:00) → next-day flights report after 18:00, or SBY4.
-    - **Standby windows:** SBY1 00:01–11:59 · SBY2 06:00–18:00 · SBY3 12:00–23:59 · SBY4 18:00–05:59.
-    - **Standby insertion if your flight cancels:** morning T/A (report after 06:00) → SBY2 · morning T/A (report before 06:00) → SBY1 · Middle-East flight reporting before 18:00 → SBY3 · midnight flight reporting before midnight → SBY4 · midnight flight reporting after midnight → SBY1.
-    - Training/duty codes (SEP, SEC, CRM, DGR, …) count as a duty day — they are **not** days off.
-                    """)
-
+                            lvd = payload.get("date")
+                            d = lvd.date() if isinstance(lvd, datetime) else None
+                        if d is not None and d >= today:
+                            def_idx = i
+                            break
+                    sel = st.selectbox("Flight & Layover Intel:", list(range(len(intel_items))), index=def_idx,
+                                       format_func=lambda i: intel_items[i][2])
+                    kind, payload, _lbl = intel_items[sel]
+                    if kind == "flight":
+                        st.markdown(flight_intel_card(payload, parsed_rows), unsafe_allow_html=True)
+                    else:
+                        lv = payload
+                        wx = fetch_station_weather(lv["station"])
+                        info = STATION_INFO.get(lv["station"])
+                        spots = (info[4] if info and info[4] else DEFAULT_SPOTS)
+                        city = wx["city"] if wx else lv["station"]
+                        apname = AIRPORT_NAME.get(lv["station"], "")
+                        wx_html = (f"{wx['icon']} {wx['temp']}°C · {wx['desc']}" if wx and wx["temp"] is not None else "n/a")
+                        lt_html = f"{wx['local_time']} ({wx['gmt']})" if wx else "-"
+                        gt_html = f"{lv['ground_hrs']} hrs" if lv["ground_hrs"] else "-"
+                        spots_html = "".join(f"<span class='spot'>{s}</span>" for s in spots)
+                        st.markdown(
+                            f"<div class='card' style='border-color:#00bcd4;'>"
+                            f"<h5>🏨 Layover Intel: {city} ({lv['station']})" + (f" — {lv['date'].strftime('%d %b')}" if lv['date'] else "") + "</h5>"
+                            + (f"<div class='muted' style='margin-bottom:8px;'>✈ {apname}</div>" if apname else "")
+                            + f"<div style='display:flex;gap:28px;font-size:13px;margin-bottom:10px;'>"
+                            f"<div><div class='muted'>Weather (live)</div>{wx_html}</div>"
+                            f"<div><div class='muted'>Local Time</div>{lt_html}</div>"
+                            f"<div><div class='muted'>Ground Time</div>{gt_html}</div></div>"
+                            f"<div class='muted' style='margin-bottom:4px;'>Explore Spots</div>{spots_html}</div>",
+                            unsafe_allow_html=True)
+                elif active_text:
+                    st.info("No flights or layovers detected in this roster for Intel.")
+                else:
+                    st.info("Paste your roster above to populate the calendar, analytics and flight & layover intel.")
+            # ---------- ROSTER GUARDIAN: FAU SOFT-RULES AUDIT ----------
+            if viewing_past:
+                st.markdown(_current_only_note("Roster Guardian"), unsafe_allow_html=True)
+            else:
+                if parsed_rows:
+                    st.markdown("#### 🛡 Roster Guardian — FAU Soft-Rules Audit")
+                    findings = audit_roster(parsed_rows)
+                    violations = [f for f in findings if f[0] == "violation"]
+                    notes = [f for f in findings if f[0] == "note"]
+                    if not findings:
+                        st.markdown(
+                            "<div class='card' style='border-color:#4caf50;'><span style='color:#a5d6a7;'>✅ No soft-rule breaches detected in this roster "
+                            "(min rest, post-flight day-off entitlements, next-day assignment limits all OK).</span></div>",
+                            unsafe_allow_html=True)
+                    else:
+                        st.markdown(
+                            f"<div class='card' style='border-color:#ff5252;'><b style='color:#ff8a8a;'>{len(violations)} possible breach(es)</b>"
+                            + (f" · <span style='color:#ffb74d;'>{len(notes)} advisory note(s)</span>" if notes else "") +
+                            "<div class='muted' style='margin-top:4px;'>Cross-check with crew control before filing — parser-based audit, scheduled times only.</div></div>",
+                            unsafe_allow_html=True)
+                        for sev, msg in findings:
+                            if sev == "violation":
+                                st.markdown(f"<div style='font-size:12.5px;background:#2c1f1f;border:1px solid #ff5252;color:#ff8a8a;padding:10px;border-radius:8px;margin-bottom:8px;'>⚠️ {msg}</div>", unsafe_allow_html=True)
+                            else:
+                                st.markdown(f"<div style='font-size:12.5px;background:#33260f;border:1px solid #ffc107;color:#ffd54f;padding:10px;border-radius:8px;margin-bottom:8px;'>ℹ️ {msg}</div>", unsafe_allow_html=True)
+                    with st.expander("📖 FAU quick reference (standby insertion & rules summary)"):
+                        st.markdown("""
+        - **Min base rest:** 17h30 from chocks-on to next flight/ground-duty report (not ground→ground).
+        - **DEL / BOM / KHI turnarounds** arriving 12:00–23:59 → next day: no flight (turnaround **or** layover) before 23:00 report; 23:00–05:59 regional (<4h sector) only; anything after 06:00 on day 2.
+        - **DEL / BOM / KHI turnarounds** arriving 00:01–11:59 → **24h rest** chocks-on to next report.
+        - **Four-sector days** (arrival before 17:30) → next day: 1-sector layover after 18:00 only; same turnaround limits as above; **SBY4 only**.
+        - **DXB / AUH / MCT turnarounds** → next day: 1-sector layover after 16:00 only; same turnaround limits; **SBY4 only**.
+        - **UL231/232 (DXB)** → next day only SBY2 (06:00–18:00) or a flight within that window.
+        - **LHR / FRA / CDG / FCO / MXP / NRT / SYD / MEL layovers & JED turnaround** → arrival day + **2 days off**.
+        - **DOH / BAH / DMM turnarounds** → arrival day + **1 day off**.
+        - **SIN / KUL / CGK morning turnarounds** (UL314/UL364, or a CMB–SIN departure 07:00–08:00) → next-day flights report after 18:00, or SBY4.
+        - **Standby windows:** SBY1 00:01–11:59 · SBY2 06:00–18:00 · SBY3 12:00–23:59 · SBY4 18:00–05:59.
+        - **Standby insertion if your flight cancels:** morning T/A (report after 06:00) → SBY2 · morning T/A (report before 06:00) → SBY1 · Middle-East flight reporting before 18:00 → SBY3 · midnight flight reporting before midnight → SBY4 · midnight flight reporting after midnight → SBY1.
+        - Training/duty codes (SEP, SEC, CRM, DGR, …) count as a duty day — they are **not** days off.
+                        """)
             # ---------- RIGHT: AGENT ALERTS + BIDDING ----------
         with right_col:
             st.markdown("#### Flight Monitoring Agent")
-            agent_on = st.toggle("Agent: Real-Time Flight Monitor", value=True)
-
-            available_roster_dates = sorted(set(valid_dates_all))
-            if available_roster_dates:
-                real_today = datetime.now().date()
-                if real_today in available_roster_dates:
-                    default_idx = available_roster_dates.index(real_today)
-                else:
-                    future = [d for d in available_roster_dates if d >= real_today]
-                    default_idx = available_roster_dates.index(future[0]) if future else len(available_roster_dates) - 1
-                simulated_today = st.selectbox(
-                    "Roster anchor day (auto-set to today):",
-                    options=available_roster_dates, index=default_idx,
-                    format_func=lambda x: x.strftime("%d %b %Y") + ("  ← today" if x == real_today else ""))
+            if viewing_past:
+                st.markdown(_current_only_note("Live flight monitoring"), unsafe_allow_html=True)
             else:
-                simulated_today = datetime.now().date()
-            simulated_tomorrow = simulated_today + timedelta(days=1)
+                agent_on = st.toggle("Agent: Real-Time Flight Monitor", value=True)
 
-            active_target_flights, seen = [], set()
-            for row in parsed_rows:
-                if row["Type"] == "FLIGHT" and row["DateObj"] is not None:
-                    fd = row["DateObj"].date()
-                    if fd in [simulated_today, simulated_tomorrow]:
-                        key = (row["Flight / Code"], fd)
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        active_target_flights.append({"flight_no": row["Flight / Code"], "date_obj": fd,
-                                                      "route": row["Route"], "dep_time": row["Departure"]})
-
-            flight_check_results = []
-            if agent_on and active_target_flights:
-                with st.spinner("Querying FlightStats & Flightradar24 live feeds..."):
-                    for flight in active_target_flights:
-                        telemetry = fetch_live_flight_telemetry(flight["flight_no"], flight["date_obj"],
-                                                                flight["route"], flight["dep_time"])
-                        # FDP & rest impact for delayed/diverted flights
-                        impact_note = None
-                        if telemetry.get("severity") in ("delayed", "diverted"):
-                            delay_guess = None
-                            m = re.search(r'by ~(\d+) min', telemetry.get("status_message", ""))
-                            if m:
-                                delay_guess = int(m.group(1))
-                            impact_note = delay_impact_note(parsed_rows, flight["flight_no"],
-                                                            flight["date_obj"], delay_guess or 0)
-                        # Cancellation → soft standby suggestion (roster unchanged)
-                        sb_suggest = None
-                        if telemetry.get("severity") == "cancelled":
-                            frow = next((r for r in parsed_rows
-                                         if r["Type"] == "FLIGHT" and r.get("DateObj")
-                                         and r["DateObj"].date() == flight["date_obj"]
-                                         and str(r["Flight / Code"]).replace(" ", "") == str(flight["flight_no"]).replace(" ", "")), None)
-                            if frow:
-                                sb_suggest = suggest_standby_for_cancel(frow)
-                        flight_check_results.append({"flight": flight["flight_no"], "route": flight["route"],
-                                                     "date": flight["date_obj"].strftime("%d %b %Y"),
-                                                     "delayed": telemetry["is_delayed"],
-                                                     "severity": telemetry.get("severity", "ok"),
-                                                     "status": telemetry["status_message"],
-                                                     "inbound_note": telemetry.get("inbound_note"),
-                                                     "inbound_risk": telemetry.get("inbound_risk", False),
-                                                     "impact_note": impact_note,
-                                                     "sb_suggest": sb_suggest})
-            st.session_state['alert_count'] = sum(
-                1 for f in flight_check_results
-                if (f["severity"] in ("delayed", "cancelled", "diverted") or f["inbound_risk"])
-                and (f["flight"], f["date"]) not in st.session_state['acked'])
-
-            if not agent_on:
-                st.markdown("<div class='card muted'>Real-time monitor paused.</div>", unsafe_allow_html=True)
-            elif flight_check_results:
-                st.markdown(
-                    f"<div class='card' style='font-size:12px;'><b style='color:#00bcd4;'>Agent Scan:</b> "
-                    f"Verified {len(flight_check_results)} flight(s) via FlightStats/Cirium + FR24 (keyless, cached 10 min).</div>",
-                    unsafe_allow_html=True)
-                for df in flight_check_results:
-                    key = (df["flight"], df["date"])
-                    acked = key in st.session_state['acked']
-                    if df["severity"] == "cancelled":
-                        bc, bg, tc, icon = "#ff1744", "#331414", "#ff8a8a", "🚫"
-                    elif df["severity"] == "diverted":
-                        bc, bg, tc, icon = "#ff6d00", "#332414", "#ffb74d", "🔀"
-                    elif df["severity"] == "delayed":
-                        bc, bg, tc, icon = "#ff5252", "#2c1f1f", "#ff8a8a", "⚠️"
-                    elif df["severity"] == "unknown":
-                        bc, bg, tc, icon = "#607d8b", "#1c2429", "#b0bec5", "ℹ️"
+                available_roster_dates = sorted(set(valid_dates_all))
+                if available_roster_dates:
+                    real_today = datetime.now().date()
+                    if real_today in available_roster_dates:
+                        default_idx = available_roster_dates.index(real_today)
                     else:
-                        bc, bg, tc, icon = "#4caf50", "#12301f", "#a5d6a7", "✈️"
-                    op = "opacity:.5;" if acked else ""
-                    extra = ""
-                    if df.get("inbound_note"):
-                        inb_bc = "#ff6d00" if df["inbound_risk"] else "#ffc107"
-                        extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#2b2413;"
-                                  f"border:1px solid {inb_bc};color:#ffd54f;font-size:11.5px;'>{df['inbound_note']}</div>")
-                    if df.get("impact_note"):
-                        impact_bad = ("⚠️" in df["impact_note"]) or ("BELOW" in df["impact_note"])
-                        r_bc = "#ff5252" if impact_bad else "#4caf50"
-                        r_tc = "#ff8a8a" if impact_bad else "#a5d6a7"
-                        extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#131f2b;"
-                                  f"border:1px solid {r_bc};color:{r_tc};font-size:11.5px;'>{df['impact_note']}</div>")
-                    if df.get("sb_suggest"):
-                        extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#2b2413;"
-                                  f"border:1px solid #ffc107;color:#ffd54f;font-size:11.5px;'>"
-                                  f"📋 Soft suggestion (roster unchanged): if cancelled, insert <b>{df['sb_suggest']}</b> standby.</div>")
+                        future = [d for d in available_roster_dates if d >= real_today]
+                        default_idx = available_roster_dates.index(future[0]) if future else len(available_roster_dates) - 1
+                    simulated_today = st.selectbox(
+                        "Roster anchor day (auto-set to today):",
+                        options=available_roster_dates, index=default_idx,
+                        format_func=lambda x: x.strftime("%d %b %Y") + ("  ← today" if x == real_today else ""))
+                else:
+                    simulated_today = datetime.now().date()
+                simulated_tomorrow = simulated_today + timedelta(days=1)
+
+                active_target_flights, seen = [], set()
+                for row in parsed_rows:
+                    if row["Type"] == "FLIGHT" and row["DateObj"] is not None:
+                        fd = row["DateObj"].date()
+                        if fd in [simulated_today, simulated_tomorrow]:
+                            key = (row["Flight / Code"], fd)
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            active_target_flights.append({"flight_no": row["Flight / Code"], "date_obj": fd,
+                                                          "route": row["Route"], "dep_time": row["Departure"]})
+
+                flight_check_results = []
+                if agent_on and active_target_flights:
+                    with st.spinner("Querying FlightStats & Flightradar24 live feeds..."):
+                        for flight in active_target_flights:
+                            telemetry = fetch_live_flight_telemetry(flight["flight_no"], flight["date_obj"],
+                                                                    flight["route"], flight["dep_time"])
+                            # FDP & rest impact for delayed/diverted flights
+                            impact_note = None
+                            if telemetry.get("severity") in ("delayed", "diverted"):
+                                delay_guess = None
+                                m = re.search(r'by ~(\d+) min', telemetry.get("status_message", ""))
+                                if m:
+                                    delay_guess = int(m.group(1))
+                                impact_note = delay_impact_note(parsed_rows, flight["flight_no"],
+                                                                flight["date_obj"], delay_guess or 0)
+                            # Cancellation → soft standby suggestion (roster unchanged)
+                            sb_suggest = None
+                            if telemetry.get("severity") == "cancelled":
+                                frow = next((r for r in parsed_rows
+                                             if r["Type"] == "FLIGHT" and r.get("DateObj")
+                                             and r["DateObj"].date() == flight["date_obj"]
+                                             and str(r["Flight / Code"]).replace(" ", "") == str(flight["flight_no"]).replace(" ", "")), None)
+                                if frow:
+                                    sb_suggest = suggest_standby_for_cancel(frow)
+                            flight_check_results.append({"flight": flight["flight_no"], "route": flight["route"],
+                                                         "date": flight["date_obj"].strftime("%d %b %Y"),
+                                                         "delayed": telemetry["is_delayed"],
+                                                         "severity": telemetry.get("severity", "ok"),
+                                                         "status": telemetry["status_message"],
+                                                         "inbound_note": telemetry.get("inbound_note"),
+                                                         "inbound_risk": telemetry.get("inbound_risk", False),
+                                                         "impact_note": impact_note,
+                                                         "sb_suggest": sb_suggest})
+                st.session_state['alert_count'] = sum(
+                    1 for f in flight_check_results
+                    if (f["severity"] in ("delayed", "cancelled", "diverted") or f["inbound_risk"])
+                    and (f["flight"], f["date"]) not in st.session_state['acked'])
+
+                if not agent_on:
+                    st.markdown("<div class='card muted'>Real-time monitor paused.</div>", unsafe_allow_html=True)
+                elif flight_check_results:
                     st.markdown(
-                        f"<div style='font-size:13px;background:{bg};padding:12px;border-radius:8px;margin-top:10px;border:1px solid {bc};{op}'>"
-                        f"{icon} <b style='font-size:14px;'>{df['flight']}</b> ({df['route']}) — <span style='color:#ccc;'><i>{df['date']}</i></span>"
-                        f"<div style='margin-top:5px;color:{tc};font-size:12px;'>{df['status']}</div>{extra}</div>",
+                        f"<div class='card' style='font-size:12px;'><b style='color:#00bcd4;'>Agent Scan:</b> "
+                        f"Verified {len(flight_check_results)} flight(s) via FlightStats/Cirium + FR24 (keyless, cached 10 min).</div>",
                         unsafe_allow_html=True)
-                    if (df["severity"] in ("delayed", "cancelled", "diverted") or df["inbound_risk"]) and not acked:
-                        if st.button("Acknowledge", key=f"ack_{df['flight']}_{df['date']}", use_container_width=True):
-                            st.session_state['acked'].add(key)
-                            st.rerun()
-                if st.button("🔄 Force Refresh Live Data", use_container_width=True):
-                    fr24_fetch_flight_history.clear()
-                    flightstats_fetch.clear()
-                    fr24_fetch_by_reg.clear()
-                    st.rerun()
-            else:
-                st.markdown(
-                    f"<div class='card muted'>No flights found for {simulated_today.strftime('%d %b')} or {simulated_tomorrow.strftime('%d %b')}.</div>",
-                    unsafe_allow_html=True)
-
-
+                    for df in flight_check_results:
+                        key = (df["flight"], df["date"])
+                        acked = key in st.session_state['acked']
+                        if df["severity"] == "cancelled":
+                            bc, bg, tc, icon = "#ff1744", "#331414", "#ff8a8a", "🚫"
+                        elif df["severity"] == "diverted":
+                            bc, bg, tc, icon = "#ff6d00", "#332414", "#ffb74d", "🔀"
+                        elif df["severity"] == "delayed":
+                            bc, bg, tc, icon = "#ff5252", "#2c1f1f", "#ff8a8a", "⚠️"
+                        elif df["severity"] == "unknown":
+                            bc, bg, tc, icon = "#607d8b", "#1c2429", "#b0bec5", "ℹ️"
+                        else:
+                            bc, bg, tc, icon = "#4caf50", "#12301f", "#a5d6a7", "✈️"
+                        op = "opacity:.5;" if acked else ""
+                        extra = ""
+                        if df.get("inbound_note"):
+                            inb_bc = "#ff6d00" if df["inbound_risk"] else "#ffc107"
+                            extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#2b2413;"
+                                      f"border:1px solid {inb_bc};color:#ffd54f;font-size:11.5px;'>{df['inbound_note']}</div>")
+                        if df.get("impact_note"):
+                            impact_bad = ("⚠️" in df["impact_note"]) or ("BELOW" in df["impact_note"])
+                            r_bc = "#ff5252" if impact_bad else "#4caf50"
+                            r_tc = "#ff8a8a" if impact_bad else "#a5d6a7"
+                            extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#131f2b;"
+                                      f"border:1px solid {r_bc};color:{r_tc};font-size:11.5px;'>{df['impact_note']}</div>")
+                        if df.get("sb_suggest"):
+                            extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#2b2413;"
+                                      f"border:1px solid #ffc107;color:#ffd54f;font-size:11.5px;'>"
+                                      f"📋 Soft suggestion (roster unchanged): if cancelled, insert <b>{df['sb_suggest']}</b> standby.</div>")
+                        st.markdown(
+                            f"<div style='font-size:13px;background:{bg};padding:12px;border-radius:8px;margin-top:10px;border:1px solid {bc};{op}'>"
+                            f"{icon} <b style='font-size:14px;'>{df['flight']}</b> ({df['route']}) — <span style='color:#ccc;'><i>{df['date']}</i></span>"
+                            f"<div style='margin-top:5px;color:{tc};font-size:12px;'>{df['status']}</div>{extra}</div>",
+                            unsafe_allow_html=True)
+                        if (df["severity"] in ("delayed", "cancelled", "diverted") or df["inbound_risk"]) and not acked:
+                            if st.button("Acknowledge", key=f"ack_{df['flight']}_{df['date']}", use_container_width=True):
+                                st.session_state['acked'].add(key)
+                                st.rerun()
+                    if st.button("🔄 Force Refresh Live Data", use_container_width=True):
+                        fr24_fetch_flight_history.clear()
+                        flightstats_fetch.clear()
+                        fr24_fetch_by_reg.clear()
+                        st.rerun()
+                else:
+                    st.markdown(
+                        f"<div class='card muted'>No flights found for {simulated_today.strftime('%d %b')} or {simulated_tomorrow.strftime('%d %b')}.</div>",
+                        unsafe_allow_html=True)
     # ================= 💰 SALARY CALCULATOR PAGE =================
     with page_salary:
         st.markdown("#### 💰 Salary Calculator")
