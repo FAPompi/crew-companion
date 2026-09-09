@@ -2291,7 +2291,8 @@ def _count_local_nights(start_dt, end_dt):
         return 0
     n = 0
     day = start_dt.date()
-    for _ in range(366):
+    last_day = end_dt.date() + timedelta(days=1)
+    while day <= last_day:
         win_start = datetime.combine(day, dtime(22, 0))
         win_end = datetime.combine(day + timedelta(days=1), dtime(8, 0))
         if win_start > end_dt:
@@ -3183,6 +3184,204 @@ def _meal_counts(start, end):
         d += timedelta(days=1)
     return tuple(out)
 
+def _sheet_roster_cols(rows):
+    """Build the Google Sheet 'Your Roster' column model consumed by the salary
+    formulas. Column layout (as read by the sheet's MAP(...) formulas):
+        A Activity · B Checkin · C Start(dep) · E Arr(IATA) · F End(arr) · G Checkout
+    The portal only writes a Checkin on a duty's FIRST sector, so duty
+    boundaries are walked by Checkin. For an HTL row the sheet leaves
+    Checkin/Checkout BLANK and carries the hotel span in Start/End — LAYOVER
+    rows therefore get checkin=None / checkout=None here (the parser's CIdt /
+    COdt convenience copies are ignored on purpose)."""
+    cols = []
+    for r in rows:
+        t = r["Type"]
+        raw_act = (r.get("Code") or r.get("Flight / Code") or "")
+        act = re.sub(r"\s+", "", str(raw_act)).upper()
+        if t == "FLIGHT":
+            o, d = _route_od(r.get("Route"))
+            dep_iata, arr_iata = (o or "CMB"), (d or "CMB")
+            checkin, start, end, checkout = (r.get("CIdt"), r.get("DEPdt"),
+                                             r.get("ARRdt"), r.get("COdt"))
+            sched_min = UL_SCHED_MIN.get(act)
+            blk = None
+            if r.get("ARRdt") and r.get("DEPdt"):
+                a = r.get("ARRdt_u") or r.get("ARRdt")
+                b = r.get("DEPdt_u") or r.get("DEPdt")
+                if a and b:
+                    blk = max(0, int((a - b).total_seconds() // 60))
+        elif t == "LAYOVER":
+            stn = (r.get("Route") or "").strip()
+            dep_iata = arr_iata = stn if (len(stn) == 3 and stn.isalpha()) else "CMB"
+            checkin, start, end, checkout = None, r.get("DEPdt"), r.get("ARRdt"), None
+            sched_min, blk = None, None
+        else:
+            dep_iata = arr_iata = "CMB"
+            checkin, start, end, checkout = (r.get("CIdt"), r.get("DEPdt"),
+                                             r.get("ARRdt"), r.get("COdt"))
+            sched_min, blk = None, None
+        cols.append({"act": act, "checkin": checkin, "start": start, "end": end,
+                     "checkout": checkout, "dep_iata": dep_iata, "arr_iata": arr_iata,
+                     "sched_min": sched_min, "block_min": blk})
+    return cols
+
+
+def _sheet_duty_start(cols, rn):
+    """Sheet d_start_rn: the most recent row at/above rn carrying a Checkin (a
+    duty begins at its first sector's check-in)."""
+    for j in range(rn, -1, -1):
+        if cols[j]["checkin"] is not None:
+            return j
+    return rn
+
+
+def _sheet_duty_end(cols, rn):
+    """Sheet d_end_rn: the next row strictly below rn carrying a Checkin (start
+    of the NEXT duty); the last row when none follows."""
+    for j in range(rn + 1, len(cols)):
+        if cols[j]["checkin"] is not None:
+            return j
+    return len(cols) - 1
+
+
+def _sheet_meal_obopma(cols):
+    """Port of the 'Meal Allowances' (col P) and 'OBOPMA' (col Q) formulas.
+    P (entitled meals) = hotel rows' stay meals + on-board meals of every
+    layover-trip flight. Q (OBOPMA) = the on-board part only (deducted from
+    salary). A flight belongs to a layover trip when its DUTY (bounded by
+    check-ins) contains an HTL ("forward"), or when an HTL sits within 3 rows
+    above it and its start is within 14 h of the hotel's end ("backward").
+    Returns (P, Q) lists aligned with `cols`, None = blank cell."""
+    n = len(cols)
+    P = [None] * n
+    Q = [None] * n
+    for rn in range(n):
+        c = cols[rn]
+        act = c["act"]
+        if not act:
+            continue
+        s_time = c["checkin"] if c["checkin"] is not None else c["start"]
+        e_time = c["checkout"] if c["checkout"] is not None else c["end"]
+        if act == "HTL":
+            pf = next((j for j in range(rn - 1, -1, -1)
+                       if cols[j]["act"].startswith("UL")), None)
+            pf_end = None
+            if pf is not None:
+                pf_end = (cols[pf]["checkout"] if cols[pf]["checkout"] is not None
+                          else cols[pf]["end"])
+            start_m = max(pf_end, s_time) if (pf_end is not None and s_time is not None) \
+                else (pf_end if pf_end is not None else s_time)
+            if start_m is not None and c["end"] is not None:
+                P[rn] = _meal_counts(start_m, c["end"])
+            continue
+        if not act.startswith("UL"):
+            continue
+        ds, de = _sheet_duty_start(cols, rn), _sheet_duty_end(cols, rn)
+        lay_fwd = any(cols[j]["act"] == "HTL" for j in range(ds, de + 1))
+        last_htl = next((j for j in range(rn - 1, -1, -1) if cols[j]["act"] == "HTL"), None)
+        lay_bwd = False
+        if last_htl is not None and (rn - last_htl) <= 3:
+            htl_end = cols[last_htl]["end"]
+            if s_time is not None and htl_end is not None \
+                    and (s_time - htl_end) < timedelta(hours=14):
+                lay_bwd = True
+        if (lay_fwd or lay_bwd) and s_time is not None and e_time is not None:
+            P[rn] = _meal_counts(s_time, e_time)
+            Q[rn] = P[rn]
+    return P, Q
+
+
+def _sheet_return_hours(cols, rn):
+    """Duration (hours) of the station→CMB return leg for the inferred L-O/N
+    edge case (the row just below an HTL has no activity). The sheet reads a
+    'Named Ranges' route table; we use the UL# schedule table when the flight
+    number is known, else the sector's block time."""
+    stn = cols[rn]["arr_iata"]
+    for j in range(rn + 1, len(cols)):
+        c = cols[j]
+        if not c["act"].startswith("UL"):
+            continue
+        if c["dep_iata"] != stn or c["arr_iata"] != "CMB":
+            continue
+        if c["sched_min"]:
+            return c["sched_min"] / 60.0
+        if c["block_min"]:
+            return c["block_min"] / 60.0
+        return 0.0
+    return 0.0
+
+
+def _sheet_l_overnight(cols):
+    """L Overnight (Hours & ONights col I): nights away from base, one value per
+    HTL row = INT(next activity time) − INT(prev activity time), plus an
+    inferred night when the return flight's duration crosses midnight past the
+    hotel end. Returns (total, nights_by_row)."""
+    n = len(cols)
+    nights_by_row = [0] * n
+    total = 0
+    for rn in range(n):
+        c = cols[rn]
+        if c["act"] != "HTL":
+            continue
+        if rn >= 1 and cols[rn - 1]["arr_iata"] == "CMB":
+            prev_time = cols[rn - 1]["checkout"]
+        elif rn >= 1 and cols[rn - 1]["checkin"] is None:
+            prev_time = cols[rn - 3]["checkin"] if rn - 3 >= 0 else None
+        else:
+            prev_time = cols[rn - 1]["checkin"] if rn >= 1 else None
+        n1 = cols[rn + 1]["checkout"] if rn + 1 < n else None
+        n2 = cols[rn + 2]["checkout"] if rn + 2 < n else None
+        if n1 is None and n2 is None:
+            next_time = c["end"]
+        elif n1 is None:
+            next_time = n2
+        else:
+            next_time = n1
+        raw = 0
+        if prev_time is not None and next_time is not None and next_time > prev_time:
+            raw = (next_time.date() - prev_time.date()).days
+        inferred = 0
+        if rn + 1 < n and not cols[rn + 1]["act"] and c["end"] is not None \
+                and c["arr_iata"] != "CMB":
+            dur_h = _sheet_return_hours(cols, rn)
+            if dur_h > 0:
+                inferred = int((c["end"] + timedelta(hours=dur_h)).date() - c["end"].date())
+        nights_by_row[rn] = raw + inferred
+        total += raw + inferred
+    return total, nights_by_row
+
+
+def _sheet_t_overnight(cols):
+    """T Overnight (Hours & ONights col J): turnaround nights. A return leg
+    (blank check-in, has check-out, previous row has a check-in) counts
+    check-out day − previous check-in day; a standard crossing counts
+    check-out day − check-in day. Rows adjacent to an HTL (layover flights)
+    are blank, and a return leg whose previous-previous row is HTL (the second
+    sector of a layover return) is blank too."""
+    n = len(cols)
+    total = 0
+    for rn in range(n):
+        act = cols[rn]["act"]
+        if not act or act == "OFF" or act == "SICK" or act.startswith("SB"):
+            continue
+        next_act = cols[rn + 1]["act"] if rn + 1 < n else ""
+        prev_act = cols[rn - 1]["act"] if rn >= 1 else ""
+        prev_checkin = cols[rn - 1]["checkin"] if rn >= 1 else None
+        prev_prev_act = cols[rn - 2]["act"] if rn >= 2 else ""
+        if next_act == "HTL" or prev_act == "HTL":
+            continue                                   # layover-adjacent → blank
+        is_ret = (cols[rn]["checkin"] is None and cols[rn]["checkout"] is not None
+                  and prev_checkin is not None)
+        if is_ret:
+            if prev_prev_act == "HTL":
+                continue                               # layover return 2nd sector
+            d = (cols[rn]["checkout"].date() - prev_checkin.date()).days
+            if d > 0:
+                total += d
+        elif cols[rn]["checkin"] is not None and cols[rn]["checkout"] is not None \
+                and cols[rn]["checkout"].date() > cols[rn]["checkin"].date():
+            total += (cols[rn]["checkout"].date() - cols[rn]["checkin"].date()).days
+    return total
 def compute_salary(rows, prof, acting=None):
     """Full payslip from parsed roster + crew profile. Mirrors the sheet:
     meal entitlements (P), on-board meal deduction (Q/OBOPMA), layover &
@@ -3200,79 +3399,62 @@ def compute_salary(rows, prof, acting=None):
             return max(0, int((r["ARRdt"] - r["DEPdt"]).total_seconds() // 60))
         return 0
 
-    def win(r):
-        return (r.get("CIdt") or r.get("DEPdt")), (r.get("COdt") or r.get("ARRdt"))
-
-    def is_layover_paired(i):
-        return any(0 <= j < len(rows) and rows[j]["Type"] == "LAYOVER" for j in (i - 1, i + 1))
+    # --- allowance / OBOPMA / overnights — ported 1:1 from the Google Sheet's
+    # 'Meal Allowances', 'OBOPMA', 'L Overnight' and 'T Overnight' formulas.
+    # Duty boundaries are walked by CHECK-IN (the portal only writes a check-in
+    # on a duty's first sector), so the combined flight before a layover
+    # (UL133/UL134 → UL253 → HTL → UL254) chains naturally, while a separate
+    # no-check-in red-eye (UL225/226) that merely precedes the layover duty is
+    # cut off at the next duty's check-in — no heuristic guards needed. ---
+    cols = _sheet_roster_cols(rows)
+    P, Q = _sheet_meal_obopma(cols)
 
     ent = [0, 0, 0]      # entitled meals B/L/D (sheet col P)
-    ob = [0, 0, 0]       # on-board meals (sheet col Q — deducted)
+    ob = [0, 0, 0]       # on-board meals (sheet col Q — deducted from salary)
     detail = []
-    for i, r in flights:
-        s, e = win(r)
-        if s and e and is_layover_paired(i):
-            b, l, d = _meal_counts(s, e)
+    for i, r in enumerate(rows):
+        if r["Type"] == "FLIGHT" and Q[i] is not None and sum(Q[i]) > 0:
+            b, l, d = Q[i]
             for k, v in enumerate((b, l, d)):
                 ent[k] += v
                 ob[k] += v
             detail.append((f"✈ {r['Flight / Code']} ({r['Route']})", f"{b}B {l}L {d}D", "on board"))
-
-    l_nights = 0
-    layover_allow = []      # per-layover allowance breakdown (dashboard estimator)
-    claimed_flights = set()
-    for i, r in enumerate(rows):
-        if r["Type"] != "LAYOVER":
-            continue
-        pf = next((rows[j] for j in range(i - 1, -1, -1) if rows[j]["Type"] == "FLIGHT"), None)
-        nf = next((rows[j] for j in range(i + 1, len(rows)) if rows[j]["Type"] == "FLIGHT"), None)
-        hs = r.get("CIdt") or ((pf.get("COdt") or pf.get("ARRdt")) if pf else None)
-        he = r.get("COdt") or ((nf.get("CIdt") or nf.get("DEPdt")) if nf else None)
-        pf_end = (pf.get("COdt") or pf.get("ARRdt")) if pf else None
-        ms = max(hs, pf_end) if (hs and pf_end) else (hs or pf_end)
-        lay_meals = 0
-        if ms and he:
-            b, l, d = _meal_counts(ms, he)
-            lay_meals = b + l + d
+        elif r["Type"] == "LAYOVER" and P[i] is not None and sum(P[i]) > 0:
+            b, l, d = P[i]
             for k, v in enumerate((b, l, d)):
                 ent[k] += v
             detail.append((f"🏨 Layover {r['Route']}", f"{b}B {l}L {d}D", "hotel"))
-        # meals eaten ON BOARD the flights into/out of this layover also belong
-        # to this layover trip (paid as allowance, deducted from salary)
-        for f in (pf, nf):
-            if f is None or id(f) in claimed_flights:
-                continue
-            fs, fe = win(f)
-            if fs and fe:
-                fb, fl_, fd = _meal_counts(fs, fe)
-                lay_meals += fb + fl_ + fd
-                claimed_flights.add(id(f))
-        # Layover O/N count — nights AWAY FROM BASE, from the outbound flight's
-        # report (check-in) to the return flight's check-out after landing.
-        # Mirrors the sheet's 'Hours & ONights' column I ("L Overnight"):
-        #   INT(next_checkout_or_end) - INT(prev_checkin_or_checkout)
-        prev_time = (pf.get("CIdt") or pf.get("COdt") or pf.get("ARRdt")) if pf else (r.get("CIdt") or hs)
-        if nf is not None:
-            next_time = nf.get("COdt") or nf.get("ARRdt") or he
-        else:
-            next_time = he or r.get("EndDateObj")
-        lay_nights = 0
-        if prev_time and next_time and next_time > prev_time:
-            lay_nights = (next_time.date() - prev_time.date()).days
-            l_nights += lay_nights
-        layover_allow.append({
-            "station": r["Route"] if r.get("Route") and r["Route"] != "-" else "LAY",
-            "meals": lay_meals, "nights": lay_nights,
-            "usd": lay_meals * MEAL_RATE_USD + lay_nights * OVERNIGHT_RATE_USD[cat],
-        })
 
-    t_on = 0
-    for i, r in flights:
-        if is_layover_paired(i):
+    l_nights, _lrow = _sheet_l_overnight(cols)
+    t_on = _sheet_t_overnight(cols)
+
+    # Per-layover allowance breakdown for the dashboard card: hotel meals (P)
+    # + the on-board meals (Q) of this layover's outbound/inbound sectors.
+    layover_allow = []
+    claimed = set()
+    for i, r in enumerate(rows):
+        if r["Type"] != "LAYOVER":
             continue
-        s, e = win(r)
-        if s and e and s.date() != e.date():
-            t_on += 1
+        stn = cols[i]["arr_iata"]
+        meals = sum(P[i]) if P[i] else 0
+        htl_end = cols[i]["end"]
+        for j in range(_sheet_duty_start(cols, i), i):          # outbound chain
+            if j in claimed or rows[j]["Type"] != "FLIGHT" or Q[j] is None:
+                continue
+            meals += sum(Q[j])
+            claimed.add(j)
+        for j in range(i + 1, min(i + 4, len(rows))):            # inbound chain
+            if j in claimed or rows[j]["Type"] != "FLIGHT" or Q[j] is None:
+                continue
+            s_t = cols[j]["checkin"] if cols[j]["checkin"] is not None else cols[j]["start"]
+            if htl_end is not None and s_t is not None and (s_t - htl_end) < timedelta(hours=14):
+                meals += sum(Q[j])
+                claimed.add(j)
+        layover_allow.append({
+            "station": stn if len(stn) == 3 else (r.get("Route") or "LAY"),
+            "meals": meals, "nights": _lrow[i],
+            "usd": meals * MEAL_RATE_USD + _lrow[i] * OVERNIGHT_RATE_USD[cat],
+        })
 
     block_min = sum(_block_mins(r) for _, r in flights)
     # CLV (casual leave) is NOT paid — only ALV / RLV / ALP (sheet C17)
@@ -4395,97 +4577,109 @@ else:
 
                 a_df["Δ Net (Rs)"] = a_df["Net (Rs)"].diff()
 
-                PAL = {"cyan": "#22d3ee", "green": "#34d399", "amber": "#fbbf24",
-                       "pink": "#f472b6", "violet": "#a78bfa", "blue": "#60a5fa"}
-                FONT = dict(family="Segoe UI, Arial, sans-serif", size=12, color="#9fb3c8")
+                if go is not None:
+                    PAL = {"cyan": "#22d3ee", "green": "#34d399", "amber": "#fbbf24",
+                           "pink": "#f472b6", "violet": "#a78bfa", "blue": "#60a5fa"}
+                    FONT = dict(family="Segoe UI, Arial, sans-serif", size=12, color="#9fb3c8")
 
-                def _style_axes(fig, height=300, legend=True):
-                    fig.update_layout(
-                        height=height, margin=dict(l=10, r=10, t=26, b=10),
-                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                        font=FONT, showlegend=legend, hovermode="x unified",
-                        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left",
-                                    x=0, font=dict(size=11)))
-                    fig.update_xaxes(showgrid=False, zeroline=False, linecolor="rgba(159,179,200,0.25)")
-                    fig.update_yaxes(showgrid=True, gridcolor="rgba(159,179,200,0.12)", zeroline=False)
-                    return fig
+                    def _style_axes(fig, height=300, legend=True):
+                        fig.update_layout(
+                            height=height, margin=dict(l=10, r=10, t=26, b=10),
+                            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                            font=FONT, showlegend=legend, hovermode="x unified",
+                            legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left",
+                                        x=0, font=dict(size=11)))
+                        fig.update_xaxes(showgrid=False, zeroline=False, linecolor="rgba(159,179,200,0.25)")
+                        fig.update_yaxes(showgrid=True, gridcolor="rgba(159,179,200,0.12)", zeroline=False)
+                        return fig
 
-                # 1 · Net trend — smooth area line
-                net = go.Figure(go.Scatter(
-                    x=a_df["Month"], y=a_df["Net (Rs)"], mode="lines+markers",
-                    line=dict(color=PAL["cyan"], width=2.5, shape="spline", smoothing=0.6),
-                    marker=dict(size=7, color=PAL["cyan"], line=dict(width=2, color="#0b1622")),
-                    fill="tozeroy", fillcolor="rgba(34,211,238,0.12)",
-                    hovertemplate="%{x}<br>Net Rs %{y:,.0f}<extra></extra>"))
-                _style_axes(net, height=300, legend=False)
-                st.markdown("##### Net salary by month")
-                st.plotly_chart(net, width="stretch")
+                    # 1 · Net trend — smooth area line
+                    net = go.Figure(go.Scatter(
+                        x=a_df["Month"], y=a_df["Net (Rs)"], mode="lines+markers",
+                        line=dict(color=PAL["cyan"], width=2.5, shape="spline", smoothing=0.6),
+                        marker=dict(size=7, color=PAL["cyan"], line=dict(width=2, color="#0b1622")),
+                        fill="tozeroy", fillcolor="rgba(34,211,238,0.12)",
+                        hovertemplate="%{x}<br>Net Rs %{y:,.0f}<extra></extra>"))
+                    _style_axes(net, height=300, legend=False)
+                    st.markdown("##### Net salary by month")
+                    st.plotly_chart(net, width="stretch")
 
-                # 2 · Composition donut + block/sectors dual axis, side by side
-                cL, cR = st.columns([1, 1])
-                with cL:
-                    comp = [("Productivity", "Productivity (Rs)", PAL["cyan"]),
-                            ("Premium", "Premium (Rs)", PAL["green"]),
-                            ("FBPP", "FBPP (Rs)", PAL["pink"]),
-                            ("Acting", "Acting (Rs)", PAL["violet"])]
-                    keep = [(l, a_df[c].sum(), col) for l, c, col in comp if a_df[c].sum() > 0]
-                    if keep:
-                        donut = go.Figure(go.Pie(
-                            labels=[k[0] for k in keep], values=[k[1] for k in keep],
-                            hole=0.62, marker=dict(colors=[k[2] for k in keep],
-                                                   line=dict(color="#0b1622", width=2)),
-                            textinfo="label+percent", textfont=dict(size=11, color="#c9d6e3"),
-                            hovertemplate="%{label}<br>Rs %{value:,.0f}<extra></extra>"))
-                        donut.update_layout(
+                    # 2 · Composition donut + block/sectors dual axis, side by side
+                    cL, cR = st.columns([1, 1])
+                    with cL:
+                        comp = [("Productivity", "Productivity (Rs)", PAL["cyan"]),
+                                ("Premium", "Premium (Rs)", PAL["green"]),
+                                ("FBPP", "FBPP (Rs)", PAL["pink"]),
+                                ("Acting", "Acting (Rs)", PAL["violet"])]
+                        keep = [(l, a_df[c].sum(), col) for l, c, col in comp if a_df[c].sum() > 0]
+                        if keep:
+                            donut = go.Figure(go.Pie(
+                                labels=[k[0] for k in keep], values=[k[1] for k in keep],
+                                hole=0.62, marker=dict(colors=[k[2] for k in keep],
+                                                       line=dict(color="#0b1622", width=2)),
+                                textinfo="label+percent", textfont=dict(size=11, color="#c9d6e3"),
+                                hovertemplate="%{label}<br>Rs %{value:,.0f}<extra></extra>"))
+                            donut.update_layout(
+                                height=300, margin=dict(l=10, r=10, t=26, b=10),
+                                paper_bgcolor="rgba(0,0,0,0)", font=FONT, showlegend=False,
+                                annotations=[dict(
+                                    text=f"Rs {sum(k[1] for k in keep):,.0f}"
+                                         f"<br><span style='font-size:11px;color:#9fb3c8'>total earnings</span>",
+                                    x=0.5, y=0.5, showarrow=False, font=dict(size=15, color="#e6edf3"))])
+                            st.markdown("##### Earnings composition")
+                            st.plotly_chart(donut, width="stretch")
+                        else:
+                            st.info("No earnings components to show yet.")
+                    with cR:
+                        bh = go.Figure()
+                        bh.add_trace(go.Scatter(
+                            x=a_df["Month"], y=a_df["Block hours"], name="Block hours",
+                            mode="lines+markers", line=dict(color=PAL["blue"], width=2.5),
+                            marker=dict(size=7, line=dict(width=2, color="#0b1622")), yaxis="y",
+                            hovertemplate="%{x}<br>Block %{y:.1f} h<extra></extra>"))
+                        bh.add_trace(go.Scatter(
+                            x=a_df["Month"], y=a_df["Sectors"], name="Sectors",
+                            mode="lines+markers", line=dict(color=PAL["amber"], width=2.5, dash="dot"),
+                            marker=dict(size=7, line=dict(width=2, color="#0b1622")), yaxis="y2",
+                            hovertemplate="%{x}<br>%{y} sectors<extra></extra>"))
+                        bh.update_layout(
                             height=300, margin=dict(l=10, r=10, t=26, b=10),
-                            paper_bgcolor="rgba(0,0,0,0)", font=FONT, showlegend=False,
-                            annotations=[dict(
-                                text=f"Rs {sum(k[1] for k in keep):,.0f}"
-                                     f"<br><span style='font-size:11px;color:#9fb3c8'>total earnings</span>",
-                                x=0.5, y=0.5, showarrow=False, font=dict(size=15, color="#e6edf3"))])
-                        st.markdown("##### Earnings composition")
-                        st.plotly_chart(donut, width="stretch")
-                    else:
-                        st.info("No earnings components to show yet.")
-                with cR:
-                    bh = go.Figure()
-                    bh.add_trace(go.Scatter(
-                        x=a_df["Month"], y=a_df["Block hours"], name="Block hours",
-                        mode="lines+markers", line=dict(color=PAL["blue"], width=2.5),
-                        marker=dict(size=7, line=dict(width=2, color="#0b1622")), yaxis="y",
-                        hovertemplate="%{x}<br>Block %{y:.1f} h<extra></extra>"))
-                    bh.add_trace(go.Scatter(
-                        x=a_df["Month"], y=a_df["Sectors"], name="Sectors",
-                        mode="lines+markers", line=dict(color=PAL["amber"], width=2.5, dash="dot"),
-                        marker=dict(size=7, line=dict(width=2, color="#0b1622")), yaxis="y2",
-                        hovertemplate="%{x}<br>%{y} sectors<extra></extra>"))
-                    bh.update_layout(
-                        height=300, margin=dict(l=10, r=10, t=26, b=10),
-                        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-                        font=FONT, hovermode="x unified",
-                        legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left",
-                                    x=0, font=dict(size=11)),
-                        yaxis=dict(title=dict(text="hours", font=dict(color=PAL["blue"], size=11)),
-                                   gridcolor="rgba(159,179,200,0.12)", zeroline=False),
-                        yaxis2=dict(title=dict(text="sectors", font=dict(color=PAL["amber"], size=11)),
-                                    overlaying="y", side="right", showgrid=False))
-                    bh.update_xaxes(showgrid=False, zeroline=False, linecolor="rgba(159,179,200,0.25)")
-                    st.markdown("##### Block hours & sectors")
-                    st.plotly_chart(bh, width="stretch")
+                            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                            font=FONT, hovermode="x unified",
+                            legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="left",
+                                        x=0, font=dict(size=11)),
+                            yaxis=dict(title=dict(text="hours", font=dict(color=PAL["blue"], size=11)),
+                                       gridcolor="rgba(159,179,200,0.12)", zeroline=False),
+                            yaxis2=dict(title=dict(text="sectors", font=dict(color=PAL["amber"], size=11)),
+                                        overlaying="y", side="right", showgrid=False))
+                        bh.update_xaxes(showgrid=False, zeroline=False, linecolor="rgba(159,179,200,0.25)")
+                        st.markdown("##### Block hours & sectors")
+                        st.plotly_chart(bh, width="stretch")
 
-                # 3 · Allowances — clean lines
-                allow = go.Figure()
-                for col, name, color in [("Meals ($)", "Meals", PAL["cyan"]),
-                                         ("Layover ($)", "Layover", PAL["violet"]),
-                                         ("T/A ($)", "T/A overnight", PAL["pink"])]:
-                    allow.add_trace(go.Scatter(
-                        x=a_df["Month"], y=a_df[col], name=name, mode="lines+markers",
-                        line=dict(color=color, width=2.5),
-                        marker=dict(size=7, line=dict(width=2, color="#0b1622")),
-                        hovertemplate="%{x}<br>" + name + " $%{y:,.0f}<extra></extra>"))
-                _style_axes(allow, height=280)
-                st.markdown("##### Allowances (USD)")
-                st.plotly_chart(allow, width="stretch")
+                    # 3 · Allowances — clean lines
+                    allow = go.Figure()
+                    for col, name, color in [("Meals ($)", "Meals", PAL["cyan"]),
+                                             ("Layover ($)", "Layover", PAL["violet"]),
+                                             ("T/A ($)", "T/A overnight", PAL["pink"])]:
+                        allow.add_trace(go.Scatter(
+                            x=a_df["Month"], y=a_df[col], name=name, mode="lines+markers",
+                            line=dict(color=color, width=2.5),
+                            marker=dict(size=7, line=dict(width=2, color="#0b1622")),
+                            hovertemplate="%{x}<br>" + name + " $%{y:,.0f}<extra></extra>"))
+                    _style_axes(allow, height=280)
+                    st.markdown("##### Allowances (USD)")
+                    st.plotly_chart(allow, width="stretch")
+                else:
+                    # Plotly not installed — native Streamlit area/line fallback (no bars).
+                    st.markdown("##### Net salary by month")
+                    st.area_chart(a_df.set_index("Month")[["Net (Rs)"]], height=300)
+                    st.markdown("##### Earnings composition (Rs)")
+                    st.area_chart(a_df.set_index("Month")[["Productivity (Rs)", "Premium (Rs)",
+                                                            "FBPP (Rs)", "Acting (Rs)"]], height=300)
+                    st.markdown("##### Block hours & sectors")
+                    st.line_chart(a_df.set_index("Month")[["Block hours", "Sectors"]], height=300)
+                    st.markdown("##### Allowances (USD)")
+                    st.line_chart(a_df.set_index("Month")[["Meals ($)", "Layover ($)", "T/A ($)"]], height=280)
 
                 # 4 · Comparison table with MoM delta arrows
                 st.markdown("##### Monthly comparison")
