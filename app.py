@@ -397,6 +397,17 @@ def load_roster_history(username):
     return out
 
 
+def delete_roster_history(username, period_start):
+    """Remove one archived 28-day period (its published/performed text goes too).
+    Used to clean up a stray finalized period (e.g. an accidental paste)."""
+    pkey = period_start.strftime('%Y-%m-%d') if hasattr(period_start, 'strftime') else str(period_start)
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    c.execute('DELETE FROM roster_history WHERE username = ? AND period_start = ?', (username, pkey))
+    conn.commit()
+    conn.close()
+
+
 def _rows_in_period(rows, start, days=ROSTER_PERIOD_DAYS):
     """Rows whose DateObj falls within [start, start + days)."""
     lo, hi = start, start + timedelta(days=days)
@@ -3968,7 +3979,8 @@ else:
                     "Performed roster text (this period)",
                     value=(tgt["performed_text"] if tgt else ""), height=140,
                     key=f"hist_perf_{sel_start.strftime('%Y%m%d')}")
-                if st.button("Save performed roster for this period", key="history_manual_btn"):
+                hb_save, hb_del = st.columns([1, 1])
+                if hb_save.button("💾 Save performed roster", use_container_width=True, key="history_manual_btn"):
                     if man_in.strip():
                         save_roster_history(st.session_state['username'], sel_start,
                                             published_text=(tgt["published_text"] if tgt else None),
@@ -3977,6 +3989,13 @@ else:
                         st.rerun()
                     else:
                         st.warning("Paste the performed roster text first.")
+                _del_ok = hb_del.checkbox("⚠️ Allow delete", key="history_del_confirm")
+                if hb_del.button("🗑 Delete this period", use_container_width=True, key="history_delete_btn",
+                                 disabled=not _del_ok):
+                    delete_roster_history(st.session_state['username'], sel_start)
+                    st.session_state.pop('cal_period_sel', None)
+                    st.success(f"Period {sel_start.strftime('%d %b')} deleted from Roster History.")
+                    st.rerun()
 
             # 28-day roster period navigation (anchored 13 Jul 2026: 07 Sep–04 Oct is current).
             # Calendar shows the current roster + finalized performed periods, so the
@@ -3996,19 +4015,32 @@ else:
                 if 'cal_period_sel' not in st.session_state or st.session_state['cal_period_sel'] not in starts:
                     st.session_state['cal_period_sel'] = t0 if t0 in starts else starts[0]
                 idx = starts.index(st.session_state['cal_period_sel'])
-                nav1, nav2, nav3 = st.columns([1, 4, 1])
+
+                def _period_label(d):
+                    return (f"{d.strftime('%d %b')} – "
+                            f"{(d + timedelta(days=ROSTER_PERIOD_DAYS - 1)).strftime('%d %b %Y')}"
+                            + ("  ·  current" if d == t0 else ""))
+
+                nav1, nav2, nav3, nav4 = st.columns([0.8, 4.4, 0.8, 1.4])
                 with nav1:
                     if st.button("‹", use_container_width=True, disabled=idx == 0):
                         st.session_state['cal_period_sel'] = starts[idx - 1]
                         st.rerun()
+                with nav2:
+                    # Direct period picker (doubles as the label) — no more
+                    # clicking the arrows all the way back to today.
+                    st.selectbox("Roster period", starts, key="cal_period_sel",
+                                 format_func=_period_label, label_visibility="collapsed")
                 with nav3:
                     if st.button("›", use_container_width=True, disabled=idx == len(periods) - 1):
                         st.session_state['cal_period_sel'] = starts[idx + 1]
                         st.rerun()
-                with nav2:
-                    p0, p1 = periods[idx]
-                    st.markdown(f"<div style='text-align:center;font-weight:700;padding-top:6px;'>Roster Period: {p0.strftime('%d %b')} – {p1.strftime('%d %b %Y')}</div>", unsafe_allow_html=True)
-                sel_span = periods[idx]
+                with nav4:
+                    if t0 in starts and st.button("⟲ Current", use_container_width=True,
+                                                  disabled=(st.session_state['cal_period_sel'] == t0)):
+                        st.session_state['cal_period_sel'] = t0
+                        st.rerun()
+                sel_span = periods[starts.index(st.session_state['cal_period_sel'])]
             else:
                 sel_span = None
 
@@ -4320,7 +4352,8 @@ else:
             if 'performed_roster' not in st.session_state:
                 st.session_state['performed_roster'] = load_performed_roster(st.session_state['username'])
             perf_saved = st.session_state.get('performed_roster', '')
-            with st.expander("📋 Performed Roster (paste here)", expanded=not bool(perf_saved)):
+            with st.expander("📋 Performed Roster (paste here) — " + ("saved ✅" if perf_saved.strip() else "empty"),
+                             expanded=True):
                 st.markdown("<div class='muted' style='margin-bottom:6px;'>Salary is calculated per <b>calendar month (1st – end)</b>, and only when the <b>whole month</b> is performed — a half-month shows \u201cno data\u201d. Paste your <b>performed</b> roster from the crew portal; it's used here only if it covers the full month. Saved separately from your live roster.</div>", unsafe_allow_html=True)
                 perf_input = st.text_area("Performed roster text", value=perf_saved, height=160,
                                           label_visibility="collapsed",
