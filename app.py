@@ -231,6 +231,8 @@ def roster_periods_off_days(username, current_rows):
     for h in hist:
         if not h["finalized"] or not h["performed_text"] or h["period_start"] is None:
             continue
+        if cur_start is not None and h["period_start"] == cur_start:
+            continue   # current period stays as the live published roster
         rows = parse_roster_text(h["performed_text"])
         clipped = _rows_in_period(rows, h["period_start"])
         ds = _day_status_map(clipped)
@@ -264,17 +266,20 @@ def merged_history_rows(username, current_rows):
     hist = load_roster_history(username)
     out = []
     included = set()
-    for h in hist:
-        if not h["finalized"] or not h["performed_text"] or h["period_start"] is None:
-            continue
-        out += _rows_in_period(parse_roster_text(h["performed_text"]), h["period_start"])
-        included.add(h["period_start"])
+    cur_start = None
     if current_rows:
         dates = [r["DateObj"].date() for r in current_rows if r.get("DateObj")]
         if dates:
             cur_start = roster_period_of_roster(dates)
-            if cur_start not in included:
-                out += _rows_in_period(current_rows, cur_start)
+    for h in hist:
+        if not h["finalized"] or not h["performed_text"] or h["period_start"] is None:
+            continue
+        if cur_start is not None and h["period_start"] == cur_start:
+            continue   # current period stays as the live published roster
+        out += _rows_in_period(parse_roster_text(h["performed_text"]), h["period_start"])
+        included.add(h["period_start"])
+    if current_rows and cur_start and cur_start not in included:
+        out += _rows_in_period(current_rows, cur_start)
     out.sort(key=lambda r: r["DateObj"] or datetime.min)
     return out
 
@@ -300,7 +305,17 @@ def calendar_rows(username, current_rows):
         out += _rows_in_period(parse_roster_text(h["performed_text"]), h["period_start"])
     out += list(current_rows)
     out.sort(key=lambda r: r["DateObj"] or datetime.min)
-    return out
+    # The live published roster can carry a day or two of the PREVIOUS period
+    # (its tail), which a finalized history period also provides — collapse
+    # identical (date, type, code) rows so those days aren't double-chipped.
+    seen, dedup = set(), []
+    for r in out:
+        key = (r["DateObj"].date() if r.get("DateObj") else None, r["Type"], r.get("Code"))
+        if key in seen:
+            continue
+        seen.add(key)
+        dedup.append(r)
+    return dedup
 
 def save_profile(username, data):
     conn = sqlite3.connect('crew_companion.db')
@@ -402,7 +417,7 @@ def _parse_tab_line(line_str):
     act_idx = act = None
     for i, f in enumerate(fields):
         s = f.strip()
-        if re.match(r'^(UL\s*\d{1,4}|HTL|OFF|ROF|TOF|SB\d*|ALV|RLV|ALP|CLV|' + _DUTY_PAT + r')$', s):
+        if re.match(r'^(UL\s*\d{1,4}|HTL|OFF|ROF|TOF|SB\d*|ALV|RLV|ALP|CLV|S/L|' + _DUTY_PAT + r')$', s):
             act_idx, act = i, s.upper()
             break
     if act is None:
@@ -469,7 +484,7 @@ def _parse_tab_line(line_str):
         elif dts:
             ci_dt = dep_dt = dts[0][1]
             arr_dt = co_dt = dts[-1][1]
-    elif act in ("ALV", "RLV", "ALP", "CLV"):
+    elif act in ("ALV", "RLV", "ALP", "CLV", "S/L"):
         atype, code = "LEAVE", act
         if dts:
             dep_dt, arr_dt = _clamp_exclusive_end(dts[0][1], dts[-1][1])
@@ -591,7 +606,7 @@ def parse_roster_text(raw_text):
             except ValueError:
                 pass
 
-        if any(keyword in line_str for keyword in ["UL", "OFF", "HTL", "SB", "ROF", "TOF", "ALV", "RLV", "ALP", "CLV"]):
+        if any(keyword in line_str for keyword in ["UL", "OFF", "HTL", "SB", "ROF", "TOF", "ALV", "RLV", "ALP", "CLV", "S/L"]):
             activity_type = "OTHER"
             flight_no = "-"
             checkin_time = "-"
@@ -608,7 +623,7 @@ def parse_roster_text(raw_text):
                 activity_type = "DAY OFF"
             elif "TOF" in line_str:
                 activity_type = "TIMEOFF"
-            elif any(c in line_str for c in ("ALV", "RLV", "ALP", "CLV")):
+            elif any(c in line_str for c in ("ALV", "RLV", "ALP", "CLV", "S/L")):
                 activity_type = "LEAVE"
             elif "HTL" in line_str:
                 activity_type = "LAYOVER"
@@ -634,7 +649,7 @@ def parse_roster_text(raw_text):
                 m = re.search(r'\bSB\d*\b', line_str)
                 code = m.group(0) if m else "SB"
             elif activity_type == "LEAVE":
-                m = re.search(r'\b(ALV|RLV|ALP|CLV)\b', line_str)
+                m = re.search(r'\b(ALV|RLV|ALP|CLV|S/L)\b', line_str)
                 code = m.group(1) if m else "LEAVE"
             else:
                 code = "OTHER"
@@ -2110,59 +2125,91 @@ def _day_status_map(rows):
     return day_status
 
 
-def _days_off_rule_breaks(day_status, lo, hi):
-    """Which 8.2.17(a/b/c) counting rules are breached across [lo, hi].
-    (a) run of >7 consecutive duty days; (b) a 14-day window with no adjacent
-    pair of off days; (c) a 28-day window with fewer than 7 off days."""
-    breaks = set()
-    run = 0
+def _max_duty_run(day_status, lo, hi):
+    """Longest run of consecutive duty days across [lo, hi] (8.2.17.a)."""
+    run = best = 0
     d = lo
     while d <= hi:
         if "duty" in day_status.get(d, set()):
             run += 1
-            if run > 7:
-                breaks.add("a")
-                break
+            best = max(best, run)
         else:
             run = 0
         d += timedelta(days=1)
+    return best
+
+
+def _no_pair_14_windows(day_status, lo, hi):
+    """Set of 14-day window START dates (windows fully inside [lo, hi]) that
+    contain no adjacent pair of off days (8.2.17.b)."""
+    out = set()
     d = lo
     while d + timedelta(days=13) <= hi:
         if not any("off" in day_status.get(d + timedelta(days=k), set())
                    and "off" in day_status.get(d + timedelta(days=k + 1), set())
                    for k in range(13)):
-            breaks.add("b")
-            break
+            out.add(d)
         d += timedelta(days=1)
-    d = lo
-    while d + timedelta(days=27) <= hi:
-        if sum(1 for k in range(28) if "off" in day_status.get(d + timedelta(days=k), set())) < 7:
-            breaks.add("c")
+    return out
+
+
+def _period_off_count(day_status, period_start):
+    """Number of off days inside one aligned 28-day roster period."""
+    return sum(1 for d, s in day_status.items()
+               if "off" in s and period_start <= d < period_start + timedelta(days=ROSTER_PERIOD_DAYS))
+
+
+def _base_rule_status(day_status, lo, hi):
+    """Which 8.2.17(a/b/c) rules the base roster already breaches.
+    (a) a duty run > 7 anywhere; (b) any 14-day window with no adjacent off pair;
+    (c) any aligned 28-day period with fewer than 7 off days (the user-confirmed
+    per-roster minimum)."""
+    brk = set()
+    if _max_duty_run(day_status, lo, hi) > 7:
+        brk.add("a")
+    if _no_pair_14_windows(day_status, lo, hi):
+        brk.add("b")
+    pmin = roster_period_bounds(lo)[0]
+    pmax = roster_period_bounds(hi)[0]
+    p = pmin
+    while p <= pmax:
+        if _period_off_count(day_status, p) < 7:
+            brk.add("c")
             break
-        d += timedelta(days=1)
-    return breaks
+        p += timedelta(days=ROSTER_PERIOD_DAYS)
+    return brk
 
 
 def mandatory_off_days(rows):
-    """DAY OFF dates that are legally required by 8.2.17. Each off date is
-    individually stress-tested: if turning it into a duty day would breach
-    rule (a), (b) or (c), that date is mandatory. Conservative (one day at a
-    time), so a date is only marked when it is itself load-bearing. Returns
-    {date: [rule label, ...]}."""
+    """DAY OFF dates that are legally required by 8.2.17. A date is mandatory
+    only when the roster currently MEETS a rule but turning that date into a
+    duty day would BREACH it (new-breach-vs-base), so an already-short roster
+    doesn't mark every day. Rule (c) uses the user-confirmed per-roster reading:
+    an aligned 28-day period with exactly 7 off days makes all 7 load-bearing.
+    Returns {date: [rule label, ...]}."""
     day_status = _day_status_map(rows)
     off_days = sorted(d for d, s in day_status.items() if "off" in s)
     if not day_status or not off_days:
         return {}
     lo, hi = min(day_status), max(day_status)
     labels = {"a": "8th-day off", "b": "2-off-in-14", "c": "7-off-in-28"}
+    base = _base_rule_status(day_status, lo, hi)
+    base_b = _no_pair_14_windows(day_status, lo, hi)
+
     mand = {}
     for o in off_days:
         alt = {d: set(v) for d, v in day_status.items()}
         alt[o].discard("off")
         alt[o].add("duty")
-        breaks = _days_off_rule_breaks(alt, lo, hi)
-        if breaks:
-            mand[o] = [labels[b] for b in sorted(breaks)]
+        rules = []
+        if "a" not in base and _max_duty_run(alt, lo, hi) > 7:
+            rules.append("a")
+        if _no_pair_14_windows(alt, lo, hi) - base_b:
+            rules.append("b")
+        if _period_off_count(day_status, roster_period_bounds(o)[0]) == 7:
+            rules.append("c")
+        if rules:
+            mand[o] = [labels[r] for r in rules]
     return mand
 
 
@@ -2491,12 +2538,14 @@ def _duty_cont_chip(sectors):
             else f"<div class='chip chip-cont'>↳ <b>{title}</b></div>")
 
 
-def _off_chip(mand_rules):
-    """DAY OFF chip — mandatory days (required by 8.2.17) are highlighted."""
+def _off_chip(mand_rules, code="OFF"):
+    """DAY OFF chip — OFF vs ROF kept distinct; mandatory days (required by
+    8.2.17) are highlighted red."""
+    lbl = code if code in ("OFF", "ROF") else "OFF"
     if mand_rules:
         return (f"<div class='chip chip-off-mand' title='Mandatory — {', '.join(mand_rules)}'>"
-                f"🔴 OFF · MAND</div>")
-    return "<div class='chip chip-off'>🟢 OFF</div>"
+                f"🔴 {lbl} · MAND</div>")
+    return f"<div class='chip chip-off'>🟢 {lbl}</div>"
 
 
 def flight_intel_card(du, rows):
@@ -2569,7 +2618,7 @@ def build_calendar_html(rows, span=None):
             stn = r["Route"] if r["Route"] != "-" else "Layover"
             chip = f"<div class='chip chip-lay'>🏨 {stn}</div>"
         elif r["Type"] == "DAY OFF":
-            chip = None   # built per-day so mandatory days can be highlighted
+            chip = ("off", r.get("Code") or "OFF")   # per-day; keeps the OFF/ROF code
         elif r["Type"] == "STANDBY":
             code = r.get("Code") or "SB"
             s0 = r.get("CIdt") or r.get("DEPdt")
@@ -2581,7 +2630,8 @@ def build_calendar_html(rows, span=None):
                     t = f"{s0.day} {s0.strftime('%H:%M')}–{s1.day} {s1.strftime('%H:%M')}"
             chip = f"<div class='chip chip-sby'>⏱ <b>{code}</b>{(' · ' + t) if t else ''}</div>"
         elif r["Type"] == "LEAVE":
-            chip = "<div class='chip chip-lay'>🌴 Leave</div>"
+            chip = ("<div class='chip chip-lay'>🤒 S/L (sick)</div>" if r.get("Code") == "S/L"
+                    else "<div class='chip chip-lay'>🌴 Leave</div>")
         elif r["Type"] == "TIMEOFF":
             s0 = r.get("DEPdt") or r.get("CIdt")
             s1 = r.get("ARRdt") or r.get("COdt")
@@ -2597,8 +2647,8 @@ def build_calendar_html(rows, span=None):
         d1 = r["EndDateObj"].date() if r.get("EndDateObj") else d0
         d = d0
         while d <= d1:
-            if chip is None:
-                rmap.setdefault(d, []).append(_off_chip(mand_map.get(d)))
+            if isinstance(chip, tuple) and chip[0] == "off":
+                rmap.setdefault(d, []).append(_off_chip(mand_map.get(d), chip[1]))
             else:
                 rmap.setdefault(d, []).append(chip)
             d += timedelta(days=1)
@@ -2655,6 +2705,10 @@ def build_calendar_html(rows, span=None):
         "= required by §8.2.17 (7-day duty cap / 2-off-in-14 / 7-off-in-28) &nbsp;·&nbsp; "
         "<span class='chip chip-off' style='display:inline-block;margin:0 4px 0 0;'>🟢 OFF</span>"
         "= discretionary &nbsp;·&nbsp; "
+        "<span class='chip chip-off' style='display:inline-block;margin:0 4px 0 0;'>🟢 ROF</span>"
+        "= rest-off day &nbsp;·&nbsp; "
+        "<span class='chip chip-lay' style='display:inline-block;margin:0 4px 0 0;'>🤒 S/L</span>"
+        "= sick leave &nbsp;·&nbsp; "
         "<span class='chip chip-tof' style='display:inline-block;margin:0 4px 0 0;'>🕓 TOF</span>"
         "= time off (no check-in/check-out allowed in the window)</div>")
     return "".join(cells) + legend
@@ -3231,17 +3285,20 @@ else:
                 hist_rows = load_roster_history(st.session_state['username'])
                 now_ref = (roster_period_of_roster(valid_dates_all) if valid_dates_all
                            else roster_period_bounds(datetime.now().date())[0])
-                avail = [now_ref - timedelta(days=ROSTER_PERIOD_DAYS * k) for k in range(4)]
+                # PAST periods only — the current period stays as the published
+                # roster until its period ends (finalized via the end-of-period
+                # banner above), so it can never shadow the live fatigue /
+                # intel / monitoring data.
+                avail = [now_ref - timedelta(days=ROSTER_PERIOD_DAYS * k) for k in range(1, 5)]
                 for h in hist_rows:
-                    if h["period_start"] and h["period_start"] not in avail:
+                    if h["period_start"] and h["period_start"] != now_ref and h["period_start"] not in avail:
                         avail.append(h["period_start"])
                 avail = sorted(set(avail), reverse=True)   # newest first
 
-                st.markdown("<div class='muted' style='margin-bottom:6px;'>Paste your <b>performed</b> rosters (portal's performed view) for past periods here — the 8.2.17(d) 3-period average and rolling checks use these, not the published plan.</div>", unsafe_allow_html=True)
+                st.markdown("<div class='muted' style='margin-bottom:6px;'>Paste your <b>performed</b> rosters (portal's performed view) for <b>past</b> periods here — the 8.2.17(d) 3-period average and rolling checks use these, not the published plan. The current period is kept as the published roster above and is finalized automatically when it ends.</div>", unsafe_allow_html=True)
                 for s in avail:
                     h = next((x for x in hist_rows if x["period_start"] == s), None)
                     last = s + timedelta(days=ROSTER_PERIOD_DAYS - 1)
-                    cur_tag = " · current" if s == now_ref else ""
                     if h and h["finalized"]:
                         status = "✅ finalized"
                     elif h:
@@ -3249,15 +3306,14 @@ else:
                     else:
                         status = "—"
                     st.markdown(
-                        f"<div class='bidrow'><span>{s.strftime('%d %b')} – {last.strftime('%d %b %Y')}{cur_tag}</span>"
+                        f"<div class='bidrow'><span>{s.strftime('%d %b')} – {last.strftime('%d %b %Y')}</span>"
                         f"<span>{status}</span></div>", unsafe_allow_html=True)
 
                 sel_start = st.selectbox(
                     "Finalize which period?",
                     avail,
                     format_func=lambda s: (s.strftime('%d %b') + " – " +
-                                           (s + timedelta(days=ROSTER_PERIOD_DAYS - 1)).strftime('%d %b %Y') +
-                                           (" (current)" if s == now_ref else "")),
+                                           (s + timedelta(days=ROSTER_PERIOD_DAYS - 1)).strftime('%d %b %Y')),
                     key="history_sel_period")
                 tgt = next((h for h in hist_rows if h["period_start"] == sel_start), None)
                 man_in = st.text_area(
@@ -3267,8 +3323,7 @@ else:
                 if st.button("Save performed roster for this period", key="history_manual_btn"):
                     if man_in.strip():
                         save_roster_history(st.session_state['username'], sel_start,
-                                            published_text=(tgt["published_text"] if tgt else
-                                                            (st.session_state['current_roster'] if sel_start == now_ref else None)),
+                                            published_text=(tgt["published_text"] if tgt else None),
                                             performed_text=man_in, finalized=True)
                         st.success(f"Period {sel_start.strftime('%d %b')} finalized — rolling checks now use the performed roster.")
                         st.rerun()
