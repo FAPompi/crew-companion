@@ -3746,6 +3746,36 @@ else:
 
     with page_dash:
         _cur_period = roster_period_of_roster(valid_dates_all) if valid_dates_all else None
+
+        # Resolve the period-navigation state HERE, before any panel reads it, so
+        # ‹ › ⟲ and the direct picker all take effect in the same run. The buttons
+        # stash a plain '_cal_nav_req' key and rerun; applying it here (before the
+        # selectbox further down is instantiated) avoids mutating a widget-backed
+        # key mid-run (StreamlitWidgetAlreadyInstantiatedError).
+        _cal_rows = calendar_rows(st.session_state['username'], parsed_rows)
+        _cal_dates = [r["DateObj"].date() for r in _cal_rows if r["DateObj"] is not None]
+        _period_starts = []
+        _t0 = None
+        if _cal_dates:
+            _pmin = roster_period_bounds(min(_cal_dates))[0]
+            _pmax = roster_period_bounds(max(_cal_dates))[0]
+            _p = _pmin
+            while _p <= _pmax:
+                _period_starts.append(_p)
+                _p += timedelta(days=ROSTER_PERIOD_DAYS)
+            _t0 = roster_period_bounds(datetime.now().date())[0]
+            if ('cal_period_sel' not in st.session_state
+                    or st.session_state['cal_period_sel'] not in _period_starts):
+                st.session_state['cal_period_sel'] = _t0 if _t0 in _period_starts else _period_starts[0]
+            _nav_req = st.session_state.pop('_cal_nav_req', None)
+            _idx0 = _period_starts.index(st.session_state['cal_period_sel'])
+            if _nav_req == 'prev' and _idx0 > 0:
+                st.session_state['cal_period_sel'] = _period_starts[_idx0 - 1]
+            elif _nav_req == 'next' and _idx0 < len(_period_starts) - 1:
+                st.session_state['cal_period_sel'] = _period_starts[_idx0 + 1]
+            elif _nav_req == 'cur' and _t0 in _period_starts:
+                st.session_state['cal_period_sel'] = _t0
+
         _view_sel = st.session_state.get('cal_period_sel')
         viewing_past = bool(_cur_period is not None and _view_sel is not None
                              and _view_sel != _cur_period)
@@ -4045,37 +4075,15 @@ else:
                         st.success(f"Period {_slabel} finalized — rolling checks now use the performed roster.")
                         st.rerun()
 
-            # 28-day roster period navigation (anchored 13 Jul 2026: 07 Sep–04 Oct is current).
-            # Calendar shows the current roster + finalized performed periods, so the
-            # nav range extends back over the archived periods too.
-            cal_rows = calendar_rows(st.session_state['username'], parsed_rows)
-            cal_dates = [r["DateObj"].date() for r in cal_rows if r["DateObj"] is not None]
-            if cal_dates:
-                pmin = roster_period_bounds(min(cal_dates))[0]
-                pmax = roster_period_bounds(max(cal_dates))[0]
-                periods, p = [], pmin
-                while p <= pmax:
-                    # (start, last_day) — inclusive 28-day span for the calendar
-                    periods.append((p, p + timedelta(days=ROSTER_PERIOD_DAYS - 1)))
-                    p += timedelta(days=ROSTER_PERIOD_DAYS)
-                starts = [x[0] for x in periods]
-                t0 = roster_period_bounds(datetime.now().date())[0]
-                if 'cal_period_sel' not in st.session_state or st.session_state['cal_period_sel'] not in starts:
-                    st.session_state['cal_period_sel'] = t0 if t0 in starts else starts[0]
-
-                # ‹ › ⟲ set a PLAIN state key and rerun; the request is applied
-                # here, BEFORE the selectbox is instantiated. Mutating a
-                # widget-backed key after its widget exists in the same run
-                # raises StreamlitWidgetAlreadyInstantiatedError, so the buttons
-                # must never touch 'cal_period_sel' directly.
-                _nav_req = st.session_state.pop('_cal_nav_req', None)
-                _idx0 = starts.index(st.session_state['cal_period_sel'])
-                if _nav_req == 'prev' and _idx0 > 0:
-                    st.session_state['cal_period_sel'] = starts[_idx0 - 1]
-                elif _nav_req == 'next' and _idx0 < len(starts) - 1:
-                    st.session_state['cal_period_sel'] = starts[_idx0 + 1]
-                elif _nav_req == 'cur' and t0 in starts:
-                    st.session_state['cal_period_sel'] = t0
+            # 28-day roster period navigation (anchored 13 Jul 2026: 07 Sep–04 Oct is
+            # current). State was resolved at the top of this tab into `_period_starts`,
+            # so panels and calendar always agree; here we only render the controls.
+            cal_rows = _cal_rows
+            cal_dates = _cal_dates
+            if cal_dates and _period_starts:
+                periods = [(p, p + timedelta(days=ROSTER_PERIOD_DAYS - 1)) for p in _period_starts]
+                starts = _period_starts
+                t0 = _t0
                 idx = starts.index(st.session_state['cal_period_sel'])
 
                 def _period_label(d):
