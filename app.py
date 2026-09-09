@@ -408,6 +408,19 @@ def delete_roster_history(username, period_start):
     conn.close()
 
 
+def purge_pre2026_history():
+    """Startup cleanup: the app only supports 2026-onwards rosters and salary
+    months, so any roster period or salary month saved from an older test
+    roster is removed automatically. Idempotent — runs on every launch, so a
+    stray pre-2026 paste can never persist across an app update/reload."""
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    c.execute("DELETE FROM roster_history WHERE period_start < '2026-01-01' OR period_start = ''")
+    c.execute("DELETE FROM salary_history WHERE month < '2026-01'")
+    conn.commit()
+    conn.close()
+
+
 def _rows_in_period(rows, start, days=ROSTER_PERIOD_DAYS):
     """Rows whose DateObj falls within [start, start + days)."""
     lo, hi = start, start + timedelta(days=days)
@@ -3575,6 +3588,7 @@ def compute_salary(rows, prof, acting=None):
 # --- 4. STREAMLIT CONFIG & UI ---
 st.set_page_config(page_title="Crew Companion", page_icon="✈️", layout="wide")
 init_db()
+purge_pre2026_history()
 
 st.markdown("""
     <style>
@@ -3954,38 +3968,76 @@ else:
                         avail.append(h["period_start"])
                 avail = sorted(set(avail), reverse=True)   # newest first
 
-                st.markdown("<div class='muted' style='margin-bottom:6px;'>Paste your <b>performed</b> rosters (portal's performed view) for <b>past</b> periods here — the 8.2.17(d) 3-period average and rolling checks use these, not the published plan. The current period is kept as the published roster above and is finalized automatically when it ends.</div>", unsafe_allow_html=True)
-                for s in avail:
+                st.markdown("<div class='muted' style='margin-bottom:6px;'>Paste your <b>performed</b> rosters (portal's performed view) for <b>past</b> periods here — the 8.2.17(d) 3-period average and rolling checks use these, not the published plan. The period is <b>auto-detected</b> from the dates you paste, so a stray pattern lands under its real period (marked ⚠️ partial) and can be selected &amp; deleted. The current period is kept as the published roster above and is finalized automatically when it ends. Periods before 2026 are auto-removed.</div>", unsafe_allow_html=True)
+
+                def _summarize(s):
+                    """One-line status for a period: finalized/partial + row count
+                    + the date span its saved text actually covers."""
                     h = next((x for x in hist_rows if x["period_start"] == s), None)
-                    last = s + timedelta(days=ROSTER_PERIOD_DAYS - 1)
-                    if h and h["finalized"]:
-                        status = "✅ finalized"
-                    elif h:
-                        status = "⏳ saved, not finalized"
+                    if not h or not (h["performed_text"] or "").strip():
+                        return "—"
+                    rows = parse_roster_text(h["performed_text"])
+                    dates = [r["DateObj"].date() for r in rows if r.get("DateObj")]
+                    days = len(set(dates))
+                    span = (f"{min(dates).strftime('%d %b')}–{max(dates).strftime('%d %b')}"
+                            if dates else "no dates")
+                    if 0 < days < 14:
+                        tag = "⚠️ partial"
                     else:
-                        status = "—"
+                        tag = "✅ finalized" if h["finalized"] else "⏳ not finalized"
+                    return f"{tag} · {len(rows)} row(s) · {span}"
+
+                for s in avail:
+                    last = s + timedelta(days=ROSTER_PERIOD_DAYS - 1)
                     st.markdown(
                         f"<div class='bidrow'><span>{s.strftime('%d %b')} – {last.strftime('%d %b %Y')}</span>"
-                        f"<span>{status}</span></div>", unsafe_allow_html=True)
+                        f"<span>{_summarize(s)}</span></div>", unsafe_allow_html=True)
 
                 sel_start = st.selectbox(
                     "Finalize which period?",
                     avail,
                     format_func=lambda s: (s.strftime('%d %b') + " – " +
-                                           (s + timedelta(days=ROSTER_PERIOD_DAYS - 1)).strftime('%d %b %Y')),
+                                           (s + timedelta(days=ROSTER_PERIOD_DAYS - 1)).strftime('%d %b %Y') +
+                                           "  ·  " + _summarize(s)),
                     key="history_sel_period")
                 tgt = next((h for h in hist_rows if h["period_start"] == sel_start), None)
                 man_in = st.text_area(
                     "Performed roster text (this period)",
                     value=(tgt["performed_text"] if tgt else ""), height=140,
                     key=f"hist_perf_{sel_start.strftime('%Y%m%d')}")
+
+                # Auto-detect which 28-day period the pasted text falls into.
+                _det_rows = parse_roster_text(man_in) if man_in.strip() else []
+                _det_dates = [r["DateObj"].date() for r in _det_rows if r.get("DateObj")]
+                _detected = roster_period_of_roster(_det_dates) if _det_dates else None
+                if _det_dates and _detected is not None:
+                    _det_label = (f"{_detected.strftime('%d %b')} – "
+                                  f"{(_detected + timedelta(days=ROSTER_PERIOD_DAYS - 1)).strftime('%d %b %Y')}")
+                    if _detected < datetime(2026, 1, 1).date():
+                        st.markdown(
+                            f"<div style='font-size:12px;background:#331414;border:1px solid #ff5252;color:#ff8a8a;padding:8px;border-radius:8px;margin-bottom:6px;'>"
+                            f"📍 Detected period <b>{_det_label}</b> is before 2026 — pre-2026 history is auto-removed on load, so it won't persist. The app only supports 2026 onward.</div>",
+                            unsafe_allow_html=True)
+                    elif _detected == sel_start:
+                        st.markdown(f"<div class='muted' style='font-size:12px;margin-bottom:6px;'>📍 Detected period: {_det_label} (matches the selection above).</div>", unsafe_allow_html=True)
+                    else:
+                        st.markdown(
+                            f"<div style='font-size:12px;background:#12301f;border:1px solid #4caf50;color:#a5d6a7;padding:8px;border-radius:8px;margin-bottom:6px;'>"
+                            f"📍 Detected period: <b>{_det_label}</b> — this will be saved under that period (auto-detected from the pasted dates), not the selection above.</div>",
+                            unsafe_allow_html=True)
+                elif man_in.strip():
+                    st.markdown("<div class='muted' style='font-size:12px;margin-bottom:6px;'>⚠️ No dates detected in the pasted text — saving under the selected period.</div>", unsafe_allow_html=True)
+
                 hb_save, hb_del = st.columns([1, 1])
                 if hb_save.button("💾 Save performed roster", use_container_width=True, key="history_manual_btn"):
                     if man_in.strip():
-                        save_roster_history(st.session_state['username'], sel_start,
-                                            published_text=(tgt["published_text"] if tgt else None),
+                        save_start = _detected if _detected is not None else sel_start
+                        save_roster_history(st.session_state['username'], save_start,
+                                            published_text=(tgt["published_text"] if tgt and tgt["period_start"] == save_start else None),
                                             performed_text=man_in, finalized=True)
-                        st.success(f"Period {sel_start.strftime('%d %b')} finalized — rolling checks now use the performed roster.")
+                        _slabel = (f"{save_start.strftime('%d %b')} – "
+                                   f"{(save_start + timedelta(days=ROSTER_PERIOD_DAYS - 1)).strftime('%d %b %Y')}")
+                        st.success(f"Period {_slabel} finalized — rolling checks now use the performed roster.")
                         st.rerun()
                     else:
                         st.warning("Paste the performed roster text first.")
@@ -4014,6 +4066,20 @@ else:
                 t0 = roster_period_bounds(datetime.now().date())[0]
                 if 'cal_period_sel' not in st.session_state or st.session_state['cal_period_sel'] not in starts:
                     st.session_state['cal_period_sel'] = t0 if t0 in starts else starts[0]
+
+                # ‹ › ⟲ set a PLAIN state key and rerun; the request is applied
+                # here, BEFORE the selectbox is instantiated. Mutating a
+                # widget-backed key after its widget exists in the same run
+                # raises StreamlitWidgetAlreadyInstantiatedError, so the buttons
+                # must never touch 'cal_period_sel' directly.
+                _nav_req = st.session_state.pop('_cal_nav_req', None)
+                _idx0 = starts.index(st.session_state['cal_period_sel'])
+                if _nav_req == 'prev' and _idx0 > 0:
+                    st.session_state['cal_period_sel'] = starts[_idx0 - 1]
+                elif _nav_req == 'next' and _idx0 < len(starts) - 1:
+                    st.session_state['cal_period_sel'] = starts[_idx0 + 1]
+                elif _nav_req == 'cur' and t0 in starts:
+                    st.session_state['cal_period_sel'] = t0
                 idx = starts.index(st.session_state['cal_period_sel'])
 
                 def _period_label(d):
@@ -4024,7 +4090,7 @@ else:
                 nav1, nav2, nav3, nav4 = st.columns([0.8, 4.4, 0.8, 1.4])
                 with nav1:
                     if st.button("‹", use_container_width=True, disabled=idx == 0):
-                        st.session_state['cal_period_sel'] = starts[idx - 1]
+                        st.session_state['_cal_nav_req'] = 'prev'
                         st.rerun()
                 with nav2:
                     # Direct period picker (doubles as the label) — no more
@@ -4033,12 +4099,12 @@ else:
                                  format_func=_period_label, label_visibility="collapsed")
                 with nav3:
                     if st.button("›", use_container_width=True, disabled=idx == len(periods) - 1):
-                        st.session_state['cal_period_sel'] = starts[idx + 1]
+                        st.session_state['_cal_nav_req'] = 'next'
                         st.rerun()
                 with nav4:
                     if t0 in starts and st.button("⟲ Current", use_container_width=True,
                                                   disabled=(st.session_state['cal_period_sel'] == t0)):
-                        st.session_state['cal_period_sel'] = t0
+                        st.session_state['_cal_nav_req'] = 'cur'
                         st.rerun()
                 sel_span = periods[starts.index(st.session_state['cal_period_sel'])]
             else:
