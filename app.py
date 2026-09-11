@@ -4,6 +4,7 @@ import hashlib
 import re
 import json
 import os
+from urllib.parse import quote
 import requests
 import pandas as pd
 try:
@@ -5202,6 +5203,67 @@ def _brand_logo(size=40):
         '</g></svg>'
     )
 
+# --- brand micro-assets: favicon (SVG data-URI) + animated tab icons ---
+def _svg_uri(svg):
+    return "data:image/svg+xml," + quote(svg)
+
+_FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+    '<rect x="2" y="2" width="60" height="60" rx="14" fill="#0B1F33"/>'
+    '<path d="M12,9.6 L12.968,13.032 L16.4,14 L12.968,14.968 L12,18.4 L11.032,14.968 L7.6,14 L11.032,13.032 Z" fill="#F0A93B"/>'
+    '<circle cx="18" cy="50" r="2.2" fill="#F0A93B"/>'
+    '<path d="M18,50 C14,42 26,38 42,30" stroke="#F0A93B" stroke-width="2" fill="none" '
+    'stroke-linecap="round" stroke-dasharray="0.1 5" opacity="0.6"/>'
+    '<g transform="translate(42,30) rotate(-30) scale(1.15)">'
+    '<path d="M14,0 L-9,9.5 L-12.5,0 Z" fill="#FFFFFF"/>'
+    '<path d="M14,0 L-12.5,0 L-9,-9.5 Z" fill="#0FB5AE"/>'
+    '<path d="M14,0 L-4.2,-2.8 L-4.2,2.8 Z" fill="#35C7C0"/>'
+    '</g></svg>'
+)
+
+# Animated tab icons (SMIL — animate in Chrome/Firefox; static in Safari) in the
+# brand palette. Order matches the 4 main tabs.
+_TAB_ICON_SVGS = [
+    # 0 · Dashboard — calendar grid with a pulsing gold cell
+    ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+     '<rect x="2.5" y="3" width="19" height="18" rx="3" fill="none" stroke="#0FB5AE" stroke-width="1.7"/>'
+     '<path d="M2.5 8.2h19" stroke="#0FB5AE" stroke-width="1.3" opacity="0.55"/>'
+     '<rect x="6" y="11" width="3.3" height="3.3" rx="0.8" fill="#0FB5AE"/>'
+     '<rect x="12.2" y="11" width="3.3" height="3.3" rx="0.8" fill="#0A7E7A"/>'
+     '<rect x="6" y="16.7" width="3.3" height="3.3" rx="0.8" fill="#0A7E7A"/>'
+     '<rect x="12.2" y="16.7" width="3.3" height="3.3" rx="0.8" fill="#F0A93B">'
+     '<animate attributeName="opacity" values="1;0.4;1" dur="2.6s" repeatCount="indefinite"/>'
+     '</rect></svg>'),
+    # 1 · Salary Calculator — coin with a twinkling gold star
+    ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+     '<circle cx="12" cy="12" r="8.6" fill="none" stroke="#0FB5AE" stroke-width="1.7"/>'
+     '<circle cx="12" cy="12" r="6" fill="#0A7E7A" opacity="0.35"/>'
+     '<path d="M12 5.6 L12.9 9.4 L17 9.4 L13.4 11.9 L14.8 15.6 L12 13.2 L9.2 15.6 L10.6 11.9 L7 9.4 L11.1 9.4 Z" fill="#F0A93B">'
+     '<animate attributeName="opacity" values="1;0.45;1" dur="2.2s" repeatCount="indefinite"/>'
+     '</path></svg>'),
+    # 2 · Salary Analytics — bars that gently grow/shrink
+    ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+     '<path d="M3.5 20.5h17" stroke="#0FB5AE" stroke-width="1.5" stroke-linecap="round"/>'
+     '<rect x="5.2" y="11" width="3.4" height="8" rx="1" fill="#0FB5AE">'
+     '<animate attributeName="height" values="8;11;8" dur="3.2s" repeatCount="indefinite"/>'
+     '<animate attributeName="y" values="11;8;11" dur="3.2s" repeatCount="indefinite"/></rect>'
+     '<rect x="10.4" y="6" width="3.4" height="12" rx="1" fill="#0A7E7A">'
+     '<animate attributeName="height" values="12;9.5;12" dur="3.2s" begin="0.4s" repeatCount="indefinite"/>'
+     '<animate attributeName="y" values="6;8.5;6" dur="3.2s" begin="0.4s" repeatCount="indefinite"/></rect>'
+     '<rect x="15.6" y="13.5" width="3.4" height="5" rx="1" fill="#F0A93B">'
+     '<animate attributeName="height" values="5;7.5;5" dur="3.2s" begin="0.8s" repeatCount="indefinite"/>'
+     '<animate attributeName="y" values="13.5;11;13.5" dur="3.2s" begin="0.8s" repeatCount="indefinite"/></rect>'
+     '</svg>'),
+    # 3 · FDP Calculator — clock with rotating hands
+    ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+     '<circle cx="12" cy="12" r="8.6" fill="none" stroke="#0FB5AE" stroke-width="1.7"/>'
+     '<g><animateTransform attributeName="transform" type="rotate" from="0 12 12" to="360 12 12" dur="14s" repeatCount="indefinite"/>'
+     '<path d="M12 12V7" stroke="#F0A93B" stroke-width="1.9" stroke-linecap="round"/>'
+     '<path d="M12 12H15.8" stroke="#0A7E7A" stroke-width="1.5" stroke-linecap="round" opacity="0.75"/>'
+     '</g><circle cx="12" cy="12" r="1.1" fill="#F0A93B"/></svg>'),
+]
+_TAB_ICON_URIS = [_svg_uri(s) for s in _TAB_ICON_SVGS]
+
 try:
     _APP_DIR = os.path.dirname(os.path.abspath(__file__))
 except NameError:  # exec'd without __file__ (ad-hoc test harnesses)
@@ -5256,6 +5318,30 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
+# Favicon (SVG data-URI — overrides any cached tab icon) + animated brand tab icons.
+st.markdown(
+    f'<link rel="icon" type="image/svg+xml" href="{_svg_uri(_FAVICON_SVG)}">',
+    unsafe_allow_html=True,
+)
+st.markdown(
+    f"""
+<style>
+/* animated brand icons on the 4 main tabs (only the 4-tab group, never the 2-tab login group) */
+[data-testid="stTabs"] [data-testid="stTab"] {{
+    background-repeat: no-repeat !important;
+    background-position: 10px center !important;
+    background-size: 16px 16px !important;
+    padding-left: 30px !important;
+}}
+[data-testid="stTabs"]:has([data-testid="stTab"][id="3"]) [data-testid="stTab"][id="0"] {{ background-image: url("{_TAB_ICON_URIS[0]}") !important; }}
+[data-testid="stTabs"]:has([data-testid="stTab"][id="3"]) [data-testid="stTab"][id="1"] {{ background-image: url("{_TAB_ICON_URIS[1]}") !important; }}
+[data-testid="stTabs"]:has([data-testid="stTab"][id="3"]) [data-testid="stTab"][id="2"] {{ background-image: url("{_TAB_ICON_URIS[2]}") !important; }}
+[data-testid="stTabs"]:has([data-testid="stTab"][id="3"]) [data-testid="stTab"][id="3"] {{ background-image: url("{_TAB_ICON_URIS[3]}") !important; }}
+</style>
+""",
+    unsafe_allow_html=True,
+)
+
 if 'logged_in' not in st.session_state:
     st.session_state['logged_in'] = False
     st.session_state['username'] = ''
@@ -5270,7 +5356,7 @@ if not st.session_state['logged_in']:
     with col2:
         st.markdown(f"<div style='text-align:center;margin-bottom:2px;'>{_brand_logo(88)}</div>", unsafe_allow_html=True)
         st.markdown("<div class='brand-word' style='text-align:center;font-size:34px;'>CHOCKS ON</div>", unsafe_allow_html=True)
-        st.markdown("<div class='brand-tag' style='text-align:center;font-size:14px;margin-top:2px;'>Chocks on. Mind off.</div>", unsafe_allow_html=True)
+        st.markdown("<div class='brand-tag' style='text-align:center;font-size:14px;margin-top:2px;'>Mind off.</div>", unsafe_allow_html=True)
         st.markdown("<div style='text-align:center;color:#7e8ba0;font-size:12px;margin:6px 0 16px;'>Your roster, salary &amp; rest — sorted before you land.</div>", unsafe_allow_html=True)
 
         tab_login, tab_reg = st.tabs(["Log In", "Register Account"])
@@ -5361,7 +5447,7 @@ else:
             f"{_brand_logo(42)}"
             f"<div style='margin-left:13px;'>"
             f"<div class='brand-word' style='font-size:20px;'>CHOCKS ON</div>"
-            f"<div class='brand-tag'>Chocks on. Mind off. &nbsp;·&nbsp; {month_label}</div>"
+            f"<div class='brand-tag'>Mind off. &nbsp;·&nbsp; {month_label}</div>"
             f"</div></div>"
             f"<div style='display:flex;align-items:center;'>"
             f"<span style='margin-right:18px;font-size:16px;'>{bell}</span>"
@@ -5373,7 +5459,7 @@ else:
             st.session_state['logged_in'] = False
             st.rerun()
 
-    page_dash, page_salary, page_analytics, page_fdp = st.tabs(["📋 Dashboard", "💰 Salary Calculator", "📊 Salary Analytics", "⏱ FDP Calculator"])
+    page_dash, page_salary, page_analytics, page_fdp = st.tabs(["Dashboard", "Salary Calculator", "Salary Analytics", "FDP Calculator"])
 
     with page_dash:
         _cur_period = roster_period_of_roster(valid_dates_all) if valid_dates_all else None
