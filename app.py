@@ -3469,13 +3469,11 @@ def flight_intel_card(du, rows):
     return f"<div class='card' style='border-color:#00bcd4;'><h5>{head}</h5>{sub}{rows_html}{fdp_html}</div>"
 
 
-def build_calendar_html(rows, span=None):
-    valid = [r for r in rows if r["DateObj"] is not None]
-    if not valid:
-        return "<div style='color:#7e8ba0;font-size:14px;'>No dated duties parsed.</div>"
-    # Non-flight duties map onto every day they cover (multi-day HTL / SB / OFF);
-    # flights are grouped into DUTIES so a turnaround shows as ONE chip with
-    # both legs (e.g. 'UL404/5') instead of only the return leg.
+def _day_chips_map(rows):
+    """date → [chip HTML] for every calendar day a duty touches, plus (rmin, rmax).
+    Ground blocks map onto every day they cover (multi-day HTL / SB / OFF);
+    flights are grouped into DUTIES so a turnaround shows as ONE chip with
+    both legs (e.g. 'UL404/5') instead of only the return leg."""
     mand_map = mandatory_off_days(rows)
     rmap = {}
     for r in rows:
@@ -3564,8 +3562,18 @@ def build_calendar_html(rows, span=None):
                 chip = _duty_cont_chip(grp)
             rmap.setdefault(d, []).append(chip)
             d += timedelta(days=1)
+    valid = [r for r in rows if r["DateObj"] is not None]
     rmin = min(r["DateObj"] for r in valid).date()
     rmax = max((r["EndDateObj"] or r["DateObj"]) for r in valid).date()
+    return rmap, rmin, rmax
+
+
+def build_calendar_html(rows, span=None):
+    valid = [r for r in rows if r["DateObj"] is not None]
+    if not valid:
+        return "<div style='color:#7e8ba0;font-size:14px;'>No dated duties parsed.</div>"
+    # Chips per day come from _day_chips_map (shared with the edit-mode grid).
+    rmap, rmin, rmax = _day_chips_map(rows)
     if span:
         dmin, dmax = span
     else:
@@ -3603,6 +3611,563 @@ def build_calendar_html(rows, span=None):
         "<span class='chip chip-tof' style='display:inline-block;margin:0 4px 0 0;'>🕓 TOF</span>"
         "= time off (no check-in/check-out allowed in the window)</div>")
     return "".join(cells) + legend
+
+
+# --- CALENDAR EDITING (current roster only) ---
+# The live roster is stored as text; edits operate on parsed rows, which are
+# re-serialized (round-trips losslessly — see _rows_to_roster_text) and saved
+# back. Editing is gated to the CURRENT 28-day period only.
+
+_ADD_OFF_CODES = ["OFF", "ROF", "HOT", "OVO"]
+_ADD_LEAVE_CODES = ["ALV", "RLV", "ALP", "CLV", "SPL", "MTL", "S/L", "FSL", "LMS"]
+_ADD_TOF_CODES = ["TOF", "HTO"]
+_ADD_DUTY_CODES = ["GND", "MTG", "FAU", "OFG", "DLV", "ADM", "MED", "CRM", "SEP", "SEC", "DGR", "CBT"]
+_ADD_SBY_CODES = ["SB1", "SB2", "SB3", "SB4", "ASB", "LSB", "SSY"]
+
+
+def _parse_hm(s):
+    """'HH:MM' -> datetime.time; blank/invalid -> None."""
+    if not isinstance(s, str):
+        return None
+    m = re.match(r'^\s*(\d{1,2}):(\d{2})\s*$', s)
+    if not m:
+        return None
+    h, mi = int(m.group(1)), int(m.group(2))
+    if h > 23 or mi > 59:
+        return None
+    return dtime(h, mi)
+
+
+def _at(day, t):
+    """Combine a date with a time (or None)."""
+    if t is None:
+        return None
+    return datetime.combine(day, t)
+
+
+def _prefill(dt_):
+    """datetime -> 'HH:MM' for a text field, else ''."""
+    return dt_.strftime("%H:%M") if isinstance(dt_, datetime) else ""
+
+
+def duty_rows_on_day(rows, day):
+    """Indices of rows anchored to `day`: flights on their departure date, ground
+    blocks on every date they cover (start..end)."""
+    out = []
+    for i, r in enumerate(rows):
+        d0 = r.get("DateObj")
+        if not isinstance(d0, datetime):
+            continue
+        d1 = r.get("EndDateObj") if isinstance(r.get("EndDateObj"), datetime) else d0
+        if d0.date() <= day <= d1.date():
+            out.append(i)
+    return out
+
+
+def build_duty_row(day, rtype, code, ci=None, dep=None, arr=None, co=None,
+                   origin="CMB", dest="CMB", ac="-", end_day=None):
+    """Construct a parsed-row dict for a new/edited duty anchored on `day`.
+    Times are datetime.time objects (or None); `end_day` > day spans a ground
+    block across multiple days. Overnight rollover follows the parser's rules."""
+    ci_dt = _at(day, ci)
+    dep_dt = _at(day, dep)
+    arr_dt = _at(day, arr)
+    co_dt = _at(day, co)
+
+    if rtype in ("FLIGHT", "STANDBY", "DUTY"):
+        if dep_dt and arr_dt and arr_dt <= dep_dt:
+            arr_dt += timedelta(days=1)      # overnight arrival
+        if arr_dt and co_dt and co_dt <= arr_dt:
+            co_dt += timedelta(days=1)
+        if ci_dt and dep_dt and ci_dt > dep_dt:
+            ci_dt -= timedelta(days=1)       # check-in the evening before
+
+    if rtype == "FLIGHT":
+        dep_dt = dep_dt or datetime.combine(day, dtime(7, 0))
+        arr_dt = arr_dt or (dep_dt + timedelta(hours=2))
+        anchor = dep_dt
+        route = f"{origin} ➔ {dest}"
+        end_dt_obj = None
+    elif rtype == "LAYOVER":
+        dep_dt = dep_dt or datetime.combine(day, dtime(0, 0))
+        if end_day and end_day > day:
+            arr_dt = datetime.combine(end_day, dtime(23, 59))
+        arr_dt = arr_dt or dep_dt
+        anchor = dep_dt
+        route = origin
+        ci_dt, co_dt = dep_dt, arr_dt
+        end_dt_obj = (datetime.combine(arr_dt.date(), dtime.min)
+                      if arr_dt.date() > dep_dt.date() else None)
+    elif rtype in ("STANDBY", "DUTY"):
+        dep_dt = dep_dt or datetime.combine(day, dtime(6, 0))
+        ci_dt = ci_dt or dep_dt
+        if end_day and end_day > day:
+            arr_dt = co_dt = datetime.combine(end_day, dtime(23, 59))
+        co_dt = co_dt or arr_dt or (dep_dt + timedelta(hours=12))
+        arr_dt = arr_dt or co_dt
+        anchor = dep_dt
+        route = "-"
+        end_dt_obj = (datetime.combine(co_dt.date(), dtime.min)
+                      if co_dt.date() > dep_dt.date() else None)
+    else:  # DAY OFF / LEAVE / TIMEOFF
+        dep_dt = dep_dt or datetime.combine(day, dtime(0, 0))
+        if end_day and end_day > day:
+            arr_dt = datetime.combine(end_day, dtime(23, 59))
+        arr_dt = arr_dt or datetime.combine(day, dtime(23, 59))
+        ci_dt = co_dt = None
+        anchor = dep_dt
+        route = "-"
+        end_dt_obj = (datetime.combine(arr_dt.date(), dtime.min)
+                      if arr_dt.date() > dep_dt.date() else None)
+
+    def hm(dt_):
+        return dt_.strftime("%H:%M") if dt_ else "-"
+
+    code_clean = re.sub(r"\s+", "", (code or "")).upper()
+    if rtype == "FLIGHT":
+        if not code_clean.startswith("UL"):
+            code_clean = "UL" + code_clean
+        fcode = f"UL {code_clean[2:]}"
+    else:
+        fcode = rtype
+
+    return {
+        "Date": anchor.strftime("%d%b%y").upper(),
+        "DateObj": datetime.combine(anchor.date(), dtime.min),
+        "EndDateObj": end_dt_obj,
+        "Type": rtype,
+        "Code": code_clean,
+        "Flight / Code": fcode,
+        "Check-In": hm(ci_dt) if rtype in ("FLIGHT", "STANDBY", "DUTY") else "-",
+        "Departure": hm(dep_dt),
+        "Route": route,
+        "Arrival": hm(arr_dt),
+        "Checkout": hm(co_dt) if rtype in ("FLIGHT", "STANDBY", "DUTY") else "-",
+        "Aircraft": ac or "-",
+        "CIdt": ci_dt, "DEPdt": dep_dt, "ARRdt": arr_dt, "COdt": co_dt,
+        "CIdt_u": None, "DEPdt_u": None, "ARRdt_u": None, "COdt_u": None,
+    }
+
+
+def _sort_rows(rows):
+    """Chronological order so the re-serialized roster stays consistent."""
+    def key(r):
+        t = r.get("DEPdt") or r.get("CIdt") or r.get("DateObj")
+        if isinstance(t, datetime):
+            return t
+        return datetime(2099, 1, 1)
+    return sorted(rows, key=key)
+
+
+def save_rows_as_roster(username, rows):
+    """Serialize parsed rows back to roster text, persist, return the text."""
+    text = _rows_to_roster_text(_sort_rows(rows))
+    save_roster_to_db(username, text)
+    return text
+
+
+def _row_summary(r):
+    """One-line human summary of a duty row for the editor list."""
+    t = r["Type"]
+    code = r.get("Code") or ""
+    if t == "FLIGHT":
+        o, d = _route_od(r.get("Route"))
+        s = f"✈ {code} {o}➔{d}"
+        dep, arr = r.get("DEPdt"), r.get("ARRdt")
+        if isinstance(dep, datetime):
+            s += f" · dep {dep:%H:%M}"
+        if isinstance(arr, datetime):
+            s += f" – arr {arr:%H:%M}"
+        return s
+    if t == "STANDBY":
+        s0 = r.get("CIdt") or r.get("DEPdt")
+        s1 = r.get("COdt") or r.get("ARRdt")
+        s = f"⏱ {code}"
+        if isinstance(s0, datetime) and isinstance(s1, datetime):
+            s += f" · {s0:%H:%M}–{s1:%H:%M}"
+        return s
+    if t == "LAYOVER":
+        return f"🏨 {code} {r.get('Route') or ''}".strip()
+    if t == "DAY OFF":
+        return f"🟢 {code}"
+    if t == "LEAVE":
+        return f"🌴 {code}"
+    if t == "TIMEOFF":
+        s0, s1 = r.get("DEPdt"), r.get("ARRdt")
+        s = f"🕓 {code}"
+        if isinstance(s0, datetime) and isinstance(s1, datetime):
+            s += f" · {s0:%H:%M}–{s1:%H:%M}"
+        return s
+    if t == "DUTY":
+        return f"📚 {code}"
+    return f"{t} {code}"
+
+
+def _day_summary_labels(rows, day):
+    """Compact one-line labels for the edit-mode calendar cell on `day`."""
+    labels = []
+    for r in rows:
+        if r["Type"] == "FLIGHT" or not isinstance(r.get("DateObj"), datetime):
+            continue
+        d0 = r["DateObj"].date()
+        d1 = (r["EndDateObj"].date() if isinstance(r.get("EndDateObj"), datetime) else d0)
+        if not (d0 <= day <= d1):
+            continue
+        code = r.get("Code") or ""
+        t = r["Type"]
+        if t == "DAY OFF":
+            labels.append("🟢 " + code)
+        elif t == "LAYOVER":
+            labels.append("🏨 " + (r["Route"] if r["Route"] != "-" else "Layover"))
+        elif t == "STANDBY":
+            labels.append("⏱ " + code)
+        elif t == "LEAVE":
+            labels.append("🌴 " + code)
+        elif t == "TIMEOFF":
+            labels.append("🕓 " + code)
+        elif t == "DUTY":
+            labels.append("📚 " + code)
+    for grp in _calendar_duties(rows):
+        first, last = grp[0], grp[-1]
+        dep_dt = first.get("dep")
+        if not isinstance(dep_dt, datetime):
+            continue
+        start = first.get("ci") or dep_dt
+        end = last.get("co") or last.get("arr")
+        if not isinstance(end, datetime):
+            end = start
+        if not (start.date() <= day <= end.date()):
+            continue
+        nums = "/".join(dict.fromkeys(s["flight"].replace(" ", "") for s in grp))
+        if day == dep_dt.date():
+            labels.append("✈ " + nums)
+        elif day < dep_dt.date():
+            labels.append("⟳ " + nums + " starts")
+        else:
+            labels.append("🛬 " + nums + " lands")
+    return labels
+
+
+def _cedit_open(day):
+    """on_click: open the per-day editor."""
+    st.session_state['caledit_day'] = day
+    st.session_state['caledit_target'] = None
+
+
+def _commit_roster_change(new_rows):
+    """Persist edited rows back to the current roster and reload."""
+    st.session_state['current_roster'] = save_rows_as_roster(st.session_state['username'], new_rows)
+    st.session_state.pop('caledit_target', None)
+    st.success("Current roster updated — dashboard & intel recalculated.")
+    st.rerun()
+
+
+def _time_field(label, key, default=""):
+    return st.text_input(label, value=default, key=key, placeholder="HH:MM or blank")
+
+
+def _render_duty_edit_form(rows, idx):
+    """Form to edit an existing duty row (type-preserving)."""
+    r = rows[idx]
+    t = r["Type"]
+    anchor = r["DateObj"].date() if isinstance(r.get("DateObj"), datetime) else datetime.now().date()
+    with st.form(key="cedit_edit_form"):
+        if t == "FLIGHT":
+            fl = st.text_input("Flight number", value=r.get("Code") or "UL", key="cedit_e_flt").replace(" ", "")
+            o, d = _route_od(r.get("Route"))
+            c1, c2 = st.columns(2)
+            with c1:
+                origin = st.text_input("From (IATA)", value=o or "CMB", key="cedit_e_o").strip().upper()
+            with c2:
+                dest = st.text_input("To (IATA)", value=d or "", key="cedit_e_d").strip().upper()
+            c3, c4, c5, c6 = st.columns(4)
+            with c3:
+                ci = _time_field("Check-in", "cedit_e_ci", _prefill(r.get("CIdt")))
+            with c4:
+                dep = _time_field("Departure", "cedit_e_dep", _prefill(r.get("DEPdt")))
+            with c5:
+                arr = _time_field("Arrival", "cedit_e_arr", _prefill(r.get("ARRdt")))
+            with c6:
+                co = _time_field("Check-out", "cedit_e_co", _prefill(r.get("COdt")))
+            ac = st.text_input("Aircraft (optional)", value=r.get("Aircraft") or "", key="cedit_e_ac").strip().upper()
+            ok, msg = True, ""
+            if not re.fullmatch(r'UL\d{1,4}', fl.upper()):
+                ok, msg = False, "Flight number must look like UL404."
+            if not re.fullmatch(r'[A-Z]{3}', origin) or not re.fullmatch(r'[A-Z]{3}', dest):
+                ok, msg = False, "From/To must be 3-letter IATA codes."
+            if _parse_hm(dep) is None or _parse_hm(arr) is None:
+                ok, msg = False, "Departure & Arrival need HH:MM times."
+            if st.form_submit_button("💾 Save changes", key="cedit_edit_submit"):
+                if ok:
+                    new_rows = list(rows)
+                    new_rows[idx] = build_duty_row(anchor, "FLIGHT", fl.upper(), ci=_parse_hm(ci), dep=_parse_hm(dep),
+                                                   arr=_parse_hm(arr), co=_parse_hm(co), origin=origin, dest=dest, ac=ac or "-")
+                    _commit_roster_change(_sort_rows(new_rows))
+                else:
+                    st.error(msg)
+        elif t == "STANDBY":
+            cur = r.get("Code") or "SB2"
+            code = st.selectbox("Standby code", _ADD_SBY_CODES,
+                                index=(_ADD_SBY_CODES.index(cur) if cur in _ADD_SBY_CODES else 0), key="cedit_e_sb")
+            c1, c2 = st.columns(2)
+            with c1:
+                start = _time_field("Start", "cedit_e_s0", _prefill(r.get("CIdt") or r.get("DEPdt")))
+            with c2:
+                end = _time_field("End", "cedit_e_s1", _prefill(r.get("COdt") or r.get("ARRdt")))
+            if st.form_submit_button("💾 Save changes", key="cedit_edit_submit"):
+                if _parse_hm(start) is None or _parse_hm(end) is None:
+                    st.error("Start & End need HH:MM times.")
+                else:
+                    new_rows = list(rows)
+                    new_rows[idx] = build_duty_row(anchor, "STANDBY", code, ci=_parse_hm(start), dep=_parse_hm(start),
+                                                   arr=_parse_hm(end), co=_parse_hm(end))
+                    _commit_roster_change(_sort_rows(new_rows))
+        elif t in ("DAY OFF", "LEAVE", "TIMEOFF", "DUTY", "LAYOVER"):
+            code = r.get("Code") or ""
+            pool = {"DAY OFF": _ADD_OFF_CODES, "LEAVE": _ADD_LEAVE_CODES, "TIMEOFF": _ADD_TOF_CODES,
+                    "DUTY": _ADD_DUTY_CODES, "LAYOVER": ["HTL"]}[t]
+            if code not in pool:
+                pool = [code] + pool
+            ccode = st.selectbox("Code", pool, index=pool.index(code), key="cedit_e_code")
+            d1 = r.get("EndDateObj") if isinstance(r.get("EndDateObj"), datetime) else r.get("DateObj")
+            if t == "LAYOVER":
+                stn = st.text_input("Station (IATA)", value=(r.get("Route") or ""), key="cedit_e_stn").strip().upper()
+                end = st.date_input("Until", value=(d1.date() if isinstance(d1, datetime) else anchor), key="cedit_e_end")
+                if st.form_submit_button("💾 Save changes", key="cedit_edit_submit"):
+                    if not re.fullmatch(r'[A-Z]{3}', stn):
+                        st.error("Station must be a 3-letter IATA code.")
+                    else:
+                        new_rows = list(rows)
+                        new_rows[idx] = build_duty_row(anchor, "LAYOVER", "HTL", origin=stn,
+                                                       end_day=(end if end > anchor else None))
+                        _commit_roster_change(_sort_rows(new_rows))
+            elif t == "TIMEOFF":
+                c1, c2 = st.columns(2)
+                with c1:
+                    s0 = _time_field("From", "cedit_e_t0", _prefill(r.get("DEPdt")))
+                with c2:
+                    s1 = _time_field("To", "cedit_e_t1", _prefill(r.get("ARRdt")))
+                if st.form_submit_button("💾 Save changes", key="cedit_edit_submit"):
+                    if _parse_hm(s0) is None or _parse_hm(s1) is None:
+                        st.error("From & To need HH:MM times.")
+                    else:
+                        new_rows = list(rows)
+                        new_rows[idx] = build_duty_row(anchor, "TIMEOFF", ccode, dep=_parse_hm(s0), arr=_parse_hm(s1))
+                        _commit_roster_change(_sort_rows(new_rows))
+            elif t == "DUTY":
+                c1, c2 = st.columns(2)
+                with c1:
+                    s0 = _time_field("Start", "cedit_e_d0", _prefill(r.get("CIdt") or r.get("DEPdt")))
+                with c2:
+                    s1 = _time_field("End", "cedit_e_d1", _prefill(r.get("COdt") or r.get("ARRdt")))
+                if st.form_submit_button("💾 Save changes", key="cedit_edit_submit"):
+                    if _parse_hm(s0) is None or _parse_hm(s1) is None:
+                        st.error("Start & End need HH:MM times.")
+                    else:
+                        new_rows = list(rows)
+                        new_rows[idx] = build_duty_row(anchor, "DUTY", ccode, ci=_parse_hm(s0), dep=_parse_hm(s0),
+                                                       arr=_parse_hm(s1), co=_parse_hm(s1))
+                        _commit_roster_change(_sort_rows(new_rows))
+            else:  # DAY OFF / LEAVE — full days
+                end = st.date_input("Until", value=(d1.date() if isinstance(d1, datetime) else anchor), key="cedit_e_end")
+                if st.form_submit_button("💾 Save changes", key="cedit_edit_submit"):
+                    new_rows = list(rows)
+                    new_rows[idx] = build_duty_row(anchor, t, ccode, end_day=(end if end > anchor else None))
+                    _commit_roster_change(_sort_rows(new_rows))
+        else:
+            st.markdown("This duty type can't be edited here — use the paste box.")
+
+
+def _render_duty_add_form(rows, day):
+    """Form to add a new duty on `day`."""
+    with st.form(key="cedit_add_form"):
+        ftype = st.selectbox("Add duty type", ["Flight", "Standby", "Day off", "Leave / sick",
+                                               "Time off", "Training / ground duty", "Layover"],
+                             key="cedit_add_type")
+        if ftype == "Flight":
+            fl = st.text_input("Flight number", value="UL", key="cedit_a_flt").replace(" ", "")
+            c1, c2 = st.columns(2)
+            with c1:
+                origin = st.text_input("From (IATA)", value="CMB", key="cedit_a_o").strip().upper()
+            with c2:
+                dest = st.text_input("To (IATA)", value="", key="cedit_a_d").strip().upper()
+            c3, c4, c5, c6 = st.columns(4)
+            with c3:
+                ci = _time_field("Check-in", "cedit_a_ci")
+            with c4:
+                dep = _time_field("Departure", "cedit_a_dep", "07:00")
+            with c5:
+                arr = _time_field("Arrival", "cedit_a_arr", "09:00")
+            with c6:
+                co = _time_field("Check-out", "cedit_a_co")
+            ac = st.text_input("Aircraft (optional)", value="", key="cedit_a_ac").strip().upper()
+            ok, msg = True, ""
+            if not re.fullmatch(r'UL\d{1,4}', fl.upper()):
+                ok, msg = False, "Flight number must look like UL404."
+            if not re.fullmatch(r'[A-Z]{3}', origin) or not re.fullmatch(r'[A-Z]{3}', dest):
+                ok, msg = False, "From/To must be 3-letter IATA codes."
+            if _parse_hm(dep) is None or _parse_hm(arr) is None:
+                ok, msg = False, "Departure & Arrival need HH:MM times."
+            if st.form_submit_button(f"➕ Add flight to {day.strftime('%d %b')}", key="cedit_add_submit"):
+                if ok:
+                    row = build_duty_row(day, "FLIGHT", fl.upper(), ci=_parse_hm(ci), dep=_parse_hm(dep),
+                                         arr=_parse_hm(arr), co=_parse_hm(co), origin=origin, dest=dest, ac=ac or "-")
+                    _commit_roster_change(_sort_rows(list(rows) + [row]))
+                else:
+                    st.error(msg)
+        elif ftype == "Standby":
+            code = st.selectbox("Standby code", _ADD_SBY_CODES, key="cedit_sb_code")
+            c1, c2 = st.columns(2)
+            with c1:
+                s0 = _time_field("Start", "cedit_sb_s0", "06:00")
+            with c2:
+                s1 = _time_field("End", "cedit_sb_s1", "18:00")
+            if st.form_submit_button(f"➕ Add standby to {day.strftime('%d %b')}", key="cedit_add_submit"):
+                if _parse_hm(s0) is None or _parse_hm(s1) is None:
+                    st.error("Start & End need HH:MM times.")
+                else:
+                    row = build_duty_row(day, "STANDBY", code, ci=_parse_hm(s0), dep=_parse_hm(s0),
+                                         arr=_parse_hm(s1), co=_parse_hm(s1))
+                    _commit_roster_change(_sort_rows(list(rows) + [row]))
+        elif ftype == "Day off":
+            code = st.selectbox("Off code", _ADD_OFF_CODES, key="cedit_off_code")
+            end = st.date_input("Until (leave = today for a single day)", value=day, key="cedit_off_end")
+            if st.form_submit_button(f"➕ Add day(s) off from {day.strftime('%d %b')}", key="cedit_add_submit"):
+                row = build_duty_row(day, "DAY OFF", code, end_day=(end if end > day else None))
+                _commit_roster_change(_sort_rows(list(rows) + [row]))
+        elif ftype == "Leave / sick":
+            code = st.selectbox("Leave code", _ADD_LEAVE_CODES, key="cedit_lv_code")
+            end = st.date_input("Until (leave = today for a single day)", value=day, key="cedit_lv_end")
+            if st.form_submit_button(f"➕ Add leave from {day.strftime('%d %b')}", key="cedit_add_submit"):
+                row = build_duty_row(day, "LEAVE", code, end_day=(end if end > day else None))
+                _commit_roster_change(_sort_rows(list(rows) + [row]))
+        elif ftype == "Time off":
+            code = st.selectbox("Time-off code", _ADD_TOF_CODES, key="cedit_tof_code")
+            c1, c2 = st.columns(2)
+            with c1:
+                s0 = _time_field("From", "cedit_tof_s0", "09:00")
+            with c2:
+                s1 = _time_field("To", "cedit_tof_s1", "17:00")
+            if st.form_submit_button(f"➕ Add time-off to {day.strftime('%d %b')}", key="cedit_add_submit"):
+                if _parse_hm(s0) is None or _parse_hm(s1) is None:
+                    st.error("From & To need HH:MM times.")
+                else:
+                    row = build_duty_row(day, "TIMEOFF", code, dep=_parse_hm(s0), arr=_parse_hm(s1))
+                    _commit_roster_change(_sort_rows(list(rows) + [row]))
+        elif ftype == "Training / ground duty":
+            code = st.selectbox("Duty code", _ADD_DUTY_CODES, key="cedit_du_code")
+            c1, c2 = st.columns(2)
+            with c1:
+                s0 = _time_field("Start", "cedit_du_s0", "09:00")
+            with c2:
+                s1 = _time_field("End", "cedit_du_s1", "17:00")
+            if st.form_submit_button(f"➕ Add duty to {day.strftime('%d %b')}", key="cedit_add_submit"):
+                if _parse_hm(s0) is None or _parse_hm(s1) is None:
+                    st.error("Start & End need HH:MM times.")
+                else:
+                    row = build_duty_row(day, "DUTY", code, ci=_parse_hm(s0), dep=_parse_hm(s0),
+                                         arr=_parse_hm(s1), co=_parse_hm(s1))
+                    _commit_roster_change(_sort_rows(list(rows) + [row]))
+        else:  # Layover
+            stn = st.text_input("Station (IATA)", value="", key="cedit_lay_stn").strip().upper()
+            end = st.date_input("Until (leave = today for a single day)", value=day, key="cedit_lay_end")
+            if st.form_submit_button(f"➕ Add layover from {day.strftime('%d %b')}", key="cedit_add_submit"):
+                if not re.fullmatch(r'[A-Z]{3}', stn):
+                    st.error("Station must be a 3-letter IATA code.")
+                else:
+                    row = build_duty_row(day, "LAYOVER", "HTL", origin=stn, end_day=(end if end > day else None))
+                    _commit_roster_change(_sort_rows(list(rows) + [row]))
+
+
+def _render_calendar_editor(rows, sel_span):
+    """Edit-mode calendar for the CURRENT period: a day grid with an ✎ per day,
+    plus a per-day editor that rewrites the live roster."""
+    username = st.session_state['username']
+    start, last = sel_span
+
+    # pending delete (flag set by a 🗑 button, applied on the next run)
+    del_idx = st.session_state.pop('_cedit_del', None)
+    if del_idx is not None and 0 <= del_idx < len(rows):
+        new_rows = [r for j, r in enumerate(rows) if j != del_idx]
+        st.session_state['current_roster'] = save_rows_as_roster(username, new_rows)
+        st.session_state.pop('caledit_target', None)
+        st.success("Duty removed from the current roster.")
+        st.rerun()
+
+    today = datetime.now().date()
+    grid_start = start - timedelta(days=start.weekday())
+    days = [grid_start + timedelta(days=i) for i in range(28)]
+
+    hd = st.columns(7)
+    for i, wd in enumerate(["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]):
+        with hd[i]:
+            st.markdown(f"<div class='cal-hd'>{wd}</div>", unsafe_allow_html=True)
+
+    for wk in range(4):
+        cols = st.columns(7)
+        for i in range(7):
+            d = days[wk * 7 + i]
+            with cols[i]:
+                in_period = start <= d <= last
+                labels = _day_summary_labels(rows, d) if in_period else []
+                hl = "#00bcd4" if d == today else "#1f2b3a"
+                body = "".join(f"<div class='chip' style='margin-bottom:2px;font-size:11px;'>{lbl}</div>"
+                               for lbl in labels)
+                if in_period and not labels:
+                    body = "<div class='chip chip-none' style='font-size:11px;'>No duty</div>"
+                st.markdown(
+                    f"<div style='background:#0f1926;border:1px solid {hl};border-radius:8px;"
+                    f"min-height:58px;padding:4px 6px;{'opacity:.35;' if not in_period else ''}'>"
+                    f"<div class='cal-date' style='font-size:12px;margin-bottom:2px;'>{d.day}"
+                    f"{' ' + d.strftime('%b') if d.day == 1 else ''}</div>{body}</div>",
+                    unsafe_allow_html=True)
+                if in_period:
+                    st.button("✎", key=f"cedit_{d.isoformat()}",
+                              use_container_width=True,
+                              help=f"Add or edit a duty on {d.strftime('%d %b')}",
+                              on_click=_cedit_open, args=(d,))
+
+    ed_day = st.session_state.get('caledit_day')
+    if ed_day is None:
+        return
+    if not (start <= ed_day <= last):
+        st.session_state.pop('caledit_day', None)
+        return
+
+    st.divider()
+    idxs = duty_rows_on_day(rows, ed_day)
+    ehead, eclose = st.columns([6, 1])
+    with ehead:
+        st.markdown(f"**✏️ {ed_day.strftime('%A %d %b %Y')}** — {len(idxs)} duty(s) on this day")
+    with eclose:
+        if st.button("✕ Close", key="cedit_close", help="Close the editor"):
+            st.session_state.pop('caledit_day', None)
+            st.session_state.pop('caledit_target', None)
+            st.rerun()
+
+    for j in idxs:
+        r = rows[j]
+        c1, c2, c3 = st.columns([8, 0.8, 0.8])
+        with c1:
+            st.markdown(f"<div style='padding:6px 2px;'>{_row_summary(r)}</div>", unsafe_allow_html=True)
+        with c2:
+            if st.button("✏️", key=f"cedit_edit_{j}", help="Edit this duty"):
+                st.session_state['caledit_target'] = j
+                st.rerun()
+        with c3:
+            if st.button("🗑", key=f"cedit_del_{j}", help="Delete this duty"):
+                st.session_state['_cedit_del'] = j
+                st.rerun()
+
+    target = st.session_state.get('caledit_target')
+    if target is not None and target not in idxs:
+        st.session_state.pop('caledit_target', None)
+        target = None
+
+    if target is not None:
+        _render_duty_edit_form(rows, target)
+    else:
+        _render_duty_add_form(rows, ed_day)
 
 
 # --- 3.7 SALARY ENGINE (ported from the FAU sheet formulas + code.gs) ---
@@ -4583,7 +5148,33 @@ else:
             else:
                 sel_span = None
 
-            st.markdown(f"<div class='card'>{build_calendar_html(cal_rows, span=sel_span)}</div>", unsafe_allow_html=True)
+            # ---------- CALENDAR: read-only view vs EDIT-MODE grid ----------
+            # Editing is allowed only for the CURRENT period (never archived/
+            # performed periods, and never a past period being browsed).
+            _edit_ok = (not viewing_past) and bool(cal_dates) and (sel_span is not None)
+            if not _edit_ok:
+                st.session_state['edit_mode'] = False
+                st.session_state.pop('caledit_day', None)
+                st.session_state.pop('caledit_target', None)
+            if _edit_ok:
+                e1, e2 = st.columns([5, 2])
+                with e1:
+                    st.markdown(
+                        "<div class='muted' style='font-size:12px;padding-top:6px;'>"
+                        "✏️ <b>Edit calendar</b> changes the <b>current roster</b> only — older/archived periods are read-only.</div>",
+                        unsafe_allow_html=True)
+                with e2:
+                    _lbl = "✅ Done editing" if st.session_state.get('edit_mode') else "✏️ Edit calendar"
+                    if st.button(_lbl, use_container_width=True, key="cedit_toggle"):
+                        st.session_state['edit_mode'] = not st.session_state.get('edit_mode', False)
+                        if not st.session_state['edit_mode']:
+                            st.session_state.pop('caledit_day', None)
+                            st.session_state.pop('caledit_target', None)
+                        st.rerun()
+            if st.session_state.get('edit_mode') and _edit_ok:
+                _render_calendar_editor(parsed_rows, sel_span)
+            else:
+                st.markdown(f"<div class='card'>{build_calendar_html(cal_rows, span=sel_span)}</div>", unsafe_allow_html=True)
 
             # Flight & Layover Intel — grouped: each layover trip is ONE entry
             # (inbound + 🏨 + outbound); standalone turnarounds get their own entry.
