@@ -5324,9 +5324,10 @@ st.markdown(
    never the 2-tab login group, via :has([data-key="3"])) */
 [data-testid="stTabs"]:has([data-testid="stTab"][data-key="3"]) [data-testid="stTab"] {{
     background-repeat: no-repeat !important;
-    background-position: 10px center !important;
-    background-size: 16px 16px !important;
-    padding-left: 30px !important;
+    background-position: 12px center !important;
+    background-size: 24px 24px !important;
+    padding-left: 44px !important;
+    min-height: 40px !important;
 }}
 [data-testid="stTabs"]:has([data-testid="stTab"][data-key="3"]) [data-testid="stTab"][data-key="0"] {{ background-image: url("{_TAB_ICON_URIS[0]}") !important; }}
 [data-testid="stTabs"]:has([data-testid="stTab"][data-key="3"]) [data-testid="stTab"][data-key="1"] {{ background-image: url("{_TAB_ICON_URIS[1]}") !important; }}
