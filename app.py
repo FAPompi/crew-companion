@@ -3,7 +3,6 @@ import sqlite3
 import hashlib
 import re
 import json
-import os
 from urllib.parse import quote
 import requests
 import pandas as pd
@@ -5264,12 +5263,9 @@ _TAB_ICON_SVGS = [
 ]
 _TAB_ICON_URIS = [_svg_uri(s) for s in _TAB_ICON_SVGS]
 
-try:
-    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
-except NameError:  # exec'd without __file__ (ad-hoc test harnesses)
-    _APP_DIR = os.getcwd()
-_ICON_PATH = os.path.join(_APP_DIR, "assets", "favicon.png")
-PAGE_ICON = _ICON_PATH if os.path.exists(_ICON_PATH) else "🛬"
+# Inline SVG string as page_icon → Streamlit serves it as a data-URI favicon
+# (no file dependency, no cacheable /media URL, crisp vector).
+PAGE_ICON = _FAVICON_SVG
 
 st.set_page_config(page_title="Chocks On", page_icon=PAGE_ICON, layout="wide")
 init_db()
@@ -5318,25 +5314,24 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Favicon (SVG data-URI — overrides any cached tab icon) + animated brand tab icons.
-st.markdown(
-    f'<link rel="icon" type="image/svg+xml" href="{_svg_uri(_FAVICON_SVG)}">',
-    unsafe_allow_html=True,
-)
+# Animated brand tab icons. Streamlit 1.63 renders each tab as
+# <div data-testid="stTab" data-key="0..N" role="tab"> (react-aria); the icon is a
+# background image so it can't be stripped by the markdown sanitizer.
 st.markdown(
     f"""
 <style>
-/* animated brand icons on the 4 main tabs (only the 4-tab group, never the 2-tab login group) */
-[data-testid="stTabs"] [data-testid="stTab"] {{
+/* animated brand icons on the 4 main tabs (scoped to the 4-tab group only,
+   never the 2-tab login group, via :has([data-key="3"])) */
+[data-testid="stTabs"]:has([data-testid="stTab"][data-key="3"]) [data-testid="stTab"] {{
     background-repeat: no-repeat !important;
     background-position: 10px center !important;
     background-size: 16px 16px !important;
     padding-left: 30px !important;
 }}
-[data-testid="stTabs"]:has([data-testid="stTab"][id="3"]) [data-testid="stTab"][id="0"] {{ background-image: url("{_TAB_ICON_URIS[0]}") !important; }}
-[data-testid="stTabs"]:has([data-testid="stTab"][id="3"]) [data-testid="stTab"][id="1"] {{ background-image: url("{_TAB_ICON_URIS[1]}") !important; }}
-[data-testid="stTabs"]:has([data-testid="stTab"][id="3"]) [data-testid="stTab"][id="2"] {{ background-image: url("{_TAB_ICON_URIS[2]}") !important; }}
-[data-testid="stTabs"]:has([data-testid="stTab"][id="3"]) [data-testid="stTab"][id="3"] {{ background-image: url("{_TAB_ICON_URIS[3]}") !important; }}
+[data-testid="stTabs"]:has([data-testid="stTab"][data-key="3"]) [data-testid="stTab"][data-key="0"] {{ background-image: url("{_TAB_ICON_URIS[0]}") !important; }}
+[data-testid="stTabs"]:has([data-testid="stTab"][data-key="3"]) [data-testid="stTab"][data-key="1"] {{ background-image: url("{_TAB_ICON_URIS[1]}") !important; }}
+[data-testid="stTabs"]:has([data-testid="stTab"][data-key="3"]) [data-testid="stTab"][data-key="2"] {{ background-image: url("{_TAB_ICON_URIS[2]}") !important; }}
+[data-testid="stTabs"]:has([data-testid="stTab"][data-key="3"]) [data-testid="stTab"][data-key="3"] {{ background-image: url("{_TAB_ICON_URIS[3]}") !important; }}
 </style>
 """,
     unsafe_allow_html=True,
