@@ -3,6 +3,7 @@ import sqlite3
 import hashlib
 import re
 import json
+import os
 import requests
 import pandas as pd
 try:
@@ -5176,14 +5177,53 @@ def compute_salary(rows, prof, acting=None):
     }
 
 # --- 4. STREAMLIT CONFIG & UI ---
-st.set_page_config(page_title="Crew Companion", page_icon="✈️", layout="wide")
+# Brand: Chocks On — "Chocks on. Mind off." (flight-path roundel, see /branding/).
+def _brand_logo(size=40):
+    return (
+        '<svg class="brand-logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" '
+        f'width="{size}" height="{size}">'
+        '<defs><linearGradient id="bglg" x1="0" y1="0" x2="0" y2="1">'
+        '<stop offset="0" stop-color="#0FB5AE"/><stop offset="1" stop-color="#0A7E7A"/>'
+        '</linearGradient></defs>'
+        '<circle cx="60" cy="60" r="55" fill="none" stroke="url(#bglg)" stroke-width="5"/>'
+        '<circle cx="60" cy="60" r="46" fill="none" stroke="#F0A93B" stroke-width="1.5" opacity="0.45"/>'
+        '<path d="M36,23.5 L37.43,28.57 L42.5,30 L37.43,31.43 L36,36.5 L34.57,31.43 L29.5,30 L34.57,28.57 Z" fill="#F0A93B"/>'
+        '<circle cx="40" cy="96" r="4.8" fill="none" stroke="#F0A93B" stroke-width="1.3" opacity="0.3"/>'
+        '<circle cx="40" cy="96" r="2.8" fill="#F0A93B"/>'
+        '<path d="M40,96 C 30,70 58,60 82,48" stroke="#F0A93B" stroke-width="2.6" fill="none" '
+        'stroke-linecap="round" stroke-dasharray="0.1 7.5" opacity="0.6"/>'
+        '<g transform="translate(82,48) rotate(-27) scale(1.7)">'
+        '<path d="M15,0 L-9.5,10.5 L-13,0 Z" fill="#0A7E7A"/>'
+        '<path d="M15,0 L-13,0 L-9.5,-10.5 Z" fill="#0FB5AE"/>'
+        '<path d="M15,0 L-9.5,-10.5 L-6,-3.5 Z" fill="#FFFFFF" opacity="0.12"/>'
+        '<path d="M15,0 L-13,0" stroke="#F0A93B" stroke-width="1.7" stroke-linecap="round"/>'
+        '<path d="M15,0 L-4.6,-3.2 L-4.6,3.2 Z" fill="#35C7C0"/>'
+        '<path d="M-4.6,-3.2 L-4.6,3.2" stroke="#0A7E7A" stroke-width="0.8" opacity="0.55"/>'
+        '</g></svg>'
+    )
+
+try:
+    _APP_DIR = os.path.dirname(os.path.abspath(__file__))
+except NameError:  # exec'd without __file__ (ad-hoc test harnesses)
+    _APP_DIR = os.getcwd()
+_ICON_PATH = os.path.join(_APP_DIR, "assets", "favicon.png")
+PAGE_ICON = _ICON_PATH if os.path.exists(_ICON_PATH) else "🛬"
+
+st.set_page_config(page_title="Chocks On", page_icon=PAGE_ICON, layout="wide")
 init_db()
 purge_pre2026_history()
 
 st.markdown("""
     <style>
+    @import url('https://fonts.googleapis.com/css2?family=Montserrat:wght@600;700;800&family=Inter:wght@400;500;600;700&display=swap');
+    html, body, [data-testid="stAppViewContainer"], .stApp { font-family: 'Inter', 'Segoe UI', Arial, sans-serif; }
+    h1, h2, h3, h4, h5, h6 { font-family: 'Montserrat', 'Inter', sans-serif; }
     .stApp { background-color: #0b1420; color: #ffffff; }
     .block-container { padding-top: 1.2rem; }
+    .brand-logo { filter: drop-shadow(0 0 10px rgba(15,181,174,.28)); }
+    .brand-word { font-family: 'Montserrat', 'Inter', sans-serif; font-weight: 800; letter-spacing: 2.5px; color: #ffffff; }
+    .brand-tag { color: #9fb3c8; font-size: 11.5px; letter-spacing: .4px; }
+    .brand-accent { color: #F0A93B; }
     .card { background:#121e2c; border:1px solid #1f2b3a; border-radius:12px; padding:16px; margin-bottom:14px; }
     .card h5 { margin:0 0 10px 0; font-size:14px; color:#e8eef7; }
     .muted { color:#7e8ba0; font-size:11px; }
@@ -5228,8 +5268,10 @@ if 'acked' not in st.session_state:
 if not st.session_state['logged_in']:
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        st.markdown("<h1 style='text-align: center;'>✈️ Crew Companion</h1>", unsafe_allow_html=True)
-        st.markdown("<h3 style='text-align: center; color: #888;'>Enterprise Roster & Analytics Hub</h3>", unsafe_allow_html=True)
+        st.markdown(f"<div style='text-align:center;margin-bottom:2px;'>{_brand_logo(88)}</div>", unsafe_allow_html=True)
+        st.markdown("<div class='brand-word' style='text-align:center;font-size:34px;'>CHOCKS ON</div>", unsafe_allow_html=True)
+        st.markdown("<div class='brand-tag' style='text-align:center;font-size:14px;margin-top:2px;'>Chocks on. Mind off.</div>", unsafe_allow_html=True)
+        st.markdown("<div style='text-align:center;color:#7e8ba0;font-size:12px;margin:6px 0 16px;'>Your roster, salary &amp; rest — sorted before you land.</div>", unsafe_allow_html=True)
 
         tab_login, tab_reg = st.tabs(["Log In", "Register Account"])
 
@@ -5315,7 +5357,12 @@ else:
     with hcol1:
         st.markdown(
             f"<div class='hbar'>"
-            f"<div style='font-size:18px;font-weight:800;'>🌲 CrewAI &nbsp;<span style='font-weight:400;color:#9fb3c8;'>| Roster Companion — {month_label}</span></div>"
+            f"<div style='display:flex;align-items:center;'>"
+            f"{_brand_logo(42)}"
+            f"<div style='margin-left:13px;'>"
+            f"<div class='brand-word' style='font-size:20px;'>CHOCKS ON</div>"
+            f"<div class='brand-tag'>Chocks on. Mind off. &nbsp;·&nbsp; {month_label}</div>"
+            f"</div></div>"
             f"<div style='display:flex;align-items:center;'>"
             f"<span style='margin-right:18px;font-size:16px;'>{bell}</span>"
             f"<span class='avatar'>{initials}</span>"
@@ -6520,7 +6567,7 @@ else:
                 if go is not None:
                     PAL = {"cyan": "#22d3ee", "green": "#34d399", "amber": "#fbbf24",
                            "pink": "#f472b6", "violet": "#a78bfa", "blue": "#60a5fa"}
-                    FONT = dict(family="Segoe UI, Arial, sans-serif", size=12, color="#9fb3c8")
+                    FONT = dict(family="Montserrat, Segoe UI, Arial, sans-serif", size=12, color="#9fb3c8")
 
                     def _style_axes(fig, height=300, legend=True):
                         fig.update_layout(
