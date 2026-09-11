@@ -2101,7 +2101,6 @@ PER_DIEM = {"LHR": 120, "CDG": 115, "FRA": 110, "ZRH": 130, "SYD": 110, "MEL": 1
             "BOM": 65, "DEL": 60, "BLR": 60, "MAA": 55}
 PER_DIEM_DEFAULT = 70
 
-CREW_VISA_NOTE = "Crew on GD (General Declaration) — no additional visa needed."
 
 # Extra crew-intel per station: currency + approximate rate, plug type, visa notes
 # for partners/family, how public transport is paid (tap vs cash vs travel card),
@@ -2292,7 +2291,7 @@ PLUG_SHAPES = {
     "D": ("• •\n •", "three round pins (triangle)"),
     "E": ("• •\n⌾", "two round pins + earth pin"),
     "F": ("• •", "two round pins + side clips"),
-    "G": ("▬ ▬\n │", "three rectangular pins"),
+    "G": ("│\n▬ ▬", "three rectangular pins"),
     "I": ("\\ /\n │", "two slanted pins + ground"),
     "J": ("• • •", "three round pins in a row"),
     "M": ("● ●\n ●", "three large round pins"),
@@ -3390,37 +3389,22 @@ def _off_chip(mand_rules, code="OFF"):
     return f"<div class='chip chip-off'>🟢 {lbl}</div>"
 
 
-def flight_intel_card(du, rows):
-    """HTML card for one duty: per-sector route + times + flying time, aircraft,
-    airport names and timezones, check-in/on-chock, and the duty's FDP vs its
-    Table A/B maximum. (Flying time/airport detail lives here, not on the
-    calendar chip.)"""
-    sectors = du["sectors"]
-    first = sectors[0]
-    report, chocks = du.get("report"), du.get("chocks_on")
-
+def _duty_sectors_html(du, rows):
+    """The per-sector route/times/flying-time rows for one duty (shared by the
+    flight-intel card and the merged layover card)."""
     ac_by = {}
     for r in rows:
         if r["Type"] == "FLIGHT":
             ac_by[str(r["Flight / Code"]).replace(" ", "")] = r.get("Aircraft") or "-"
 
     sec_rows = []
-    for s in sectors:
+    for s in du["sectors"]:
         fno = s["flight"].replace(" ", "")
         dep_t = s["dep"].strftime("%H:%M") if isinstance(s.get("dep"), datetime) else "-"
         arr_t = s["arr"].strftime("%H:%M") if isinstance(s.get("arr"), datetime) else "-"
         block = _fmt_hm(int(round(s["block_h"] * 60))) if s.get("block_h") else "-"
         sec_rows.append((fno, s["o"], s["d"], dep_t, arr_t, block, ac_by.get(fno, "-")))
 
-    n = len(sectors)
-    band = fdp_band((first["dep"] - timedelta(hours=1)).time()) if isinstance(first.get("dep"), datetime) else "0600-0759"
-    acclim = _roster_acclimatized(rows, report, away_origin=du.get("origin"))
-    prec = _preceding_rest_h(rows, report) if not acclim else None
-    max_fdp = fdp_limit_min(acclim, band, n, prec)
-    fdp_actual = (int((chocks - report).total_seconds() // 60)
-                  if isinstance(report, datetime) and isinstance(chocks, datetime) and chocks > report else None)
-
-    d0 = first["dep"].date().strftime("%d %b") if isinstance(first.get("dep"), datetime) else ""
     rows_html = ""
     for fno, o, d, dep_t, arr_t, block, ac in sec_rows:
         on = AIRPORT_NAME.get(o, "")
@@ -3434,6 +3418,45 @@ def flight_intel_card(du, rows):
             f"<span style='color:#e8eef7;font-weight:600;'>{block}</span></div>"
             f"<div class='muted' style='margin-top:3px;'>{on} ({o}, {_gmt_str(AIRPORT_OFFSET_H.get(o, 5.5))}) → {dn} ({d}, {_gmt_str(AIRPORT_OFFSET_H.get(d, 5.5))}){ac_txt}</div></div>"
         )
+    return rows_html
+
+
+def layover_flight_duties(rows, station, lv_date):
+    """Inbound duty (last sector arrives at `station` on the layover start date)
+    and outbound duty (departs `station` after the layover) — merged into the
+    layover card so you don't have to click the flights separately."""
+    inbound = outbound = None
+    for du in build_duties(rows):
+        if (du["dest"] == station and isinstance(du["chocks_on"], datetime)
+                and du["chocks_on"].date() == lv_date):
+            inbound = du
+    for du in build_duties(rows):
+        if (du["origin"] == station and isinstance(du["report"], datetime)
+                and du["report"].date() > lv_date):
+            outbound = du
+            break
+    return inbound, outbound
+
+
+def flight_intel_card(du, rows):
+    """HTML card for one duty: per-sector route + times + flying time, aircraft,
+    airport names and timezones, check-in/on-chock, and the duty's FDP vs its
+    Table A/B maximum. (Flying time/airport detail lives here, not on the
+    calendar chip.)"""
+    sectors = du["sectors"]
+    first = sectors[0]
+    report, chocks = du.get("report"), du.get("chocks_on")
+
+    n = len(sectors)
+    band = fdp_band((first["dep"] - timedelta(hours=1)).time()) if isinstance(first.get("dep"), datetime) else "0600-0759"
+    acclim = _roster_acclimatized(rows, report, away_origin=du.get("origin"))
+    prec = _preceding_rest_h(rows, report) if not acclim else None
+    max_fdp = fdp_limit_min(acclim, band, n, prec)
+    fdp_actual = (int((chocks - report).total_seconds() // 60)
+                  if isinstance(report, datetime) and isinstance(chocks, datetime) and chocks > report else None)
+
+    d0 = first["dep"].date().strftime("%d %b") if isinstance(first.get("dep"), datetime) else ""
+    rows_html = _duty_sectors_html(du, rows)
     fdp_html = ""
     if fdp_actual is not None:
         fdp_html = (f"<div class='bidrow'><span>Duty FDP (check-in → on-chock)</span>"
@@ -4607,7 +4630,7 @@ else:
                         ex = station_extra(lv["station"])
                         ex_html = ""
                         if ex:
-                            _rows_x = [f"<div class='bidrow'><span>🛂 You (crew)</span><span>{CREW_VISA_NOTE}</span></div>"]
+                            _rows_x = []
                             if ex.get("cur"):
                                 _rows_x.append(f"<div class='bidrow'><span>💱 Currency</span><span>{ex['cur']}"
                                                + (f" &nbsp;·&nbsp; {ex['fx']}" if ex.get("fx") else "") + "</span></div>")
@@ -4624,6 +4647,21 @@ else:
                             ex_html = (f"<div class='muted' style='margin:8px 0 4px;'>Crew info</div>"
                                        f"<div class='muted' style='font-size:10.5px;margin-bottom:4px;'>{VISA_DISCLAIMER}</div>"
                                        + "".join(_rows_x))
+                        # merged flight section: inbound (to the layover) + outbound (back to CMB)
+                        _lvd = lv.get("date") if lv.get("date") else None
+                        _inb, _outb = (layover_flight_duties(parsed_rows, lv["station"], _lvd)
+                                       if _lvd else (None, None))
+                        flights_html = ""
+                        if _inb or _outb:
+                            _fl_bits = []
+                            if _inb is not None:
+                                _fl_bits.append("<div class='muted' style='font-size:11px;margin-bottom:2px;'>↘ Inbound</div>"
+                                                + _duty_sectors_html(_inb, parsed_rows))
+                            if _outb is not None:
+                                _fl_bits.append("<div class='muted' style='font-size:11px;margin-bottom:2px;'>↗ Outbound</div>"
+                                                + _duty_sectors_html(_outb, parsed_rows))
+                            flights_html = (f"<div class='muted' style='margin:8px 0 4px;'>Flights</div>"
+                                            + "".join(_fl_bits))
                         st.markdown(
                             f"<div class='card' style='border-color:#00bcd4;'>"
                             f"<h5>🏨 Layover Intel: {city} ({lv['station']})" + (f" — {lv['date'].strftime('%d %b')}" if lv['date'] else "") + "</h5>"
@@ -4632,7 +4670,8 @@ else:
                             f"<div><div class='muted'>Weather (live)</div>{wx_html}</div>"
                             f"<div><div class='muted'>Local Time</div>{lt_html}</div>"
                             f"<div><div class='muted'>Ground Time</div>{gt_html}</div></div>"
-                            f"<div class='muted' style='margin-bottom:4px;'>Explore Spots</div>{spots_html}"
+                            + flights_html
+                            + f"<div class='muted' style='margin-bottom:4px;'>Explore Spots</div>{spots_html}"
                             + ex_html + "</div>",
                             unsafe_allow_html=True)
                 elif active_text:
