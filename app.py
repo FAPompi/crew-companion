@@ -3625,6 +3625,88 @@ _ADD_DUTY_CODES = ["GND", "MTG", "FAU", "OFG", "DLV", "ADM", "MED", "CRM", "SEP"
 _ADD_SBY_CODES = ["SB1", "SB2", "SB3", "SB4", "ASB", "LSB", "SSY"]
 
 
+# Standby windows (start, end) — SB4 runs overnight into the next morning.
+_SBY_WINDOWS = {
+    "SB1": ("00:01", "11:59"),
+    "SB2": ("12:00", "23:59"),
+    "SB3": ("06:00", "18:00"),
+    "SB4": ("18:00", "05:59"),
+}
+
+# Layover trips: outbound flight -> return flight, nights away (counted from
+# the day the outbound ARRIVES), and optional per-weekday overrides (0=Mon..
+# 6=Sun) for routes where the layover length depends on the departure day.
+LAYOVER_TRIPS = {
+    "UL253": {"ret": "UL254", "nights": 1, "dow": {}},   # Dammam
+    "UL265": {"ret": "UL266", "nights": 1, "dow": {}},   # Riyadh
+    "UL470": {"ret": "UL471", "nights": 2, "dow": {}},   # Seoul
+    "UL503": {"ret": "UL504", "nights": 2, "dow": {}},   # London
+}
+
+
+def _normalize_flt(s):
+    """'404' or 'ul404 ' -> 'UL404'; anything else passed through uppercased."""
+    s = (s or '').replace(' ', '').upper()
+    if re.fullmatch(r'\d{1,4}', s):
+        return 'UL' + s
+    if re.fullmatch(r'UL\d{1,4}', s):
+        return s
+    return s
+
+
+def _hm_shift(hhmm, delta_min):
+    """Shift an HH:MM string by delta minutes (negative = earlier); '' if invalid."""
+    t = _parse_hm(hhmm)
+    if t is None:
+        return ''
+    return (datetime(2000, 1, 1) + timedelta(hours=t.hour, minutes=t.minute)
+            + timedelta(minutes=delta_min)).strftime('%H:%M')
+
+
+def _lay_nights(trip, day):
+    """Nights for a layover trip, honouring any per-weekday override."""
+    return trip.get('dow', {}).get(day.weekday(), trip['nights'])
+
+
+def _row_coverage(r):
+    """(start, end) dates a row occupies on the calendar, or None."""
+    s = r.get('CIdt') or r.get('DEPdt')
+    e = r.get('COdt') or r.get('ARRdt')
+    if isinstance(s, datetime) and isinstance(e, datetime):
+        return s.date(), e.date()
+    if isinstance(r.get('DateObj'), datetime):
+        d0 = r['DateObj'].date()
+        d1 = (r['EndDateObj'].date() if isinstance(r.get('EndDateObj'), datetime) else d0)
+        return d0, d1
+    return None
+
+
+def _remove_days(rows, lo, hi):
+    """Split rows into (kept, removed) — removed = any row touching [lo, hi]."""
+    kept, removed = [], []
+    for r in rows:
+        cov = _row_coverage(r)
+        if cov and not (cov[1] < lo or cov[0] > hi):
+            removed.append(r)
+        else:
+            kept.append(r)
+    return kept, removed
+
+
+def _cedit_flt_on_change():
+    """Light callback: flag the main body to autofill (st.success is unsafe in callbacks)."""
+    st.session_state['_autofill_flt'] = True
+
+
+def _sby_code_changed():
+    """Prefill standby times when the code changes."""
+    code = st.session_state.get('cedit_sb_code', '')
+    w = _SBY_WINDOWS.get(code)
+    if w:
+        st.session_state['cedit_sb_s0'] = w[0]
+        st.session_state['cedit_sb_s1'] = w[1]
+
+
 # SriLankan Airlines DIRECT flights from Colombo — autofill reference database.
 # Keyed by flight number. Times are typical SCHEDULED LOCAL times at each end
 # (dep = origin local, arr = destination local), matching how the portal logs
@@ -3788,9 +3870,9 @@ def build_duty_row(day, rtype, code, ci=None, dep=None, arr=None, co=None,
     co_dt = _at(day, co)
 
     if rtype in ("FLIGHT", "STANDBY", "DUTY"):
-        if dep_dt and arr_dt and arr_dt <= dep_dt:
+        if dep_dt and arr_dt and arr_dt < dep_dt:
             arr_dt += timedelta(days=1)      # overnight arrival
-        if arr_dt and co_dt and co_dt <= arr_dt:
+        if arr_dt and co_dt and co_dt < arr_dt:
             co_dt += timedelta(days=1)
         if ci_dt and dep_dt and ci_dt > dep_dt:
             ci_dt -= timedelta(days=1)       # check-in the evening before
@@ -3804,7 +3886,7 @@ def build_duty_row(day, rtype, code, ci=None, dep=None, arr=None, co=None,
     elif rtype == "LAYOVER":
         dep_dt = dep_dt or datetime.combine(day, dtime(0, 0))
         if end_day and end_day > day:
-            arr_dt = datetime.combine(end_day, dtime(23, 59))
+            arr_dt = _at(end_day, arr) or datetime.combine(end_day, dtime(23, 59))
         arr_dt = arr_dt or dep_dt
         anchor = dep_dt
         route = origin
@@ -4034,58 +4116,74 @@ def _flight_info(fl):
     return m
 
 
-def _fill_flight_details():
-    """Autofill the add-flight form from the direct-flights database, with the
-    current roster's actual times taking priority (they're always right)."""
-    fl = (st.session_state.get('cedit_a_flt') or '').replace(' ', '').upper()
+def _fill_flight_details(day=None):
+    """Autofill the add-flight form: times from the direct-flights DB (current
+    roster's actual times win). Check-in = dep − 1h20; check-out = arr + 30m
+    (turnarounds get NO check-in/check-out at the outstation). Layover trips
+    also set the return date from the number of nights away."""
+    fl = _normalize_flt(st.session_state.get('cedit_a_flt'))
     if not re.fullmatch(r'UL\d{1,4}', fl):
         st.warning("Type a UL flight number first (e.g. UL404).")
         return
     info = _flight_info(fl)
     if not info:
         st.warning(f"{fl} isn't in the flight database — fill the details manually.")
-        # clear any stale turnaround state from a previous fill
+        for k in ('cedit_a_ret', 'cedit_a_rdep', 'cedit_a_rarr', 'cedit_a_rco', 'cedit_a_rci'):
+            st.session_state[k] = ''
         st.session_state['cedit_a_turn'] = False
-        st.session_state['cedit_a_ret'] = ''
-        st.session_state['cedit_a_rdep'] = ''
-        st.session_state['cedit_a_rarr'] = ''
-        st.session_state['cedit_a_rco'] = ''
+        st.session_state['cedit_a_layover'] = False
         return
+    lay = LAYOVER_TRIPS.get(fl)
     from_roster = fl in _roster_flight_times()
+    dep, arr = info.get('dep', ''), info.get('arr', '')
     st.session_state['cedit_a_o'] = info.get('o', 'CMB')
     st.session_state['cedit_a_d'] = info.get('d', '')
-    st.session_state['cedit_a_ci'] = ''
-    st.session_state['cedit_a_dep'] = info.get('dep', '')
-    st.session_state['cedit_a_arr'] = info.get('arr', '')
-    st.session_state['cedit_a_co'] = info.get('co', '')
+    st.session_state['cedit_a_ci'] = _hm_shift(dep, -80)
+    st.session_state['cedit_a_dep'] = dep
+    st.session_state['cedit_a_arr'] = arr
+    st.session_state['cedit_a_co'] = _hm_shift(arr, 30) if lay else ''
     st.session_state['cedit_a_ac'] = info.get('ac', '')
-    ret = info.get('ret')
+    ret = (lay or {}).get('ret') or info.get('ret')
     if ret and ret in UL_DIRECT:
         ri = _flight_info(ret) if ret in _roster_flight_times() else UL_DIRECT[ret]
         st.session_state['cedit_a_ret'] = ret
         st.session_state['cedit_a_rdep'] = ri.get('dep', '')
         st.session_state['cedit_a_rarr'] = ri.get('arr', '')
-        st.session_state['cedit_a_rco'] = ri.get('co', '')
-        st.session_state['cedit_a_retday'] = int(info.get('ret_day', 0) or 0)
+        st.session_state['cedit_a_rco'] = _hm_shift(ri.get('arr', ''), 30)
+        st.session_state['cedit_a_rci'] = _hm_shift(ri.get('dep', ''), -80) if lay else ''
+        src = "your roster" if from_roster else "flight database"
+        if lay:
+            dep_t, arr_t = _parse_hm(dep), _parse_hm(arr)
+            overnight = bool(dep_t and arr_t and arr_t < dep_t)
+            nights = _lay_nights(lay, day) if day else lay['nights']
+            st.session_state['cedit_a_retday'] = (1 if overnight else 0) + nights
+            st.session_state['cedit_a_layover'] = True
+            retdate = (day + timedelta(days=st.session_state['cedit_a_retday'])) if day else None
+            st.success(f"Filled {fl}: {info['o']}→{info['d']} {dep}–{arr} · layover {nights} night(s)"
+                       f" · returns {ret} {retdate.strftime('%d %b') if retdate else ''} · from {src}")
+        else:
+            st.session_state['cedit_a_retday'] = int(info.get('ret_day', 0) or 0)
+            st.session_state['cedit_a_layover'] = False
+            st.success(f"Filled {fl}: {info['o']}→{info['d']} {dep}–{arr} · return {ret}"
+                       f" {'next day' if info.get('ret_day') else 'same day'} · from {src}")
         st.session_state['cedit_a_turn'] = True
-        src = "your roster" if from_roster else "flight database"
-        st.success(f"Filled {fl}: {info['o']}→{info['d']} {info.get('dep','')}–{info.get('arr','')}"
-                   f" · return {ret} {'next day' if info.get('ret_day') else 'same day'} · from {src}")
     else:
-        st.session_state['cedit_a_ret'] = ''
-        st.session_state['cedit_a_rdep'] = ''
-        st.session_state['cedit_a_rarr'] = ''
-        st.session_state['cedit_a_rco'] = ''
+        for k in ('cedit_a_ret', 'cedit_a_rdep', 'cedit_a_rarr', 'cedit_a_rco', 'cedit_a_rci'):
+            st.session_state[k] = ''
         st.session_state['cedit_a_turn'] = False
+        st.session_state['cedit_a_layover'] = False
         src = "your roster" if from_roster else "flight database"
-        st.success(f"Filled {fl}: {info['o']}→{info['d']} {info.get('dep','')}–{info.get('arr','')} · from {src}")
+        st.success(f"Filled {fl}: {info['o']}→{info['d']} {dep}–{arr} · from {src}")
 
 
-def _commit_roster_change(new_rows):
-    """Persist edited rows back to the current roster and reload."""
+def _commit_roster_change(new_rows, note=None):
+    """Persist edited rows back to the current roster and reload. `note` (if
+    any) is shown as a warning banner on the next render."""
     _snapshot_for_undo()
     st.session_state['current_roster'] = save_rows_as_roster(st.session_state['username'], new_rows)
     st.session_state.pop('caledit_target', None)
+    if note:
+        st.session_state['_cedit_note'] = note
     st.success("Current roster updated — dashboard & intel recalculated.")
     st.rerun()
 
@@ -4210,25 +4308,41 @@ def _render_duty_edit_form(rows, idx):
 
 
 def _render_duty_add_form(rows, day):
-    """Form to add a new duty on `day`. The type selector + flight autofill +
-    turnaround tick live OUTSIDE the form so they react instantly; the fields
-    + submit button sit inside the form."""
+    """Form to add a new duty on `day`. Type-specific widgets that must react
+    instantly (flight number, Fill, turnaround/layover tick, standby code) live
+    OUTSIDE the form; the fields + submit button sit inside it."""
     ftype = st.selectbox("Add duty type", ["Flight", "Standby", "Day off", "Leave / sick",
                                            "Time off", "Training / ground duty", "Layover"],
                          key="cedit_add_type")
 
+    _lay = None
     if ftype == "Flight":
-        _fl = st.text_input("Flight number (e.g. UL404)", key="cedit_a_flt",
-                            placeholder="UL404").replace(" ", "").upper()
+        fl_default = "UL" if "cedit_a_flt" not in st.session_state else None
+        _fl_raw = st.text_input("Flight number (e.g. UL404)", key="cedit_a_flt",
+                                value=fl_default, placeholder="UL404",
+                                on_change=_cedit_flt_on_change)
+        if st.session_state.pop('_autofill_flt', False):
+            _fill_flight_details(day)
+        _fl = _normalize_flt(_fl_raw)
+        _lay = LAYOVER_TRIPS.get(_fl)
         _f1, _f2 = st.columns([2.6, 1])
         with _f2:
             if st.button("🔍 Fill from DB", key="cedit_fill_btn", use_container_width=True,
-                         help="Autofill origin/destination/times from the SriLankan direct-flights database"):
-                _fill_flight_details()
+                         help="Autofill origin/destination/times/check-in/check-out from the flight database"):
+                _fill_flight_details(day)
         with _f1:
             _info = _flight_info(_fl)
             _from_roster = _fl in _roster_flight_times()
-            if _info:
+            if _lay and _info:
+                _dep_t = _parse_hm(_info.get('dep', ''))
+                _arr_t = _parse_hm(_info.get('arr', ''))
+                _overnight = bool(_dep_t and _arr_t and _arr_t < _dep_t)
+                _n = _lay_nights(_lay, day)
+                _retdate = day + timedelta(days=(1 if _overnight else 0) + _n)
+                st.caption("🏨 Layover: " + _fl + " → " + _info.get("d", "") + " · " + str(_n)
+                           + " night(s) · returns " + _lay["ret"] + " " + _retdate.strftime('%d %b')
+                           + (" · your roster" if _from_roster else " · flight database"))
+            elif _info:
                 st.caption("✓ " + _fl + " · " + _info.get("o", "") + "→" + _info.get("d", "")
                            + " · " + _info.get("dep", "—") + "–" + _info.get("arr", "—")
                            + (" · return " + _info["ret"] + (" (next day)" if _info.get("ret_day") else "") if _info.get("ret") else "")
@@ -4236,8 +4350,16 @@ def _render_duty_add_form(rows, day):
             elif _fl:
                 st.caption("Not in the database — enter details manually below.")
             else:
-                st.caption("Type a flight number, then 🔍 Fill from DB — or enter details manually.")
-        turn = st.checkbox("🔄 Turnaround — also add the return leg", key="cedit_a_turn")
+                st.caption("Type a flight number, then press Enter or 🔍 Fill from DB — or enter details manually.")
+        if _lay:
+            turn = st.checkbox("🏨 Add full layover trip (outbound + hotel + return · clears those days)",
+                               key="cedit_a_turn")
+        else:
+            turn = st.checkbox("🔄 Turnaround — also add the return leg", key="cedit_a_turn")
+
+    elif ftype == "Standby":
+        _sby_code = st.selectbox("Standby code", _ADD_SBY_CODES, key="cedit_sb_code",
+                                 on_change=_sby_code_changed)
 
     with st.form(key="cedit_add_form"):
         if ftype == "Flight":
@@ -4257,18 +4379,35 @@ def _render_duty_add_form(rows, day):
                 co = _time_field("Check-out", "cedit_a_co")
             ac = st.text_input("Aircraft (optional)", key="cedit_a_ac").strip().upper()
             if turn:
-                _rd = int(st.session_state.get('cedit_a_retday', 0) or 0)
-                st.caption("Return departs the **" + ("next day" if _rd else "same day")
-                           + "** · From/To swap automatically.")
-                r1, r2, r3, r4 = st.columns(4)
-                with r1:
-                    rfl = st.text_input("Return flight no.", key="cedit_a_ret").replace(" ", "").upper()
-                with r2:
-                    rdep = _time_field("Return dep", "cedit_a_rdep")
-                with r3:
-                    rarr = _time_field("Return arr", "cedit_a_rarr")
-                with r4:
-                    rco = _time_field("Return co", "cedit_a_rco")
+                if _lay:
+                    _rd = int(st.session_state.get('cedit_a_retday', 0) or 0)
+                    st.caption("Return departs **" + (day + timedelta(days=_rd)).strftime('%d %b')
+                               + "** · hotel " + str(_lay_nights(_lay, day)) + " night(s)"
+                               + " · From/To swap automatically.")
+                    r1, r2, r3, r4, r5 = st.columns(5)
+                    with r1:
+                        rfl = st.text_input("Return flight", key="cedit_a_ret").replace(" ", "").upper()
+                    with r2:
+                        rci = _time_field("Return CI", "cedit_a_rci")
+                    with r3:
+                        rdep = _time_field("Return dep", "cedit_a_rdep")
+                    with r4:
+                        rarr = _time_field("Return arr", "cedit_a_rarr")
+                    with r5:
+                        rco = _time_field("Return co", "cedit_a_rco")
+                else:
+                    _rd = int(st.session_state.get('cedit_a_retday', 0) or 0)
+                    st.caption("Return departs the **" + ("next day" if _rd else "same day")
+                               + "** · From/To swap automatically.")
+                    r1, r2, r3, r4 = st.columns(4)
+                    with r1:
+                        rfl = st.text_input("Return flight no.", key="cedit_a_ret").replace(" ", "").upper()
+                    with r2:
+                        rdep = _time_field("Return dep", "cedit_a_rdep")
+                    with r3:
+                        rarr = _time_field("Return arr", "cedit_a_rarr")
+                    with r4:
+                        rco = _time_field("Return co", "cedit_a_rco")
             ok, msg = True, ""
             if not re.fullmatch(r'UL\d{1,4}', _fl):
                 ok, msg = False, "Flight number must look like UL404."
@@ -4289,29 +4428,57 @@ def _render_duty_add_form(rows, day):
                 else:
                     row_out = build_duty_row(day, "FLIGHT", _fl, ci=_parse_hm(ci), dep=_parse_hm(dep),
                                              arr=_parse_hm(arr), co=_parse_hm(co), origin=origin, dest=dest, ac=ac or "-")
-                    new_rows = [row_out]
-                    if turn:
+                    note = None
+                    if not turn:
+                        _commit_roster_change(_sort_rows(list(rows) + [row_out]))
+                    elif _lay:
                         rfl_v = (st.session_state.get('cedit_a_ret') or '').replace(' ', '').upper()
                         _rd = int(st.session_state.get('cedit_a_retday', 0) or 0)
+                        ret_day = day + timedelta(days=_rd)
+                        arr_dt = row_out.get('ARRdt')
+                        htl_start = arr_dt.date() if isinstance(arr_dt, datetime) else day
+                        htl_co_t = _parse_hm(st.session_state.get('cedit_a_co', ''))
+                        rci_t = (_parse_hm(st.session_state.get('cedit_a_rci', ''))
+                                 or _hm_shift(st.session_state.get('cedit_a_rdep', ''), -80))
+                        rdep_t = _parse_hm(st.session_state.get('cedit_a_rdep', ''))
+                        rarr_t = _parse_hm(st.session_state.get('cedit_a_rarr', ''))
+                        rco_t = _parse_hm(st.session_state.get('cedit_a_rco', ''))
+                        rac = UL_DIRECT.get(rfl_v, {}).get('ac') or (ac or '-')
+                        htl = build_duty_row(htl_start, "LAYOVER", "HTL", origin=dest,
+                                             dep=htl_co_t, arr=rci_t, end_day=ret_day)
+                        row_ret = build_duty_row(ret_day, "FLIGHT", rfl_v, ci=rci_t, dep=rdep_t,
+                                                 arr=rarr_t, co=rco_t, origin=dest, dest=origin, ac=rac)
+                        kept, removed = _remove_days(rows, day, ret_day)
+                        if removed:
+                            note = ("🏨 Layover trip added (" + _fl + " → " + dest + "). "
+                                    "Removed to make room:\n"
+                                    + "\n".join("• " + _row_summary(r) for r in removed))
+                        _commit_roster_change(_sort_rows(kept + [row_out, htl, row_ret]), note=note)
+                    else:
+                        rfl_v = (st.session_state.get('cedit_a_ret') or '').replace(' ', '').upper()
+                        _rd = int(st.session_state.get('cedit_a_retday', 0) or 0)
+                        rdep_t = _parse_hm(st.session_state.get('cedit_a_rdep', ''))
+                        rarr_t = _parse_hm(st.session_state.get('cedit_a_rarr', ''))
+                        rco_t = _parse_hm(st.session_state.get('cedit_a_rco', ''))
+                        rac = UL_DIRECT.get(rfl_v, {}).get('ac') or (ac or '-')
                         row_ret = build_duty_row(day + timedelta(days=_rd), "FLIGHT", rfl_v,
-                                                 dep=_parse_hm(st.session_state.get('cedit_a_rdep', '')),
-                                                 arr=_parse_hm(st.session_state.get('cedit_a_rarr', '')),
-                                                 co=_parse_hm(st.session_state.get('cedit_a_rco', '')),
-                                                 origin=dest, dest=origin, ac=ac or "-")
-                        new_rows.append(row_ret)
-                    _commit_roster_change(_sort_rows(list(rows) + new_rows))
+                                                 dep=rdep_t, arr=rarr_t, co=rco_t,
+                                                 origin=dest, dest=origin, ac=rac)
+                        _commit_roster_change(_sort_rows(list(rows) + [row_out, row_ret]))
         elif ftype == "Standby":
-            code = st.selectbox("Standby code", _ADD_SBY_CODES, key="cedit_sb_code")
+            w = _SBY_WINDOWS.get(_sby_code, ("06:00", "18:00"))
             c1, c2 = st.columns(2)
             with c1:
-                s0 = _time_field("Start", "cedit_sb_s0", "06:00")
+                s0 = _time_field("Start", "cedit_sb_s0", w[0])
             with c2:
-                s1 = _time_field("End", "cedit_sb_s1", "18:00")
+                s1 = _time_field("End", "cedit_sb_s1", w[1])
+            if _sby_code == "SB4":
+                st.caption("SB4 runs overnight — ends 05:59 the next morning.")
             if st.form_submit_button(f"➕ Add standby to {day.strftime('%d %b')}", key="cedit_add_submit"):
                 if _parse_hm(s0) is None or _parse_hm(s1) is None:
                     st.error("Start & End need HH:MM times.")
                 else:
-                    row = build_duty_row(day, "STANDBY", code, ci=_parse_hm(s0), dep=_parse_hm(s0),
+                    row = build_duty_row(day, "STANDBY", _sby_code, ci=_parse_hm(s0), dep=_parse_hm(s0),
                                          arr=_parse_hm(s1), co=_parse_hm(s1))
                     _commit_roster_change(_sort_rows(list(rows) + [row]))
         elif ftype == "Day off":
@@ -4369,6 +4536,10 @@ def _render_calendar_editor(rows, sel_span):
     plus a per-day editor that rewrites the live roster."""
     username = st.session_state['username']
     start, last = sel_span
+
+    note = st.session_state.pop('_cedit_note', None)
+    if note:
+        st.warning(note)
 
     # pending delete (flag set by a 🗑 button, applied on the next run)
     del_idx = st.session_state.pop('_cedit_del', None)
