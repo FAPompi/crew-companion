@@ -2101,6 +2101,187 @@ PER_DIEM = {"LHR": 120, "CDG": 115, "FRA": 110, "ZRH": 130, "SYD": 110, "MEL": 1
             "BOM": 65, "DEL": 60, "BLR": 60, "MAA": 55}
 PER_DIEM_DEFAULT = 70
 
+CREW_VISA_NOTE = "Crew on GD (General Declaration) — no additional visa needed."
+
+# Extra crew-intel per station: currency + approximate rate, plug type, visa notes
+# for partners/family, how public transport is paid (tap vs cash vs travel card),
+# and a few crew tips. Hotel/laundry/breakfast details to be added later.
+STATION_EXTRAS = {
+    "CMB": {"cur": "LKR", "fx": "1 USD ≈ LKR 305", "plug": "Type D / M / G",
+            "visa_family": "Home base — family typically no visa (check nationality).",
+            "transit": "Buses: cash or a travel card · PickMe/Uber take cards in-app.",
+            "tips": ["Drink bottled water", "Uber/PickMe are cheap & reliable", "Cards accepted city-wide"]},
+    "DXB": {"cur": "AED", "fx": "1 USD ≈ 3.67", "plug": "Type G",
+            "visa_family": "Many nationalities visa-free (30d) or visa-on-arrival — check UAE e-visa.",
+            "transit": "Metro/bus/tram all tap contactless Visa/Mastercard (nol) · a silver nol card works if a foreign card is blocked.",
+            "tips": ["nol card from any station", "Taxis take cards", "Free hotel shuttles common"]},
+    "AUH": {"cur": "AED", "fx": "1 USD ≈ 3.67", "plug": "Type G",
+            "visa_family": "Visa-free/on-arrival for many nationalities.",
+            "transit": "Hafilat card for buses (cash top-up) · taxis take cards.",
+            "tips": ["Careem/Uber everywhere"]},
+    "DOH": {"cur": "QAR", "fx": "1 USD ≈ 3.64", "plug": "Type G",
+            "visa_family": "Hayya e-visa or visa-on-arrival for many nationalities.",
+            "transit": "Metro taps contactless Visa/Mastercard · Karwa card also works.",
+            "tips": ["Metro links the airport", "Cards accepted almost everywhere"]},
+    "RUH": {"cur": "SAR", "fx": "1 USD ≈ 3.75", "plug": "Type G",
+            "visa_family": "eVisa (or visa-on-arrival for some) — arrange before travel.",
+            "transit": "Riyadh Metro taps contactless · many buses cash-only · Careem/Uber in-app cards.",
+            "tips": ["eVisa via official portal", "Malls & hotels take cards"]},
+    "DMM": {"cur": "SAR", "fx": "1 USD ≈ 3.75", "plug": "Type G",
+            "visa_family": "eVisa for visitors.",
+            "transit": "Buses cash or SPT card · Uber/Careem in-app cards.",
+            "tips": []},
+    "JED": {"cur": "SAR", "fx": "1 USD ≈ 3.75", "plug": "Type G",
+            "visa_family": "eVisa/visa-on-arrival (note Hajj/Umrah rules).",
+            "transit": "Buses cash/card · Uber/Careem.",
+            "tips": []},
+    "KWI": {"cur": "KWD", "fx": "1 USD ≈ 0.31", "plug": "Type G",
+            "visa_family": "eVisa required for most — apply in advance.",
+            "transit": "Buses mostly cash or PAM card · Careem/Uber.",
+            "tips": []},
+    "BAH": {"cur": "BHD", "fx": "1 USD ≈ 0.376", "plug": "Type G",
+            "visa_family": "eVisa or visa-on-arrival for many.",
+            "transit": "GoCard for buses · taxis cash/card.",
+            "tips": []},
+    "MCT": {"cur": "OMR", "fx": "1 USD ≈ 0.385", "plug": "Type G",
+            "visa_family": "eVisa for most nationalities.",
+            "transit": "Mwasalat buses take contactless/cash · OTaxi app.",
+            "tips": []},
+    "BKK": {"cur": "THB", "fx": "1 USD ≈ 36", "plug": "Type A / B / C",
+            "visa_family": "Visa-exempt entry (30–60d) for many nationalities.",
+            "transit": "BTS/MRT tap Visa/Mastercard on newer gates · Rabbit card for BTS · city buses cash only.",
+            "tips": ["Grab/Bolt are cheap", "7-Eleven takes cards", "Keep small cash for street food"]},
+    "SIN": {"cur": "SGD", "fx": "1 USD ≈ 1.35", "plug": "Type G",
+            "visa_family": "Visa-free for many; SG Arrival Card (electronic) for all.",
+            "transit": "Tap any contactless Visa/Mastercard on MRT & buses (SimplyGo) — no separate card needed.",
+            "tips": ["Hawker stalls often cash-only", "Grab/Gojek everywhere", "Tap water is safe"]},
+    "KUL": {"cur": "MYR", "fx": "1 USD ≈ 4.4", "plug": "Type G",
+            "visa_family": "Visa-free for most (check MDAC digital arrival card).",
+            "transit": "Touch 'n Go card needed for rail/bus (cash top-up) · Grab everywhere (cards in-app).",
+            "tips": ["Grab is the default", "Cards widely accepted"]},
+    "CGK": {"cur": "IDR", "fx": "1 USD ≈ 15,500", "plug": "Type C / F",
+            "visa_family": "Visa-on-arrival (paid) available for many.",
+            "transit": "e-money cards (e-Money/Flazz) for Commuter Line/MRT · contactless cards rare · Gojek/Grab in-app.",
+            "tips": ["Gojek for short hops", "Carry some cash"]},
+    "HKG": {"cur": "HKD", "fx": "1 USD ≈ 7.8", "plug": "Type G",
+            "visa_family": "Visa-free for most nationalities.",
+            "transit": "Octopus card (cash top-up) for MTR/bus — contactless credit cards NOT accepted · Airport Express takes cards.",
+            "tips": ["Octopus at the airport", "Cards accepted city-wide"]},
+    "CAN": {"cur": "CNY", "fx": "1 USD ≈ 7.2", "plug": "Type A / I",
+            "visa_family": "144-hr transit without visa for many — else a visa is needed.",
+            "transit": "Alipay/WeChat dominate · cash works · foreign contactless cards unreliable on buses · DiDi app.",
+            "tips": ["Set up Alipay/WeChat if you can", "Carry cash"]},
+    "PVG": {"cur": "CNY", "fx": "1 USD ≈ 7.2", "plug": "Type A / I",
+            "visa_family": "144-hr transit without visa for many.",
+            "transit": "Metro takes Alipay/WeChat & cash · foreign cards unreliable · Maglev takes cards.",
+            "tips": []},
+    "PEK": {"cur": "CNY", "fx": "1 USD ≈ 7.2", "plug": "Type A / I",
+            "visa_family": "144-hr transit without visa for many.",
+            "transit": "Metro cash/Alipay · foreign cards unreliable.",
+            "tips": []},
+    "ICN": {"cur": "KRW", "fx": "1 USD ≈ 1,330", "plug": "Type F / C",
+            "visa_family": "K-ETA (electronic) required for visa-exempt nationalities.",
+            "transit": "T-money card (cash top-up) for metro/bus · some airport buses take cards.",
+            "tips": ["K-ETA before travel", "T-money at the airport"]},
+    "NRT": {"cur": "JPY", "fx": "1 USD ≈ 150", "plug": "Type A / B",
+            "visa_family": "Visa-free for many nationalities.",
+            "transit": "Suica/Pasmo (cash top-up) — contactless credit cards only on some lines · Welcome Suica at the airport.",
+            "tips": ["Get a Suica at the airport", "Japan is still cash-friendly"]},
+    "KIX": {"cur": "JPY", "fx": "1 USD ≈ 150", "plug": "Type A / B",
+            "visa_family": "Visa-free for many nationalities.",
+            "transit": "ICOCA card for trains/buses.",
+            "tips": []},
+    "MLE": {"cur": "MVR / USD", "fx": "1 USD ≈ 15.4", "plug": "Type D / G",
+            "visa_family": "Tourist visa on arrival (30d, free) for all nationalities.",
+            "transit": "Cash — USD widely accepted · resort speedboats arranged by the hotel.",
+            "tips": ["USD accepted everywhere", "Resort transfers pre-arranged"]},
+    "MAA": {"cur": "INR", "fx": "1 USD ≈ 83", "plug": "Type C / D",
+            "visa_family": "eVisa for most nationalities.",
+            "transit": "Metro/bus cash & cards · UPI for locals · Ola/Uber cards in-app.",
+            "tips": ["Ola/Uber cheap", "Carry small notes"]},
+    "DEL": {"cur": "INR", "fx": "1 USD ≈ 83", "plug": "Type C / D",
+            "visa_family": "eVisa for most nationalities.",
+            "transit": "Delhi Metro token/card (cash) · Ola/Uber cards · autos cash.",
+            "tips": []},
+    "BLR": {"cur": "INR", "fx": "1 USD ≈ 83", "plug": "Type C / D",
+            "visa_family": "eVisa for most nationalities.",
+            "transit": "Namma Metro card/QR · buses cash · Uber/Ola.",
+            "tips": []},
+    "BOM": {"cur": "INR", "fx": "1 USD ≈ 83", "plug": "Type C / D",
+            "visa_family": "eVisa for most nationalities.",
+            "transit": "Local trains UTS app/cash · Uber/Ola cards.",
+            "tips": []},
+    "HYD": {"cur": "INR", "fx": "1 USD ≈ 83", "plug": "Type C / D",
+            "visa_family": "eVisa for most nationalities.",
+            "transit": "Metro cards · buses cash · Uber/Ola.",
+            "tips": []},
+    "CCU": {"cur": "INR", "fx": "1 USD ≈ 83", "plug": "Type C / D",
+            "visa_family": "eVisa for most nationalities.",
+            "transit": "Metro cards · buses cash · Uber/Ola.",
+            "tips": []},
+    "COK": {"cur": "INR", "fx": "1 USD ≈ 83", "plug": "Type C / D",
+            "visa_family": "eVisa for most nationalities.",
+            "transit": "Kochi Metro cards · buses cash.",
+            "tips": []},
+    "TRV": {"cur": "INR", "fx": "1 USD ≈ 83", "plug": "Type C / D",
+            "visa_family": "eVisa for most nationalities.",
+            "transit": "Buses cash · autos cash.",
+            "tips": []},
+    "TRZ": {"cur": "INR", "fx": "1 USD ≈ 83", "plug": "Type C / D",
+            "visa_family": "eVisa for most nationalities.",
+            "transit": "Buses cash · autos cash.",
+            "tips": []},
+    "DAC": {"cur": "BDT", "fx": "1 USD ≈ 110", "plug": "Type C / D / G",
+            "visa_family": "Visa on arrival for many nationalities.",
+            "transit": "Cash · Uber/Pathao cards in-app · metro takes cards.",
+            "tips": []},
+    "KHI": {"cur": "PKR", "fx": "1 USD ≈ 280", "plug": "Type C / D",
+            "visa_family": "Visa required in advance for most.",
+            "transit": "Cash · Careem/Uber cards in-app.",
+            "tips": []},
+    "LHE": {"cur": "PKR", "fx": "1 USD ≈ 280", "plug": "Type C / D",
+            "visa_family": "Visa required in advance for most.",
+            "transit": "Cash · Careem/Uber cards in-app.",
+            "tips": []},
+    "SEZ": {"cur": "SCR", "fx": "1 USD ≈ 14", "plug": "Type G",
+            "visa_family": "Visa-free (visitor's permit on arrival) for all.",
+            "transit": "Cash & cards · SPTC buses cash/card · taxis cards.",
+            "tips": ["Free visitor's permit on arrival"]},
+    "LHR": {"cur": "GBP", "fx": "1 USD ≈ 0.79", "plug": "Type G",
+            "visa_family": "eVisa/ETA (Electronic Travel Authorisation) for visa-exempt nationalities.",
+            "transit": "Tap any contactless Visa/Mastercard on Tube & bus (no Oyster needed) · daily fare cap.",
+            "tips": ["Contactless everywhere", "Heathrow Express takes cards"]},
+    "CDG": {"cur": "EUR", "fx": "1 USD ≈ 0.92", "plug": "Type C / E",
+            "visa_family": "Schengen visa for many nationalities.",
+            "transit": "Navigo Easy card or contactless cards on RATP · some buses cash.",
+            "tips": ["Contactless on metro", "Watch for pickpockets"]},
+    "FRA": {"cur": "EUR", "fx": "1 USD ≈ 0.92", "plug": "Type C / F",
+            "visa_family": "Schengen visa for many nationalities.",
+            "transit": "RMV/U-Bahn take contactless cards · some ticket machines cash.",
+            "tips": []},
+    "ZRH": {"cur": "CHF", "fx": "1 USD ≈ 0.88", "plug": "Type J",
+            "visa_family": "Schengen visa for many nationalities.",
+            "transit": "Contactless cards everywhere (SBB) — no cash needed.",
+            "tips": ["Cards everywhere", "Expensive — plan meals"]},
+    "IST": {"cur": "TRY", "fx": "1 USD ≈ 33", "plug": "Type C / F",
+            "visa_family": "eVisa for many nationalities.",
+            "transit": "Istanbulkart (cash top-up) or contactless cards · taxis cash/app.",
+            "tips": []},
+    "SYD": {"cur": "AUD", "fx": "1 USD ≈ 1.5", "plug": "Type I",
+            "visa_family": "eVisa/ETA required in advance for most.",
+            "transit": "Opal: tap contactless Visa/Mastercard directly on trains/buses/ferries.",
+            "tips": ["Tap your own card — no Opal needed", "Airport train adds a fee"]},
+    "MEL": {"cur": "AUD", "fx": "1 USD ≈ 1.5", "plug": "Type I",
+            "visa_family": "eVisa/ETA required in advance for most.",
+            "transit": "Myki accepts contactless cards (or a Myki card).",
+            "tips": []},
+}
+
+
+def station_extra(iata):
+    """Extra crew-intel for a station (currency/plug/visa/transport/tips)."""
+    return STATION_EXTRAS.get(iata, {})
+
 def wx_label(code):
     if code == 0: return "☀️", "Clear"
     if code in (1,): return "🌤", "Mostly Clear"
@@ -2549,6 +2730,46 @@ def extension_minutes(split_rest_min=None, relief_rest_min=None, relief_type=Non
 
 CUMULATIVE_LIMITS = {"7d": 60 * 60, "14d": 105 * 60, "28d": 210 * 60}   # cabin crew 8.3.d
 CUMULATIVE_7D_SOFT = 65 * 60                                            # unforeseen-delay allowance
+
+
+def _duty_periods(rows):
+    """Countable periods for cumulative totals: flight duties + standby/duty in
+    full — exactly the source the dashboard's 7/14/28-day cumulative uses."""
+    periods = []
+    for du in build_duties(rows):
+        start, end = du["report"], du["chocks_on"]
+        if not isinstance(start, datetime) or not isinstance(end, datetime) or end <= start:
+            end = start + timedelta(minutes=1)
+        periods.append({"label": du["label"], "start": start, "end": end,
+                        "minutes": int((end - start).total_seconds() // 60)})
+    for r in rows:
+        if r["Type"] in ("STANDBY", "DUTY") and r.get("CIdt"):
+            s = r["CIdt"]
+            e = r.get("COdt") or s
+            if not isinstance(e, datetime) or e <= s:
+                e = s + timedelta(minutes=1)
+            periods.append({"label": (r.get("Code") or r["Type"]).strip(),
+                            "start": s, "end": e,
+                            "minutes": int((e - s).total_seconds() // 60)})
+    periods.sort(key=lambda p: p["start"])
+    return periods
+
+
+def _cumulative_max(periods):
+    """Max rolling 7/14/28-day duty minutes over the given periods."""
+    if not periods:
+        return {"7d": 0, "14d": 0, "28d": 0}
+    anchors = sorted({p["start"].date() for p in periods})
+    out = {}
+    for wkey, days in (("7d", 7), ("14d", 14), ("28d", 28)):
+        best = 0
+        for anchor in anchors:
+            lo = anchor - timedelta(days=days - 1)
+            total = sum(p["minutes"] for p in periods if lo <= p["start"].date() <= anchor)
+            if total > best:
+                best = total
+        out[wkey] = best
+    return out
 
 
 def standby_fdp_check(acclimatized, sectors, preceding_rest_h, band, sby_minutes, case_c):
@@ -4344,6 +4565,25 @@ else:
                         lt_html = f"{wx['local_time']} ({wx['gmt']})" if wx else "-"
                         gt_html = f"{lv['ground_hrs']} hrs" if lv["ground_hrs"] else "-"
                         spots_html = "".join(f"<span class='spot'>{s}</span>" for s in spots)
+                        ex = station_extra(lv["station"])
+                        ex_html = ""
+                        if ex:
+                            _rows_x = [f"<div class='bidrow'><span>🛂 You (crew)</span><span>{CREW_VISA_NOTE}</span></div>"]
+                            if ex.get("cur"):
+                                _rows_x.append(f"<div class='bidrow'><span>💱 Currency</span><span>{ex['cur']}"
+                                               + (f" · {ex['fx']}" if ex.get("fx") else "") + "</span></div>")
+                            if ex.get("plug"):
+                                _rows_x.append(f"<div class='bidrow'><span>🔌 Plug</span><span>{ex['plug']}</span></div>")
+                            if ex.get("visa_family"):
+                                _rows_x.append(f"<div class='bidrow'><span>🛂 Partners/family</span><span>{ex['visa_family']}</span></div>")
+                            if ex.get("transit"):
+                                _rows_x.append(f"<div class='bidrow'><span>🚇 Trains/buses · paying</span><span>{ex['transit']}</span></div>")
+                            tips = ex.get("tips") or []
+                            if tips:
+                                _rows_x.append(f"<div style='margin-top:4px;'><div class='muted' style='margin-bottom:4px;'>🧭 Crew tips</div>"
+                                               + "".join(f"<span class='spot'>{t}</span>" for t in tips) + "</div>")
+                            ex_html = (f"<div class='muted' style='margin:8px 0 4px;'>Crew info</div>"
+                                       + "".join(_rows_x))
                         st.markdown(
                             f"<div class='card' style='border-color:#00bcd4;'>"
                             f"<h5>🏨 Layover Intel: {city} ({lv['station']})" + (f" — {lv['date'].strftime('%d %b')}" if lv['date'] else "") + "</h5>"
@@ -4352,7 +4592,8 @@ else:
                             f"<div><div class='muted'>Weather (live)</div>{wx_html}</div>"
                             f"<div><div class='muted'>Local Time</div>{lt_html}</div>"
                             f"<div><div class='muted'>Ground Time</div>{gt_html}</div></div>"
-                            f"<div class='muted' style='margin-bottom:4px;'>Explore Spots</div>{spots_html}</div>",
+                            f"<div class='muted' style='margin-bottom:4px;'>Explore Spots</div>{spots_html}"
+                            + ex_html + "</div>",
                             unsafe_allow_html=True)
                 elif active_text:
                     st.info("No flights or layovers detected in this roster for Intel.")
@@ -5147,6 +5388,139 @@ else:
             "<div class='muted' style='margin-bottom:10px;'>Standalone Flight Duty Period calculator for "
             "<b>cabin crew</b> \u2014 FOM Part A Chapter 08. Enter all times in <b>Colombo (CMB) local time</b>. "
             "Max FDP = Table A/B value + 1:00 cabin-crew allowance (&sect;8.3.a).</div>", unsafe_allow_html=True)
+
+        # ============ ⏳ DELAY SIMULATOR (what-if on your live roster) ============
+        st.markdown("##### ⏳ Delay Simulator — what-if on your roster")
+        _sim_duties = build_duties(parsed_rows) if parsed_rows else []
+        if not _sim_duties:
+            st.info("Paste your roster on the Dashboard to unlock the delay simulator — pick any duty, slide its delay, and see the FDP, rest and cumulative ripple effects.")
+        else:
+            _sim_labels = [f"{du['label']} — {du['report']:%d %b %H:%M}" for du in _sim_duties]
+            _sc1, _sc2, _sc3 = st.columns([2.4, 1.2, 1.0])
+            with _sc1:
+                _sim_sel = st.selectbox("Duty to delay", list(range(len(_sim_duties))),
+                                        format_func=lambda i: _sim_labels[i], key="sim_duty")
+            with _sc2:
+                _sim_delay = st.slider("Delay (minutes)", 0, 480, 60, 15, key="sim_delay")
+            with _sc3:
+                _sim_tableb = st.checkbox("Not acclimatized (Table B)", value=False, key="sim_tableb")
+
+            _du = _sim_duties[_sim_sel]
+            _prev_du = _sim_duties[_sim_sel - 1] if _sim_sel > 0 else None
+            _next_du = _sim_duties[_sim_sel + 1] if _sim_sel + 1 < len(_sim_duties) else None
+            _n = _du["n"]
+            _dep0 = _du["sectors"][0]["dep"]
+            _co0 = _du["chocks_on"]
+            _acclim = not _sim_tableb
+
+            # preceding rest from the roster (previous duty's chocks-on)
+            _prev_rest_h = None
+            if _prev_du is not None:
+                _prev_rest_h = (_du["report"] - _prev_du["chocks_on"]).total_seconds() / 3600
+                if _prev_rest_h < 0:
+                    _prev_rest_h += 24
+
+            # band / max FDP — before and with delay (8.2.6 delayed reporting)
+            _band0 = fdp_band((_dep0 - timedelta(hours=1)).time())
+            _max0 = fdp_limit_min(_acclim, _band0, _n, _prev_rest_h)
+            if _sim_delay == 0:
+                _band_d, _delay_note = _band0, ""
+            else:
+                _band_d, _delay_note = apply_delay(_acclim, _n, _prev_rest_h, _dep0, _sim_delay)
+            _max_d = fdp_limit_min(_acclim, _band_d, _n, _prev_rest_h)
+
+            # FDP clock: <4h → starts at delayed report; ≥4h → 4h after original report
+            _fdp_start = (_du["report"] + timedelta(minutes=_sim_delay) if _sim_delay < 240
+                          else _du["report"] + timedelta(hours=4))
+            _co_d = _co0 + timedelta(minutes=_sim_delay)
+            _fdp0 = max(0, int((_co0 - _du["report"]).total_seconds() // 60))
+            _fdp_d = max(0, int((_co_d - _fdp_start).total_seconds() // 60))
+            _margin_d = _max_d - _fdp_d
+
+            # --- scenario card ---
+            _scn = (
+                f"<div class='bidrow'><span>Duty</span><span>{_du['label']} · {_n} sector(s)</span></div>"
+                f"<div class='bidrow'><span>Report</span><span>{_du['report']:%d %b %H:%M}"
+                + (f" → <b>{_fdp_start:%H:%M}</b>" if _sim_delay else "") + "</span></div>"
+                f"<div class='bidrow'><span>First dep</span><span>{_dep0:%d %b %H:%M}"
+                + (f" → <b>{(_dep0 + timedelta(minutes=_sim_delay)):%H:%M}</b>" if _sim_delay else "") + "</span></div>"
+                f"<div class='bidrow'><span>Final chocks-on</span><span>{_co0:%d %b %H:%M}"
+                + (f" → <b>{_co_d:%d %b %H:%M}</b>" if _sim_delay else "") + "</span></div>"
+                f"<div class='bidrow'><span>Band (dep − 1h)</span><span>{_band0}"
+                + (f" → <b>{_band_d}</b>" if _band_d != _band0 else "") + "</span></div>"
+            )
+            st.markdown(f"<div class='card'><h5>📋 Scenario</h5>{_scn}</div>", unsafe_allow_html=True)
+
+            # --- verdict ---
+            if _margin_d >= 0:
+                _vc_bg, _vc_bc, _vc_tc, _vc_icon = "#12301f", "#4caf50", "#a5d6a7", "\u2705"
+                _v_title, _v_sub = "WITHIN LIMITS", f"{_fmt_hm(_margin_d)} to spare"
+            else:
+                _vc_bg, _vc_bc, _vc_tc, _vc_icon = "#331414", "#ff1744", "#ff8a8a", "\u274c"
+                _v_title, _v_sub = "EXCEEDS MAX FDP", f"over by {_fmt_hm(-_margin_d)}"
+            _vrows = (
+                f"<div class='bidrow'><span>Max cabin FDP</span><span>{_fmt_hm(_max_d)}</span></div>"
+                f"<div class='bidrow'><span>Actual FDP</span><span>{_fmt_hm(_fdp0)}"
+                + (f" → <b>{_fmt_hm(_fdp_d)}</b>" if _sim_delay else "") + "</span></div>"
+                f"<div class='bidrow'><span>Latest allowed chocks-on</span><span>{(_fdp_start + timedelta(minutes=_max_d)):%d %b %H:%M}</span></div>"
+            )
+            st.markdown(
+                f"<div class='card' style='text-align:center;background:{_vc_bg};border:1px solid {_vc_bc};'>"
+                f"<div style='font-size:22px;'>{_vc_icon}</div>"
+                f"<div style='font-size:17px;font-weight:800;color:{_vc_tc};'>{_v_title}</div>"
+                f"<div class='muted'>{_v_sub}</div></div>"
+                f"<div class='card' style='margin-top:6px;'>{_vrows}</div>",
+                unsafe_allow_html=True)
+            if _delay_note:
+                st.markdown(f"<div class='card' style='font-size:12.5px;border-left:3px solid #ffc107;'>{_delay_note}</div>",
+                            unsafe_allow_html=True)
+
+            # --- rest ripple ---
+            _need_rest = max(_fdp_d / 60 - 1, 11.0)
+            _earliest_next = _co_d + timedelta(hours=_need_rest)
+            if _next_du is not None:
+                _gap = (_next_du["report"] - _co_d).total_seconds() / 3600
+                if _gap < 0:
+                    _gap += 24
+                _rest_ok = _gap >= _need_rest
+                _rr_c, _rr_t = ("#4caf50", "#a5d6a7") if _rest_ok else ("#ff5252", "#ff8a8a")
+                _rr_verdict = ("\u2705 rest met" if _rest_ok
+                               else f"\u274c short by {_fmt_hm(int((_need_rest - _gap) * 60))}")
+                _rest_txt = (f"Next duty <b>{_next_du['label']}</b> reports <b>{_next_du['report']:%d %b %H:%M}</b> "
+                             f"\u2192 rest available <b>{_fmt_hm(int(_gap * 60))}</b> \u00b7 "
+                             f"<span style='color:{_rr_t};border-bottom:1px solid {_rr_c};'>{_rr_verdict}</span>")
+            else:
+                _rest_txt = "No next duty in this roster — this is the last duty."
+            st.markdown(
+                f"<div class='card' style='font-size:12.5px;'><b style='color:#00bcd4;'>Rest ripple:</b> "
+                f"required after = max({_fmt_hm(_fdp_d)} \u2212 1h, 11h) = <b>{_fmt_hm(int(_need_rest * 60))}</b> \u00b7 "
+                f"earliest next check-in <b>{_earliest_next:%d %b %H:%M}</b><br>{_rest_txt}</div>",
+                unsafe_allow_html=True)
+
+            # --- cumulative ripple ---
+            _base_periods = _duty_periods(parsed_rows)
+            _before = _cumulative_max(_base_periods)
+            _after_periods = [dict(p) for p in _base_periods]
+            for _i, _p in enumerate(_after_periods):
+                if _p["label"] == _du["label"] and _p["start"] == _du["report"]:
+                    _after_periods[_i] = {"label": _du["label"], "start": _fdp_start,
+                                          "end": _co_d, "minutes": _fdp_d}
+                    break
+            _after = _cumulative_max(_after_periods)
+            _cum_rows = ""
+            for _wk, _cap, _cap_txt in (("7d", 60 * 60, "60 h"), ("14d", 105 * 60, "105 h"), ("28d", 210 * 60, "210 h")):
+                _b, _a = _before[_wk], _after[_wk]
+                _flag = ""
+                if _a > _cap:
+                    _flag = f" <span style='color:#ff8a8a;'>⚠️ over {_cap_txt}</span>"
+                _cum_rows += (f"<div class='bidrow'><span>{_wk.replace('d', '-day')} max (cap {_cap_txt})</span>"
+                              f"<span>{_fmt_hm(_b)}" + (f" → <b>{_fmt_hm(_a)}</b>{_flag}" if _a != _b else f"{_flag}") + "</span></div>")
+            st.markdown(
+                f"<div class='card'><h5>🔗 Cumulative ripple</h5>{_cum_rows}"
+                f"<div class='muted' style='font-size:11px;margin-top:4px;'>flight duties + standby counted in full "
+                f"(same as the Dashboard) \u00b7 the delayed duty is substituted at its delayed clock times.</div></div>",
+                unsafe_allow_html=True)
+            st.markdown("<hr style='border-color:#2a3b4d;margin:14px 0 10px;'>", unsafe_allow_html=True)
 
         lcol, rcol2 = st.columns([1, 1.15])
 
