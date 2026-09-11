@@ -3632,6 +3632,11 @@ _ADD_SBY_CODES = ["SB1", "SB2", "SB3", "SB4", "ASB", "LSB", "SSY"]
 # return flight (None on return legs), 'ret_day' = days after the outbound that
 # the return departs (0 = same-day turnaround, 1 = next-day).
 UL_DIRECT = {
+    # Times are TYPICAL scheduled local times (summer 2026 season), refreshed
+    # from live flight trackers 2026-09. Schedules shift seasonally, and the
+    # app ALWAYS prefers your own pasted roster's times when it has them — see
+    # _fill_flight_details. 'ret' = paired return, 'ret_day' = days after the
+    # outbound that the return departs (0 = same-day turnaround, 1 = next day).
     # --- Bangkok (BKK) ---
     "UL402": {"o": "CMB", "d": "BKK", "dep": "01:10", "arr": "06:15", "ac": "32B", "ret": "UL403", "ret_day": 0},
     "UL403": {"o": "BKK", "d": "CMB", "dep": "07:30", "arr": "09:05", "ac": "32B"},
@@ -3646,13 +3651,13 @@ UL_DIRECT = {
     "UL104": {"o": "MLE", "d": "CMB", "dep": "20:50", "arr": "21:50", "ac": "320"},
     # --- India: Chennai (MAA) ---
     "UL121": {"o": "CMB", "d": "MAA", "dep": "07:25", "arr": "08:50", "ac": "333", "ret": "UL122", "ret_day": 0},
-    "UL122": {"o": "MAA", "d": "CMB", "dep": "09:50", "arr": "11:15", "ac": "333"},
+    "UL122": {"o": "MAA", "d": "CMB", "dep": "10:50", "arr": "12:15", "ac": "333"},
     "UL123": {"o": "CMB", "d": "MAA", "dep": "18:45", "arr": "20:10", "ac": "320", "ret": "UL124", "ret_day": 0},
-    "UL124": {"o": "MAA", "d": "CMB", "dep": "21:10", "arr": "22:35", "ac": "320"},
+    "UL124": {"o": "MAA", "d": "CMB", "dep": "22:10", "arr": "23:35", "ac": "320"},
     "UL125": {"o": "CMB", "d": "MAA", "dep": "00:45", "arr": "02:10", "ac": "320", "ret": "UL126", "ret_day": 0},
     "UL126": {"o": "MAA", "d": "CMB", "dep": "03:10", "arr": "04:35", "ac": "320"},
     "UL127": {"o": "CMB", "d": "MAA", "dep": "13:40", "arr": "15:05", "ac": "320", "ret": "UL128", "ret_day": 0},
-    "UL128": {"o": "MAA", "d": "CMB", "dep": "16:05", "arr": "17:30", "ac": "320"},
+    "UL128": {"o": "MAA", "d": "CMB", "dep": "16:55", "arr": "18:20", "ac": "320"},
     # --- India: Mumbai (BOM) ---
     "UL141": {"o": "CMB", "d": "BOM", "dep": "23:40", "arr": "02:10", "ac": "320", "ret": "UL142", "ret_day": 1},
     "UL142": {"o": "BOM", "d": "CMB", "dep": "03:10", "arr": "05:40", "ac": "320"},
@@ -3678,10 +3683,10 @@ UL_DIRECT = {
     "UL266": {"o": "RUH", "d": "CMB", "dep": "22:30", "arr": "06:20", "co": "06:50", "ac": "333"},
     "UL225": {"o": "CMB", "d": "DXB", "dep": "18:30", "arr": "21:40", "ac": "332", "ret": "UL226", "ret_day": 0},
     "UL226": {"o": "DXB", "d": "CMB", "dep": "23:00", "arr": "05:00", "ac": "332"},
-    "UL229": {"o": "CMB", "d": "KWI", "dep": "17:10", "arr": "20:05", "ac": "320", "ret": "UL230", "ret_day": 0},
-    "UL230": {"o": "KWI", "d": "CMB", "dep": "21:05", "arr": "03:35", "ac": "320"},
-    "UL217": {"o": "CMB", "d": "DOH", "dep": "19:00", "arr": "21:30", "ac": "320", "ret": "UL218", "ret_day": 0},
-    "UL218": {"o": "DOH", "d": "CMB", "dep": "22:30", "arr": "05:00", "ac": "320"},
+    "UL229": {"o": "CMB", "d": "KWI", "dep": "18:15", "arr": "21:15", "ac": "32B", "ret": "UL230", "ret_day": 0},
+    "UL230": {"o": "KWI", "d": "CMB", "dep": "22:15", "arr": "04:45", "ac": "32B"},
+    "UL217": {"o": "CMB", "d": "DOH", "dep": "18:40", "arr": "21:15", "ac": "321", "ret": "UL218", "ret_day": 0},
+    "UL218": {"o": "DOH", "d": "CMB", "dep": "22:15", "arr": "05:00", "ac": "321"},
     "UL215": {"o": "CMB", "d": "BAH", "dep": "18:50", "arr": "21:40", "ac": "320", "ret": "UL216", "ret_day": 0},
     "UL216": {"o": "BAH", "d": "CMB", "dep": "22:40", "arr": "05:20", "ac": "320"},
     "UL205": {"o": "CMB", "d": "MCT", "dep": "18:40", "arr": "21:40", "ac": "320", "ret": "UL206", "ret_day": 0},
@@ -3691,29 +3696,29 @@ UL_DIRECT = {
     # --- East Asia ---
     "UL470": {"o": "CMB", "d": "ICN", "dep": "19:50", "arr": "07:35", "co": "08:05", "ac": "332", "ret": "UL471", "ret_day": 1},
     "UL471": {"o": "ICN", "d": "CMB", "dep": "12:20", "arr": "17:00", "co": "17:30", "ac": "333"},
-    "UL454": {"o": "CMB", "d": "NRT", "dep": "19:35", "arr": "08:30", "ac": "332", "ret": "UL455", "ret_day": 1},
-    "UL455": {"o": "NRT", "d": "CMB", "dep": "11:30", "arr": "16:30", "ac": "332"},
+    "UL454": {"o": "CMB", "d": "NRT", "dep": "19:50", "arr": "08:10", "ac": "333", "ret": "UL455", "ret_day": 1},
+    "UL455": {"o": "NRT", "d": "CMB", "dep": "11:30", "arr": "16:30", "ac": "333"},
     # --- China ---
     "UL891": {"o": "CMB", "d": "HKG", "dep": "18:10", "arr": "02:20", "ac": "332", "ret": "UL892", "ret_day": 1},
     "UL892": {"o": "HKG", "d": "CMB", "dep": "03:20", "arr": "05:50", "ac": "332"},
-    "UL880": {"o": "CMB", "d": "CAN", "dep": "22:30", "arr": "06:40", "ac": "332", "ret": "UL881", "ret_day": 1},
-    "UL881": {"o": "CAN", "d": "CMB", "dep": "07:40", "arr": "10:20", "ac": "332"},
-    "UL866": {"o": "CMB", "d": "PVG", "dep": "19:30", "arr": "05:00", "ac": "332", "ret": "UL867", "ret_day": 1},
-    "UL867": {"o": "PVG", "d": "CMB", "dep": "06:00", "arr": "10:20", "ac": "332"},
+    "UL880": {"o": "CMB", "d": "CAN", "dep": "14:00", "arr": "22:30", "ac": "32N", "ret": "UL881", "ret_day": 1},
+    "UL881": {"o": "CAN", "d": "CMB", "dep": "04:25", "arr": "07:30", "ac": "333"},
+    "UL866": {"o": "CMB", "d": "PVG", "dep": "14:15", "arr": "23:50", "ac": "332", "ret": "UL867", "ret_day": 1},
+    "UL867": {"o": "PVG", "d": "CMB", "dep": "01:20", "arr": "05:40", "ac": "332"},
     "UL868": {"o": "CMB", "d": "PEK", "dep": "19:00", "arr": "05:10", "ac": "332", "ret": "UL869", "ret_day": 1},
     "UL869": {"o": "PEK", "d": "CMB", "dep": "06:10", "arr": "10:30", "ac": "332"},
     # --- Southeast Asia ---
     "UL306": {"o": "CMB", "d": "SIN", "dep": "01:50", "arr": "08:30", "ac": "320", "ret": "UL307", "ret_day": 0},
     "UL307": {"o": "SIN", "d": "CMB", "dep": "09:45", "arr": "11:15", "ac": "320"},
-    "UL314": {"o": "CMB", "d": "KUL", "dep": "08:05", "arr": "14:35", "ac": "320", "ret": "UL315", "ret_day": 0},
-    "UL315": {"o": "KUL", "d": "CMB", "dep": "15:35", "arr": "18:05", "ac": "320"},
-    "UL318": {"o": "CMB", "d": "KUL", "dep": "01:00", "arr": "07:20", "ac": "320", "ret": "UL319", "ret_day": 0},
-    "UL319": {"o": "KUL", "d": "CMB", "dep": "08:20", "arr": "10:50", "ac": "320"},
-    "UL364": {"o": "CMB", "d": "CGK", "dep": "08:05", "arr": "14:15", "ac": "320", "ret": "UL365", "ret_day": 0},
-    "UL365": {"o": "CGK", "d": "CMB", "dep": "15:15", "arr": "19:25", "ac": "320"},
+    "UL314": {"o": "CMB", "d": "KUL", "dep": "07:40", "arr": "13:55", "ac": "320", "ret": "UL315", "ret_day": 0},
+    "UL315": {"o": "KUL", "d": "CMB", "dep": "15:00", "arr": "16:00", "ac": "320"},
+    "UL318": {"o": "CMB", "d": "KUL", "dep": "19:35", "arr": "23:20", "ac": "320", "ret": "UL319", "ret_day": 1},
+    "UL319": {"o": "KUL", "d": "CMB", "dep": "09:15", "arr": "10:45", "ac": "320"},
+    "UL364": {"o": "CMB", "d": "CGK", "dep": "07:20", "arr": "13:30", "ac": "321", "ret": "UL365", "ret_day": 0},
+    "UL365": {"o": "CGK", "d": "CMB", "dep": "14:25", "arr": "17:30", "ac": "320"},
     # --- South Asia ---
-    "UL189": {"o": "CMB", "d": "DAC", "dep": "07:50", "arr": "11:40", "ac": "320", "ret": "UL190", "ret_day": 0},
-    "UL190": {"o": "DAC", "d": "CMB", "dep": "12:40", "arr": "14:50", "ac": "320"},
+    "UL189": {"o": "CMB", "d": "DAC", "dep": "07:45", "arr": "11:30", "ac": "320", "ret": "UL190", "ret_day": 0},
+    "UL190": {"o": "DAC", "d": "CMB", "dep": "12:55", "arr": "15:40", "ac": "332"},
     "UL181": {"o": "CMB", "d": "KTM", "dep": "07:30", "arr": "11:15", "ac": "320", "ret": "UL182", "ret_day": 0},
     "UL182": {"o": "KTM", "d": "CMB", "dep": "13:15", "arr": "17:05", "ac": "320"},
     "UL185": {"o": "CMB", "d": "LHE", "dep": "13:50", "arr": "17:15", "ac": "320", "ret": "UL186", "ret_day": 0},
@@ -3727,7 +3732,7 @@ UL_DIRECT = {
     "UL554": {"o": "FRA", "d": "CMB", "dep": "09:00", "arr": "22:30", "ac": "333"},
     "UL604": {"o": "CMB", "d": "MEL", "dep": "00:20", "arr": "14:40", "ac": "333", "ret": "UL605", "ret_day": 1},
     "UL605": {"o": "MEL", "d": "CMB", "dep": "16:10", "arr": "22:00", "ac": "333"},
-    "UL606": {"o": "CMB", "d": "SYD", "dep": "00:30", "arr": "16:00", "ac": "333", "ret": "UL607", "ret_day": 1},
+    "UL606": {"o": "CMB", "d": "SYD", "dep": "00:05", "arr": "14:40", "ac": "333", "ret": "UL607", "ret_day": 1},
     "UL607": {"o": "SYD", "d": "CMB", "dep": "17:30", "arr": "23:30", "ac": "333"},
 }
 
@@ -3984,13 +3989,59 @@ def _undo_last():
     st.rerun()
 
 
+def _roster_flight_times():
+    """Actual times per flight number from the CURRENT roster — authoritative
+    over the static database (your published roster is always right)."""
+    out = {}
+    text = st.session_state.get('current_roster', '')
+    if not text:
+        return out
+    try:
+        for r in parse_roster_text(text):
+            code = r.get('Code')
+            if r.get('Type') != 'FLIGHT' or not re.fullmatch(r'UL\d{1,4}', code or ''):
+                continue
+            o, d = _route_od(r.get('Route'))
+            entry = {'o': o or 'CMB', 'd': d or ''}
+            for k, src in (('dep', 'DEPdt'), ('arr', 'ARRdt'), ('co', 'COdt')):
+                v = r.get(src)
+                entry[k] = v.strftime('%H:%M') if isinstance(v, datetime) else ''
+            ac = r.get('Aircraft')
+            entry['ac'] = ac if ac not in (None, '-', '') else ''
+            out.setdefault(code, entry)   # first occurrence = outbound leg
+    except Exception:
+        pass
+    return out
+
+
+def _flight_info(fl):
+    """DB entry for `fl` with the current roster's actual times overlaid."""
+    if not re.fullmatch(r'UL\d{1,4}', fl):
+        return None
+    info = UL_DIRECT.get(fl)
+    r = _roster_flight_times().get(fl)
+    if not info and not r:
+        return None
+    m = dict(info) if info else {}
+    if r:
+        for k in ('o', 'd', 'dep', 'arr', 'co', 'ac'):
+            if r.get(k):
+                m[k] = r[k]
+    if not m:
+        return None
+    m.setdefault('o', 'CMB')
+    m.setdefault('d', '')
+    return m
+
+
 def _fill_flight_details():
-    """Autofill the add-flight form from the UL direct-flights database."""
+    """Autofill the add-flight form from the direct-flights database, with the
+    current roster's actual times taking priority (they're always right)."""
     fl = (st.session_state.get('cedit_a_flt') or '').replace(' ', '').upper()
     if not re.fullmatch(r'UL\d{1,4}', fl):
         st.warning("Type a UL flight number first (e.g. UL404).")
         return
-    info = UL_DIRECT.get(fl)
+    info = _flight_info(fl)
     if not info:
         st.warning(f"{fl} isn't in the flight database — fill the details manually.")
         # clear any stale turnaround state from a previous fill
@@ -4000,6 +4051,7 @@ def _fill_flight_details():
         st.session_state['cedit_a_rarr'] = ''
         st.session_state['cedit_a_rco'] = ''
         return
+    from_roster = fl in _roster_flight_times()
     st.session_state['cedit_a_o'] = info.get('o', 'CMB')
     st.session_state['cedit_a_d'] = info.get('d', '')
     st.session_state['cedit_a_ci'] = ''
@@ -4009,22 +4061,24 @@ def _fill_flight_details():
     st.session_state['cedit_a_ac'] = info.get('ac', '')
     ret = info.get('ret')
     if ret and ret in UL_DIRECT:
-        ri = UL_DIRECT[ret]
+        ri = _flight_info(ret) if ret in _roster_flight_times() else UL_DIRECT[ret]
         st.session_state['cedit_a_ret'] = ret
         st.session_state['cedit_a_rdep'] = ri.get('dep', '')
         st.session_state['cedit_a_rarr'] = ri.get('arr', '')
         st.session_state['cedit_a_rco'] = ri.get('co', '')
         st.session_state['cedit_a_retday'] = int(info.get('ret_day', 0) or 0)
         st.session_state['cedit_a_turn'] = True
+        src = "your roster" if from_roster else "flight database"
         st.success(f"Filled {fl}: {info['o']}→{info['d']} {info.get('dep','')}–{info.get('arr','')}"
-                   f" · return {ret} {'next day' if info.get('ret_day') else 'same day'}")
+                   f" · return {ret} {'next day' if info.get('ret_day') else 'same day'} · from {src}")
     else:
         st.session_state['cedit_a_ret'] = ''
         st.session_state['cedit_a_rdep'] = ''
         st.session_state['cedit_a_rarr'] = ''
         st.session_state['cedit_a_rco'] = ''
         st.session_state['cedit_a_turn'] = False
-        st.success(f"Filled {fl}: {info['o']}→{info['d']} {info.get('dep','')}–{info.get('arr','')}")
+        src = "your roster" if from_roster else "flight database"
+        st.success(f"Filled {fl}: {info['o']}→{info['d']} {info.get('dep','')}–{info.get('arr','')} · from {src}")
 
 
 def _commit_roster_change(new_rows):
@@ -4172,11 +4226,13 @@ def _render_duty_add_form(rows, day):
                          help="Autofill origin/destination/times from the SriLankan direct-flights database"):
                 _fill_flight_details()
         with _f1:
-            _info = UL_DIRECT.get(_fl)
+            _info = _flight_info(_fl)
+            _from_roster = _fl in _roster_flight_times()
             if _info:
                 st.caption("✓ " + _fl + " · " + _info.get("o", "") + "→" + _info.get("d", "")
                            + " · " + _info.get("dep", "—") + "–" + _info.get("arr", "—")
-                           + (" · return " + _info["ret"] + (" (next day)" if _info.get("ret_day") else "") if _info.get("ret") else ""))
+                           + (" · return " + _info["ret"] + (" (next day)" if _info.get("ret_day") else "") if _info.get("ret") else "")
+                           + (" · " + ("your roster" if _from_roster else "flight database")))
             elif _fl:
                 st.caption("Not in the database — enter details manually below.")
             else:
