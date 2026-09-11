@@ -5347,6 +5347,132 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# ===== Chocks On brand skin (items 1–7): theme, widgets, alerts, login card, accents =====
+_BG_FLIGHTPATH = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800">'
+    '<path d="M-40,660 C 260,540 500,580 780,430" stroke="#0FB5AE" stroke-width="2" fill="none" stroke-dasharray="0.1 12" opacity="0.30"/>'
+    '<circle cx="780" cy="430" r="5" fill="#0FB5AE" opacity="0.30"/>'
+    '<path d="M1240,140 C 1100,170 1020,170 900,150" stroke="#0FB5AE" stroke-width="2" fill="none" stroke-dasharray="0.1 12" opacity="0.20"/>'
+    '<circle cx="900" cy="150" r="5" fill="#0FB5AE" opacity="0.20"/>'
+    '</svg>'
+)
+_BRAND_SKIN_CSS = """
+/* 1 · theme colours + flight-path backdrop */
+.stApp { background-color: #0B1F33; }
+[data-testid="stAppViewContainer"] {
+    background-color: #0B1F33;
+    background-image: url("__BG_URI__");
+    background-repeat: no-repeat;
+    background-position: 100% 0;
+    background-size: 46%;
+    background-attachment: fixed;
+}
+[data-testid="stHeader"] { background: rgba(10,21,38,.92); }
+.card, .spot, .cal-cell { background: #0F1A2A !important; border: 1px solid #1F3348 !important; }
+.cal-today { border-color: #0FB5AE !important; box-shadow: 0 0 0 1px #0FB5AE inset !important; }
+.bidrow { border-bottom: 1px solid #1F3348; }
+.hbar { background: #12202F; border: 1px solid #2A4058; border-left: 3px solid #0FB5AE; }
+.avatar { background: #0D3340; color: #35C7C0; }
+
+/* 2 · buttons — form-submit actions are the primary actions (teal gradient);
+   plain st.button() is secondary (ghost teal) */
+button[kind="primary"], button[kind="primaryFormSubmit"], button[kind="secondaryFormSubmit"],
+[data-testid="stBaseButton-primary"], [data-testid="stBaseButton-primaryFormSubmit"],
+[data-testid="stBaseButton-secondaryFormSubmit"] {
+    background: linear-gradient(180deg, #0FB5AE, #0A7E7A) !important;
+    color: #04201F !important;
+    font-weight: 700 !important;
+    font-family: 'Montserrat', 'Inter', sans-serif !important;
+    letter-spacing: 1px;
+    border: none !important;
+    border-radius: 9px !important;
+}
+button[kind="primary"]:hover, button[kind="primaryFormSubmit"]:hover, button[kind="secondaryFormSubmit"]:hover,
+[data-testid="stBaseButton-primary"]:hover, [data-testid="stBaseButton-primaryFormSubmit"]:hover,
+[data-testid="stBaseButton-secondaryFormSubmit"]:hover {
+    background: linear-gradient(180deg, #13C7BF, #0B8F8A) !important;
+    color: #04201F !important;
+}
+button[kind="primary"] p, button[kind="primaryFormSubmit"] p, button[kind="secondaryFormSubmit"] p { color: #04201F !important; }
+button[kind="secondary"] p { color: #35C7C0 !important; }
+button[kind="secondary"]:hover p { color: #4DE3DC !important; }
+button[kind="secondary"], [data-testid="stBaseButton-secondary"] {
+    background: transparent !important;
+    color: #35C7C0 !important;
+    border: 1px solid #2A4058 !important;
+    border-radius: 9px !important;
+}
+button[kind="secondary"]:hover, [data-testid="stBaseButton-secondary"]:hover {
+    border-color: #0FB5AE !important;
+    color: #4DE3DC !important;
+    background: rgba(15,181,174,.08) !important;
+}
+
+/* inputs */
+[data-testid="stTextInputField"], [data-testid="stNumberInputField"],
+[data-testid="stDateInputField"], [data-testid="stTextArea"] textarea {
+    background-color: #0A1526 !important;
+    border: 1px solid #2A4058 !important;
+    border-radius: 9px !important;
+    color: #E8EEF7 !important;
+}
+[data-testid="stTextInputField"]:focus, [data-testid="stNumberInputField"]:focus,
+[data-testid="stDateInputField"]:focus, [data-testid="stTextArea"] textarea:focus {
+    border-color: #0FB5AE !important;
+    box-shadow: 0 0 0 3px rgba(15,181,174,.18) !important;
+}
+[data-testid="stSelectbox"] input { color: #E8EEF7 !important; }
+[data-testid="stCheckbox"] label[data-selected="true"] > div:first-of-type {
+    background: #0FB5AE !important;
+    border-color: #0FB5AE !important;
+}
+[data-testid="stSlider"] [role="slider"] {
+    background: #0FB5AE !important;
+    border-color: #0FB5AE !important;
+}
+
+/* 3 · alert banners */
+[data-testid="stAlertContainer"] { border-radius: 10px; border: 1px solid; }
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentSuccess"]) { background: #0E2A26; border-color: #1E5B54; }
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentInfo"]) { background: #0C2530; border-color: #1F5A6E; }
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentWarning"]) { background: #2C240E; border-color: #6E5A1F; }
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentError"]) { background: #331419; border-color: #7A2530; }
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentSuccess"]) p { color: #A9E3DD !important; }
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentInfo"]) p { color: #A9D9E8 !important; }
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentWarning"]) p { color: #F0D489 !important; }
+[data-testid="stAlertContainer"]:has([data-testid="stAlertContentError"]) p { color: #F0A3A8 !important; }
+
+/* 4 · login card (login = the 2-tab group, never the 4-tab main group) */
+[data-testid="stTabs"]:not(:has([data-testid="stTab"][data-key="3"])) [data-testid="stTabPanel"] {
+    background: linear-gradient(180deg, #12202F 0%, #0B1F33 100%);
+    border: 1px solid #2A4058;
+    border-radius: 16px;
+    padding: 26px 24px;
+    box-shadow: 0 24px 60px rgba(0,0,0,.45);
+}
+[data-testid="stTabs"]:not(:has([data-testid="stTab"][data-key="3"])) [data-testid="stForm"] { border: none; }
+
+/* 5 · header accent + active tab underline */
+[data-testid="stTabs"]:has([data-testid="stTab"][data-key="3"]) [data-testid="stTab"] { border-radius: 9px 9px 0 0; }
+[data-testid="stTabs"]:has([data-testid="stTab"][data-key="3"]) [data-testid="stTab"]:hover { background: rgba(15,181,174,.06); }
+[data-testid="stTabs"]:has([data-testid="stTab"][data-key="3"]) [data-testid="stTab"][data-selected="true"] {
+    border-bottom: 2px solid #F0A93B;
+    background: rgba(15,181,174,.06);
+}
+[data-testid="stTabs"]:has([data-testid="stTab"][data-key="3"]) [data-testid="stTab"][data-selected="true"] p { color: #E8EEF7 !important; }
+
+/* 7 · scrollbar */
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: #0B1F33; }
+::-webkit-scrollbar-thumb { background: #1F3348; border-radius: 8px; }
+::-webkit-scrollbar-thumb:hover { background: #0FB5AE; }
+* { scrollbar-width: thin; scrollbar-color: #1F3348 #0B1F33; }
+
+/* tidy: hide the Streamlit "Deploy" button (Cloud-only noise) */
+[data-testid="stAppDeployButton"] { display: none; }
+""".replace("__BG_URI__", _svg_uri(_BG_FLIGHTPATH))
+st.markdown(f"<style>{_BRAND_SKIN_CSS}</style>", unsafe_allow_html=True)
+
 if 'logged_in' not in st.session_state:
     st.session_state['logged_in'] = False
     st.session_state['username'] = ''
