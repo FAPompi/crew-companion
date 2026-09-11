@@ -2675,6 +2675,34 @@ def fdp_limit_min(acclimatized, band, sectors, preceding_rest_h=None):
     return row[sectors - 1] + 60
 
 
+def _fdp_engine(acclimatized, sectors, preceding_rest_h, report_dt, dep_dt, chocks_on_dt, delay_min=0):
+    """Single source of truth for the delayed-reporting FDP math (8.2.6).
+
+    Used by BOTH the Delay Simulator (roster what-if) and the standalone FDP
+    calculator so the two can never disagree for identical duty/delay inputs.
+    Returns a dict with the before/after band, max FDP, actual FDP, margins,
+    the FDP-clock start time and the delayed-reporting note.
+    """
+    band0 = fdp_band((dep_dt - timedelta(hours=1)).time())
+    max0 = fdp_limit_min(acclimatized, band0, sectors, preceding_rest_h)
+    fdp0 = max(0, int((chocks_on_dt - report_dt).total_seconds() // 60))
+    if delay_min:
+        band_d, delay_note = apply_delay(acclimatized, sectors, preceding_rest_h, dep_dt, delay_min)
+        # FDP clock: <4h → starts at the delayed report; ≥4h → 4h after original report
+        fdp_start = report_dt + (timedelta(minutes=delay_min) if delay_min < 240 else timedelta(hours=4))
+        co_d = chocks_on_dt + timedelta(minutes=delay_min)
+        max_d = fdp_limit_min(acclimatized, band_d, sectors, preceding_rest_h)
+        fdp_d = max(0, int((co_d - fdp_start).total_seconds() // 60))
+    else:
+        band_d, delay_note, max_d, fdp_d, fdp_start = band0, "", max0, fdp0, report_dt
+    return {
+        "band0": band0, "max0": max0, "fdp0": fdp0, "margin0": max0 - fdp0,
+        "band_d": band_d, "max_d": max_d, "fdp_d": fdp_d, "margin_d": max_d - fdp_d,
+        "fdp_start": fdp_start, "delay_note": delay_note,
+        "latest_co": fdp_start + timedelta(minutes=max_d),
+    }
+
+
 def _count_local_nights(start_dt, end_dt):
     """Count consecutive local nights at base between start_dt (on the ground,
     e.g. arrival) and end_dt (next duty start, e.g. check-in). FOM definition:
@@ -3595,7 +3623,8 @@ def build_calendar_html(rows, span=None):
         d += timedelta(days=1)
     cells.append("</div>")
     legend = (
-        "<div style='margin-top:8px;font-size:11px;color:#7e8ba0;'>"
+        "<details style='margin-top:8px;font-size:11px;color:#7e8ba0;'>"
+        "<summary style='cursor:pointer;color:#9fb3c8;font-size:11.5px;user-select:none;'>📖 Legend — tap to expand</summary>"
         "<span class='chip chip-off-mand' style='display:inline-block;margin:0 4px 0 0;'>🔴 OFF · MAND</span>"
         "= required by §8.2.17 (7-day duty cap / 2-off-in-14 / 7-off-in-28) &nbsp;·&nbsp; "
         "<span class='chip chip-off' style='display:inline-block;margin:0 4px 0 0;'>🟢 OFF</span>"
@@ -3609,7 +3638,7 @@ def build_calendar_html(rows, span=None):
         "<span class='chip chip-duty' style='display:inline-block;margin:0 4px 0 0;'>📚 code</span>"
         "= training / ground duty &nbsp;·&nbsp; "
         "<span class='chip chip-tof' style='display:inline-block;margin:0 4px 0 0;'>🕓 TOF</span>"
-        "= time off (no check-in/check-out allowed in the window)</div>")
+        "= time off (no check-in/check-out allowed in the window)</details>")
     return "".join(cells) + legend
 
 
@@ -4379,9 +4408,8 @@ def _render_duty_add_form(rows, day):
         _lay = LAYOVER_TRIPS.get(_fl)
         _f1, _f2 = st.columns([2.6, 1])
         with _f2:
-            if st.button("🔍 Fill from DB", key="cedit_fill_btn", use_container_width=True,
-                         help="Autofill origin/destination/times/check-in/check-out from the flight database"):
-                _fill_flight_details(day)
+            _do_fill = st.button("🔍 Fill from DB", key="cedit_fill_btn", use_container_width=True,
+                                 help="Autofill origin/destination/times/check-in/check-out from the flight database")
         with _f1:
             _info = _flight_info(_fl)
             _from_roster = _fl in _roster_flight_times()
@@ -4403,6 +4431,10 @@ def _render_duty_add_form(rows, day):
                 st.caption("Not in the database — enter details manually below.")
             else:
                 st.caption("Type a flight number, then press Enter or 🔍 Fill from DB — or enter details manually.")
+        if _do_fill:
+            # Called OUTSIDE the narrow button column so the fill confirmation
+            # banner renders full-width instead of wrapping inside it.
+            _fill_flight_details(day)
         if _lay:
             turn = st.checkbox("🏨 Add full layover trip (outbound + hotel + return · clears those days)",
                                key="cedit_a_turn")
@@ -4547,7 +4579,11 @@ def _render_duty_add_form(rows, day):
                 else:
                     row = build_duty_row(day, "STANDBY", _sby_code, ci=_parse_hm(s0), dep=_parse_hm(s0),
                                          arr=_parse_hm(s1), co=_parse_hm(s1))
-                    kept, removed = _remove_conflicts(rows, row)
+                    # A standby takes over every date it covers — clear the
+                    # whole of each such day (the user can re-add a later duty
+                    # manually if they choose to fly on minimum rest).
+                    _end = row['COdt'].date() if isinstance(row.get('COdt'), datetime) else day
+                    kept, removed = _remove_days(rows, day, max(_end, day))
                     note = None
                     if removed:
                         note = ("⏱ " + _sby_code + " added (" + row['Departure'] + "–"
@@ -5713,7 +5749,11 @@ else:
 
             # Flight & Layover Intel — grouped: each layover trip is ONE entry
             # (inbound + 🏨 + outbound); standalone turnarounds get their own entry.
-            if viewing_past:
+            # Hidden while editing the calendar — Roster Guardian below keeps
+            # flagging any violations during the edit.
+            if st.session_state.get('edit_mode') and _edit_ok:
+                pass
+            elif viewing_past:
                 st.markdown(_current_only_note("Flight & layover intel"), unsafe_allow_html=True)
             else:
                 _duties = build_duties(parsed_rows)
@@ -5878,132 +5918,135 @@ else:
                         """)
             # ---------- RIGHT: AGENT ALERTS + BIDDING ----------
         with right_col:
-            st.markdown("#### Flight Monitoring Agent")
-            if viewing_past:
-                st.markdown(_current_only_note("Live flight monitoring"), unsafe_allow_html=True)
+            if st.session_state.get('edit_mode') and _edit_ok:
+                st.markdown("<div class='muted' style='font-size:12px;padding-top:4px;'>✏️ Flight Monitoring Agent is paused while you're editing the calendar.</div>", unsafe_allow_html=True)
             else:
-                agent_on = st.toggle("Agent: Real-Time Flight Monitor", value=True)
-
-                available_roster_dates = sorted(set(valid_dates_all))
-                if available_roster_dates:
-                    real_today = datetime.now().date()
-                    if real_today in available_roster_dates:
-                        default_idx = available_roster_dates.index(real_today)
-                    else:
-                        future = [d for d in available_roster_dates if d >= real_today]
-                        default_idx = available_roster_dates.index(future[0]) if future else len(available_roster_dates) - 1
-                    simulated_today = st.selectbox(
-                        "Roster anchor day (auto-set to today):",
-                        options=available_roster_dates, index=default_idx,
-                        format_func=lambda x: x.strftime("%d %b %Y") + ("  ← today" if x == real_today else ""))
+                st.markdown("#### Flight Monitoring Agent")
+                if viewing_past:
+                    st.markdown(_current_only_note("Live flight monitoring"), unsafe_allow_html=True)
                 else:
-                    simulated_today = datetime.now().date()
-                simulated_tomorrow = simulated_today + timedelta(days=1)
+                    agent_on = st.toggle("Agent: Real-Time Flight Monitor", value=True)
 
-                active_target_flights, seen = [], set()
-                for row in parsed_rows:
-                    if row["Type"] == "FLIGHT" and row["DateObj"] is not None:
-                        fd = row["DateObj"].date()
-                        if fd in [simulated_today, simulated_tomorrow]:
-                            key = (row["Flight / Code"], fd)
-                            if key in seen:
-                                continue
-                            seen.add(key)
-                            active_target_flights.append({"flight_no": row["Flight / Code"], "date_obj": fd,
-                                                          "route": row["Route"], "dep_time": row["Departure"]})
-
-                flight_check_results = []
-                if agent_on and active_target_flights:
-                    with st.spinner("Querying FlightStats & Flightradar24 live feeds..."):
-                        for flight in active_target_flights:
-                            telemetry = fetch_live_flight_telemetry(flight["flight_no"], flight["date_obj"],
-                                                                    flight["route"], flight["dep_time"])
-                            # FDP & rest impact for delayed/diverted flights
-                            impact_note = None
-                            if telemetry.get("severity") in ("delayed", "diverted"):
-                                delay_guess = None
-                                m = re.search(r'by ~(\d+) min', telemetry.get("status_message", ""))
-                                if m:
-                                    delay_guess = int(m.group(1))
-                                impact_note = delay_impact_note(parsed_rows, flight["flight_no"],
-                                                                flight["date_obj"], delay_guess or 0)
-                            # Cancellation → soft standby suggestion (roster unchanged)
-                            sb_suggest = None
-                            if telemetry.get("severity") == "cancelled":
-                                frow = next((r for r in parsed_rows
-                                             if r["Type"] == "FLIGHT" and r.get("DateObj")
-                                             and r["DateObj"].date() == flight["date_obj"]
-                                             and str(r["Flight / Code"]).replace(" ", "") == str(flight["flight_no"]).replace(" ", "")), None)
-                                if frow:
-                                    sb_suggest = suggest_standby_for_cancel(frow)
-                            flight_check_results.append({"flight": flight["flight_no"], "route": flight["route"],
-                                                         "date": flight["date_obj"].strftime("%d %b %Y"),
-                                                         "delayed": telemetry["is_delayed"],
-                                                         "severity": telemetry.get("severity", "ok"),
-                                                         "status": telemetry["status_message"],
-                                                         "inbound_note": telemetry.get("inbound_note"),
-                                                         "inbound_risk": telemetry.get("inbound_risk", False),
-                                                         "impact_note": impact_note,
-                                                         "sb_suggest": sb_suggest})
-                st.session_state['alert_count'] = sum(
-                    1 for f in flight_check_results
-                    if (f["severity"] in ("delayed", "cancelled", "diverted") or f["inbound_risk"])
-                    and (f["flight"], f["date"]) not in st.session_state['acked'])
-
-                if not agent_on:
-                    st.markdown("<div class='card muted'>Real-time monitor paused.</div>", unsafe_allow_html=True)
-                elif flight_check_results:
-                    st.markdown(
-                        f"<div class='card' style='font-size:12px;'><b style='color:#00bcd4;'>Agent Scan:</b> "
-                        f"Verified {len(flight_check_results)} flight(s) via FlightStats/Cirium + FR24 (keyless, cached 10 min).</div>",
-                        unsafe_allow_html=True)
-                    for df in flight_check_results:
-                        key = (df["flight"], df["date"])
-                        acked = key in st.session_state['acked']
-                        if df["severity"] == "cancelled":
-                            bc, bg, tc, icon = "#ff1744", "#331414", "#ff8a8a", "🚫"
-                        elif df["severity"] == "diverted":
-                            bc, bg, tc, icon = "#ff6d00", "#332414", "#ffb74d", "🔀"
-                        elif df["severity"] == "delayed":
-                            bc, bg, tc, icon = "#ff5252", "#2c1f1f", "#ff8a8a", "⚠️"
-                        elif df["severity"] == "unknown":
-                            bc, bg, tc, icon = "#607d8b", "#1c2429", "#b0bec5", "ℹ️"
+                    available_roster_dates = sorted(set(valid_dates_all))
+                    if available_roster_dates:
+                        real_today = datetime.now().date()
+                        if real_today in available_roster_dates:
+                            default_idx = available_roster_dates.index(real_today)
                         else:
-                            bc, bg, tc, icon = "#4caf50", "#12301f", "#a5d6a7", "✈️"
-                        op = "opacity:.5;" if acked else ""
-                        extra = ""
-                        if df.get("inbound_note"):
-                            inb_bc = "#ff6d00" if df["inbound_risk"] else "#ffc107"
-                            extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#2b2413;"
-                                      f"border:1px solid {inb_bc};color:#ffd54f;font-size:11.5px;'>{df['inbound_note']}</div>")
-                        if df.get("impact_note"):
-                            impact_bad = ("⚠️" in df["impact_note"]) or ("BELOW" in df["impact_note"])
-                            r_bc = "#ff5252" if impact_bad else "#4caf50"
-                            r_tc = "#ff8a8a" if impact_bad else "#a5d6a7"
-                            extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#131f2b;"
-                                      f"border:1px solid {r_bc};color:{r_tc};font-size:11.5px;'>{df['impact_note']}</div>")
-                        if df.get("sb_suggest"):
-                            extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#2b2413;"
-                                      f"border:1px solid #ffc107;color:#ffd54f;font-size:11.5px;'>"
-                                      f"📋 Soft suggestion (roster unchanged): if cancelled, insert <b>{df['sb_suggest']}</b> standby.</div>")
+                            future = [d for d in available_roster_dates if d >= real_today]
+                            default_idx = available_roster_dates.index(future[0]) if future else len(available_roster_dates) - 1
+                        simulated_today = st.selectbox(
+                            "Roster anchor day (auto-set to today):",
+                            options=available_roster_dates, index=default_idx,
+                            format_func=lambda x: x.strftime("%d %b %Y") + ("  ← today" if x == real_today else ""))
+                    else:
+                        simulated_today = datetime.now().date()
+                    simulated_tomorrow = simulated_today + timedelta(days=1)
+
+                    active_target_flights, seen = [], set()
+                    for row in parsed_rows:
+                        if row["Type"] == "FLIGHT" and row["DateObj"] is not None:
+                            fd = row["DateObj"].date()
+                            if fd in [simulated_today, simulated_tomorrow]:
+                                key = (row["Flight / Code"], fd)
+                                if key in seen:
+                                    continue
+                                seen.add(key)
+                                active_target_flights.append({"flight_no": row["Flight / Code"], "date_obj": fd,
+                                                              "route": row["Route"], "dep_time": row["Departure"]})
+
+                    flight_check_results = []
+                    if agent_on and active_target_flights:
+                        with st.spinner("Querying FlightStats & Flightradar24 live feeds..."):
+                            for flight in active_target_flights:
+                                telemetry = fetch_live_flight_telemetry(flight["flight_no"], flight["date_obj"],
+                                                                        flight["route"], flight["dep_time"])
+                                # FDP & rest impact for delayed/diverted flights
+                                impact_note = None
+                                if telemetry.get("severity") in ("delayed", "diverted"):
+                                    delay_guess = None
+                                    m = re.search(r'by ~(\d+) min', telemetry.get("status_message", ""))
+                                    if m:
+                                        delay_guess = int(m.group(1))
+                                    impact_note = delay_impact_note(parsed_rows, flight["flight_no"],
+                                                                    flight["date_obj"], delay_guess or 0)
+                                # Cancellation → soft standby suggestion (roster unchanged)
+                                sb_suggest = None
+                                if telemetry.get("severity") == "cancelled":
+                                    frow = next((r for r in parsed_rows
+                                                 if r["Type"] == "FLIGHT" and r.get("DateObj")
+                                                 and r["DateObj"].date() == flight["date_obj"]
+                                                 and str(r["Flight / Code"]).replace(" ", "") == str(flight["flight_no"]).replace(" ", "")), None)
+                                    if frow:
+                                        sb_suggest = suggest_standby_for_cancel(frow)
+                                flight_check_results.append({"flight": flight["flight_no"], "route": flight["route"],
+                                                             "date": flight["date_obj"].strftime("%d %b %Y"),
+                                                             "delayed": telemetry["is_delayed"],
+                                                             "severity": telemetry.get("severity", "ok"),
+                                                             "status": telemetry["status_message"],
+                                                             "inbound_note": telemetry.get("inbound_note"),
+                                                             "inbound_risk": telemetry.get("inbound_risk", False),
+                                                             "impact_note": impact_note,
+                                                             "sb_suggest": sb_suggest})
+                    st.session_state['alert_count'] = sum(
+                        1 for f in flight_check_results
+                        if (f["severity"] in ("delayed", "cancelled", "diverted") or f["inbound_risk"])
+                        and (f["flight"], f["date"]) not in st.session_state['acked'])
+
+                    if not agent_on:
+                        st.markdown("<div class='card muted'>Real-time monitor paused.</div>", unsafe_allow_html=True)
+                    elif flight_check_results:
                         st.markdown(
-                            f"<div style='font-size:13px;background:{bg};padding:12px;border-radius:8px;margin-top:10px;border:1px solid {bc};{op}'>"
-                            f"{icon} <b style='font-size:14px;'>{df['flight']}</b> ({df['route']}) — <span style='color:#ccc;'><i>{df['date']}</i></span>"
-                            f"<div style='margin-top:5px;color:{tc};font-size:12px;'>{df['status']}</div>{extra}</div>",
+                            f"<div class='card' style='font-size:12px;'><b style='color:#00bcd4;'>Agent Scan:</b> "
+                            f"Verified {len(flight_check_results)} flight(s) via FlightStats/Cirium + FR24 (keyless, cached 10 min).</div>",
                             unsafe_allow_html=True)
-                        if (df["severity"] in ("delayed", "cancelled", "diverted") or df["inbound_risk"]) and not acked:
-                            if st.button("Acknowledge", key=f"ack_{df['flight']}_{df['date']}", use_container_width=True):
-                                st.session_state['acked'].add(key)
-                                st.rerun()
-                    if st.button("🔄 Force Refresh Live Data", use_container_width=True):
-                        fr24_fetch_flight_history.clear()
-                        flightstats_fetch.clear()
-                        fr24_fetch_by_reg.clear()
-                        st.rerun()
-                else:
-                    st.markdown(
-                        f"<div class='card muted'>No flights found for {simulated_today.strftime('%d %b')} or {simulated_tomorrow.strftime('%d %b')}.</div>",
-                        unsafe_allow_html=True)
+                        for df in flight_check_results:
+                            key = (df["flight"], df["date"])
+                            acked = key in st.session_state['acked']
+                            if df["severity"] == "cancelled":
+                                bc, bg, tc, icon = "#ff1744", "#331414", "#ff8a8a", "🚫"
+                            elif df["severity"] == "diverted":
+                                bc, bg, tc, icon = "#ff6d00", "#332414", "#ffb74d", "🔀"
+                            elif df["severity"] == "delayed":
+                                bc, bg, tc, icon = "#ff5252", "#2c1f1f", "#ff8a8a", "⚠️"
+                            elif df["severity"] == "unknown":
+                                bc, bg, tc, icon = "#607d8b", "#1c2429", "#b0bec5", "ℹ️"
+                            else:
+                                bc, bg, tc, icon = "#4caf50", "#12301f", "#a5d6a7", "✈️"
+                            op = "opacity:.5;" if acked else ""
+                            extra = ""
+                            if df.get("inbound_note"):
+                                inb_bc = "#ff6d00" if df["inbound_risk"] else "#ffc107"
+                                extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#2b2413;"
+                                          f"border:1px solid {inb_bc};color:#ffd54f;font-size:11.5px;'>{df['inbound_note']}</div>")
+                            if df.get("impact_note"):
+                                impact_bad = ("⚠️" in df["impact_note"]) or ("BELOW" in df["impact_note"])
+                                r_bc = "#ff5252" if impact_bad else "#4caf50"
+                                r_tc = "#ff8a8a" if impact_bad else "#a5d6a7"
+                                extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#131f2b;"
+                                          f"border:1px solid {r_bc};color:{r_tc};font-size:11.5px;'>{df['impact_note']}</div>")
+                            if df.get("sb_suggest"):
+                                extra += (f"<div style='margin-top:8px;padding:8px;border-radius:6px;background:#2b2413;"
+                                          f"border:1px solid #ffc107;color:#ffd54f;font-size:11.5px;'>"
+                                          f"📋 Soft suggestion (roster unchanged): if cancelled, insert <b>{df['sb_suggest']}</b> standby.</div>")
+                            st.markdown(
+                                f"<div style='font-size:13px;background:{bg};padding:12px;border-radius:8px;margin-top:10px;border:1px solid {bc};{op}'>"
+                                f"{icon} <b style='font-size:14px;'>{df['flight']}</b> ({df['route']}) — <span style='color:#ccc;'><i>{df['date']}</i></span>"
+                                f"<div style='margin-top:5px;color:{tc};font-size:12px;'>{df['status']}</div>{extra}</div>",
+                                unsafe_allow_html=True)
+                            if (df["severity"] in ("delayed", "cancelled", "diverted") or df["inbound_risk"]) and not acked:
+                                if st.button("Acknowledge", key=f"ack_{df['flight']}_{df['date']}", use_container_width=True):
+                                    st.session_state['acked'].add(key)
+                                    st.rerun()
+                        if st.button("🔄 Force Refresh Live Data", use_container_width=True):
+                            fr24_fetch_flight_history.clear()
+                            flightstats_fetch.clear()
+                            fr24_fetch_by_reg.clear()
+                            st.rerun()
+                    else:
+                        st.markdown(
+                            f"<div class='card muted'>No flights found for {simulated_today.strftime('%d %b')} or {simulated_tomorrow.strftime('%d %b')}.</div>",
+                            unsafe_allow_html=True)
     # ================= 💰 SALARY CALCULATOR PAGE =================
     with page_salary:
         st.markdown("#### 💰 Salary Calculator")
@@ -6657,22 +6700,14 @@ else:
                 if _prev_rest_h < 0:
                     _prev_rest_h += 24
 
-            # band / max FDP — before and with delay (8.2.6 delayed reporting)
-            _band0 = fdp_band((_dep0 - timedelta(hours=1)).time())
-            _max0 = fdp_limit_min(_acclim, _band0, _n, _prev_rest_h)
-            if _sim_delay == 0:
-                _band_d, _delay_note = _band0, ""
-            else:
-                _band_d, _delay_note = apply_delay(_acclim, _n, _prev_rest_h, _dep0, _sim_delay)
-            _max_d = fdp_limit_min(_acclim, _band_d, _n, _prev_rest_h)
-
-            # FDP clock: <4h → starts at delayed report; ≥4h → 4h after original report
-            _fdp_start = (_du["report"] + timedelta(minutes=_sim_delay) if _sim_delay < 240
-                          else _du["report"] + timedelta(hours=4))
+            # band / max FDP — before and with delay (8.2.6 delayed reporting).
+            # Shared engine with the standalone FDP calculator → the two always agree.
+            _eng = _fdp_engine(_acclim, _n, _prev_rest_h, _du["report"], _dep0, _co0, _sim_delay)
+            _band0 = _eng["band0"]
+            _band_d, _max_d, _fdp_d, _margin_d = _eng["band_d"], _eng["max_d"], _eng["fdp_d"], _eng["margin_d"]
+            _fdp_start, _delay_note = _eng["fdp_start"], _eng["delay_note"]
             _co_d = _co0 + timedelta(minutes=_sim_delay)
-            _fdp0 = max(0, int((_co0 - _du["report"]).total_seconds() // 60))
-            _fdp_d = max(0, int((_co_d - _fdp_start).total_seconds() // 60))
-            _margin_d = _max_d - _fdp_d
+            _fdp0 = _eng["fdp0"]
 
             # --- scenario card ---
             _scn = (
@@ -6708,6 +6743,7 @@ else:
                 f"<div class='muted'>{_v_sub}</div></div>"
                 f"<div class='card' style='margin-top:6px;'>{_vrows}</div>",
                 unsafe_allow_html=True)
+            st.caption("Uses the same FDP engine as the standalone calculator — identical duty + delay gives an identical verdict.")
             if _delay_note:
                 st.markdown(f"<div class='card' style='font-size:12.5px;border-left:3px solid #ffc107;'>{_delay_note}</div>",
                             unsafe_allow_html=True)
@@ -6916,16 +6952,14 @@ else:
                             "more limiting band.</div>", unsafe_allow_html=True)
 
         with rcol2:
-            # --- delayed-reporting shift (8.2.6) ---
+            # --- delayed-reporting shift (8.2.6) — shared engine with the Delay Simulator ---
             ci_act = ci_dt + timedelta(minutes=delay_min)
             dep_act = dep_dt + timedelta(minutes=delay_min)
             arr_act = arr_dt + timedelta(minutes=delay_min)
-            band_used = band
-            fdp_start = ci_dt
-            delay_note = ""
-            if delay_min > 0:
-                band_used, delay_note = apply_delay(acclim_bool, sectors, preceding_rest_h, dep_dt, delay_min)
-                fdp_start = ci_act if delay_min < 240 else (ci_dt + timedelta(hours=4))
+            _eng = _fdp_engine(acclim_bool, sectors, preceding_rest_h, ci_dt, dep_dt, arr_dt, delay_min)
+            band_used = _eng["band_d"]
+            fdp_start = _eng["fdp_start"]
+            delay_note = _eng["delay_note"]
 
             sby_note = ""
             if sby_use and sby_start is not None:
