@@ -558,6 +558,30 @@ def period_rows_for_display(username, current_rows, period_start):
     return []
 
 
+def _nav_go(delta):
+    """‹ › ⟲ calendar-period navigation. Runs as a button `on_click` callback —
+    i.e. BEFORE the script body of the rerun — so it can mutate the
+    'cal_period_sel' key directly (the selectbox hasn't been instantiated yet in
+    that run). `delta` is -1 (older), +1 (newer) or 'cur' (jump to the current
+    period). Reads the period grid stashed by the Dashboard tab."""
+    starts = st.session_state.get('_period_starts') or []
+    t0 = st.session_state.get('_t0')
+    cur = st.session_state.get('cal_period_sel')
+    if not starts:
+        return
+    if delta == 'cur':
+        if t0 in starts:
+            st.session_state['cal_period_sel'] = t0
+        return
+    idx = starts.index(cur) if cur in starts else None
+    if idx is None:
+        st.session_state['cal_period_sel'] = (t0 if t0 in starts else starts[0])
+        return
+    j = idx + delta
+    if 0 <= j < len(starts):
+        st.session_state['cal_period_sel'] = starts[j]
+
+
 def save_profile(username, data):
     conn = sqlite3.connect('crew_companion.db')
     c = conn.cursor()
@@ -3748,10 +3772,11 @@ else:
         _cur_period = roster_period_of_roster(valid_dates_all) if valid_dates_all else None
 
         # Resolve the period-navigation state HERE, before any panel reads it, so
-        # ‹ › ⟲ and the direct picker all take effect in the same run. The buttons
-        # stash a plain '_cal_nav_req' key and rerun; applying it here (before the
-        # selectbox further down is instantiated) avoids mutating a widget-backed
-        # key mid-run (StreamlitWidgetAlreadyInstantiatedError).
+        # every panel and the calendar agree on the selected period. The ‹ › ⟲
+        # buttons change 'cal_period_sel' directly through the `_nav_go` on_click
+        # callback (which runs before the script body), so there is nothing
+        # deferred to apply here — we only clamp to a valid period and stash the
+        # period grid for the callbacks to use.
         _cal_rows = calendar_rows(st.session_state['username'], parsed_rows)
         _cal_dates = [r["DateObj"].date() for r in _cal_rows if r["DateObj"] is not None]
         _period_starts = []
@@ -3767,14 +3792,9 @@ else:
             if ('cal_period_sel' not in st.session_state
                     or st.session_state['cal_period_sel'] not in _period_starts):
                 st.session_state['cal_period_sel'] = _t0 if _t0 in _period_starts else _period_starts[0]
-            _nav_req = st.session_state.pop('_cal_nav_req', None)
-            _idx0 = _period_starts.index(st.session_state['cal_period_sel'])
-            if _nav_req == 'prev' and _idx0 > 0:
-                st.session_state['cal_period_sel'] = _period_starts[_idx0 - 1]
-            elif _nav_req == 'next' and _idx0 < len(_period_starts) - 1:
-                st.session_state['cal_period_sel'] = _period_starts[_idx0 + 1]
-            elif _nav_req == 'cur' and _t0 in _period_starts:
-                st.session_state['cal_period_sel'] = _t0
+        # stash for the ‹ › ⟲ on_click callbacks
+        st.session_state['_period_starts'] = _period_starts
+        st.session_state['_t0'] = _t0
 
         _view_sel = st.session_state.get('cal_period_sel')
         viewing_past = bool(_cur_period is not None and _view_sel is not None
@@ -3999,8 +4019,22 @@ else:
             # Roster history — paste & finalize (period auto-detected), list & delete
             with st.expander("🗂 Roster History"):
                 hist_rows = load_roster_history(st.session_state['username'])
+
+                # One-shot flags from the ✏️ / 💾 buttons (both live below the
+                # paste box, so they stash a plain flag and rerun; the flag is
+                # applied here, BEFORE the text area is instantiated — the only
+                # safe time to rewrite a widget-backed key).
+                _edit_target = st.session_state.pop('_hist_edit_target', None)
+                if _edit_target is not None:
+                    _h_edit = next((h for h in hist_rows if h["period_start"] == _edit_target), None)
+                    if _h_edit is not None:
+                        st.session_state['hist_perf_input'] = (_h_edit["performed_text"]
+                                                               or _h_edit["published_text"] or "")
+                if st.session_state.pop('_hist_clear_flag', False):
+                    st.session_state['hist_perf_input'] = ''
+
                 st.markdown(
-                    "<div class='muted' style='margin-bottom:8px;'>Paste your <b>performed</b> rosters (portal's performed view) below — the 28-day period is <b>auto-detected</b> from the dates you paste, so there's nothing to select. Every saved period is listed with a 🗑 to delete it. These performed rosters feed the 8.2.17(d) average &amp; rolling checks and, once a full 1st–end calendar month is performed, the Salary Calculator. Periods before 2026 are auto-removed.</div>",
+                    "<div class='muted' style='margin-bottom:8px;'>Paste your <b>performed</b> rosters (portal's performed view) below — the 28-day period is <b>auto-detected</b> from the dates you paste, so there's nothing to select. Every saved period is listed with ✏️ to load it back for editing and 🗑 to delete it. These performed rosters feed the 8.2.17(d) average &amp; rolling checks and, once a full 1st–end calendar month is performed, the Salary Calculator. Periods before 2026 are auto-removed.</div>",
                     unsafe_allow_html=True)
 
                 def _summarize(h):
@@ -4022,12 +4056,17 @@ else:
                     for h in saved:
                         s = h["period_start"]
                         last = s + timedelta(days=ROSTER_PERIOD_DAYS - 1)
-                        sc1, sc2 = st.columns([6, 1])
+                        sc1, sc2, sc3 = st.columns([6, 0.6, 0.6])
                         with sc1:
                             st.markdown(
                                 f"<div class='bidrow'><span>{s.strftime('%d %b')} – {last.strftime('%d %b %Y')}</span>"
                                 f"<span>{_summarize(h)}</span></div>", unsafe_allow_html=True)
                         with sc2:
+                            if st.button("✏️", key=f"hist_edit_{s.strftime('%Y%m%d')}",
+                                         help=f"Load the {s.strftime('%d %b')} performed roster into the box below to edit"):
+                                st.session_state['_hist_edit_target'] = s
+                                st.rerun()
+                        with sc3:
                             if st.button("🗑", key=f"hist_del_{s.strftime('%Y%m%d')}",
                                          help=f"Delete the {s.strftime('%d %b')} period"):
                                 delete_roster_history(st.session_state['username'], s)
@@ -4072,6 +4111,7 @@ else:
                                             performed_text=man_in, finalized=True)
                         _slabel = (f"{_detected.strftime('%d %b')} – "
                                    f"{(_detected + timedelta(days=ROSTER_PERIOD_DAYS - 1)).strftime('%d %b %Y')}")
+                        st.session_state['_hist_clear_flag'] = True
                         st.success(f"Period {_slabel} finalized — rolling checks now use the performed roster.")
                         st.rerun()
 
@@ -4093,23 +4133,21 @@ else:
 
                 nav1, nav2, nav3, nav4 = st.columns([0.8, 4.4, 0.8, 1.4])
                 with nav1:
-                    if st.button("‹", use_container_width=True, disabled=idx == 0):
-                        st.session_state['_cal_nav_req'] = 'prev'
-                        st.rerun()
+                    st.button("‹", on_click=_nav_go, args=(-1,),
+                              use_container_width=True, disabled=idx == 0)
                 with nav2:
                     # Direct period picker (doubles as the label) — no more
                     # clicking the arrows all the way back to today.
                     st.selectbox("Roster period", starts, key="cal_period_sel",
                                  format_func=_period_label, label_visibility="collapsed")
                 with nav3:
-                    if st.button("›", use_container_width=True, disabled=idx == len(periods) - 1):
-                        st.session_state['_cal_nav_req'] = 'next'
-                        st.rerun()
+                    st.button("›", on_click=_nav_go, args=(1,),
+                              use_container_width=True, disabled=idx == len(periods) - 1)
                 with nav4:
-                    if t0 in starts and st.button("⟲ Current", use_container_width=True,
-                                                  disabled=(st.session_state['cal_period_sel'] == t0)):
-                        st.session_state['_cal_nav_req'] = 'cur'
-                        st.rerun()
+                    if t0 in starts:
+                        st.button("⟲ Current", on_click=_nav_go, args=("cur",),
+                                  use_container_width=True,
+                                  disabled=(st.session_state['cal_period_sel'] == t0))
                 sel_span = periods[starts.index(st.session_state['cal_period_sel'])]
             else:
                 sel_span = None
