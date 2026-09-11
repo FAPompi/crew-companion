@@ -3625,6 +3625,114 @@ _ADD_DUTY_CODES = ["GND", "MTG", "FAU", "OFG", "DLV", "ADM", "MED", "CRM", "SEP"
 _ADD_SBY_CODES = ["SB1", "SB2", "SB3", "SB4", "ASB", "LSB", "SSY"]
 
 
+# SriLankan Airlines DIRECT flights from Colombo — autofill reference database.
+# Keyed by flight number. Times are typical SCHEDULED LOCAL times at each end
+# (dep = origin local, arr = destination local), matching how the portal logs
+# them; they are a convenience prefill and always editable. 'ret' = the paired
+# return flight (None on return legs), 'ret_day' = days after the outbound that
+# the return departs (0 = same-day turnaround, 1 = next-day).
+UL_DIRECT = {
+    # --- Bangkok (BKK) ---
+    "UL402": {"o": "CMB", "d": "BKK", "dep": "01:10", "arr": "06:15", "ac": "32B", "ret": "UL403", "ret_day": 0},
+    "UL403": {"o": "BKK", "d": "CMB", "dep": "07:30", "arr": "09:05", "ac": "32B"},
+    "UL404": {"o": "CMB", "d": "BKK", "dep": "07:35", "arr": "12:45", "ac": "32B", "ret": "UL405", "ret_day": 0},
+    "UL405": {"o": "BKK", "d": "CMB", "dep": "13:55", "arr": "15:45", "co": "16:15", "ac": "32B"},
+    # --- Maldives (MLE) ---
+    "UL101": {"o": "CMB", "d": "MLE", "dep": "07:20", "arr": "08:15", "ac": "333", "ret": "UL102", "ret_day": 0},
+    "UL102": {"o": "MLE", "d": "CMB", "dep": "09:15", "arr": "10:15", "ac": "333"},
+    "UL115": {"o": "CMB", "d": "MLE", "dep": "13:30", "arr": "14:25", "ac": "320", "ret": "UL116", "ret_day": 0},
+    "UL116": {"o": "MLE", "d": "CMB", "dep": "15:25", "arr": "16:25", "ac": "320"},
+    "UL103": {"o": "CMB", "d": "MLE", "dep": "18:55", "arr": "19:50", "ac": "320", "ret": "UL104", "ret_day": 0},
+    "UL104": {"o": "MLE", "d": "CMB", "dep": "20:50", "arr": "21:50", "ac": "320"},
+    # --- India: Chennai (MAA) ---
+    "UL121": {"o": "CMB", "d": "MAA", "dep": "07:25", "arr": "08:50", "ac": "333", "ret": "UL122", "ret_day": 0},
+    "UL122": {"o": "MAA", "d": "CMB", "dep": "09:50", "arr": "11:15", "ac": "333"},
+    "UL123": {"o": "CMB", "d": "MAA", "dep": "18:45", "arr": "20:10", "ac": "320", "ret": "UL124", "ret_day": 0},
+    "UL124": {"o": "MAA", "d": "CMB", "dep": "21:10", "arr": "22:35", "ac": "320"},
+    "UL125": {"o": "CMB", "d": "MAA", "dep": "00:45", "arr": "02:10", "ac": "320", "ret": "UL126", "ret_day": 0},
+    "UL126": {"o": "MAA", "d": "CMB", "dep": "03:10", "arr": "04:35", "ac": "320"},
+    "UL127": {"o": "CMB", "d": "MAA", "dep": "13:40", "arr": "15:05", "ac": "320", "ret": "UL128", "ret_day": 0},
+    "UL128": {"o": "MAA", "d": "CMB", "dep": "16:05", "arr": "17:30", "ac": "320"},
+    # --- India: Mumbai (BOM) ---
+    "UL141": {"o": "CMB", "d": "BOM", "dep": "23:40", "arr": "02:10", "ac": "320", "ret": "UL142", "ret_day": 1},
+    "UL142": {"o": "BOM", "d": "CMB", "dep": "03:10", "arr": "05:40", "ac": "320"},
+    "UL143": {"o": "CMB", "d": "BOM", "dep": "17:20", "arr": "19:50", "ac": "320", "ret": "UL144", "ret_day": 0},
+    "UL144": {"o": "BOM", "d": "CMB", "dep": "20:40", "arr": "23:10", "ac": "320"},
+    # --- India: New Delhi (DEL) ---
+    "UL191": {"o": "CMB", "d": "DEL", "dep": "00:40", "arr": "04:15", "ac": "320", "ret": "UL192", "ret_day": 0},
+    "UL192": {"o": "DEL", "d": "CMB", "dep": "05:15", "arr": "08:50", "co": "09:20", "ac": "320"},
+    "UL195": {"o": "CMB", "d": "DEL", "dep": "14:10", "arr": "17:45", "ac": "320", "ret": "UL196", "ret_day": 0},
+    "UL196": {"o": "DEL", "d": "CMB", "dep": "18:45", "arr": "22:20", "ac": "320"},
+    # --- India: Bengaluru (BLR) ---
+    "UL171": {"o": "CMB", "d": "BLR", "dep": "18:55", "arr": "20:20", "ac": "320", "ret": "UL172", "ret_day": 0},
+    "UL172": {"o": "BLR", "d": "CMB", "dep": "21:20", "arr": "22:45", "co": "23:15", "ac": "320"},
+    # --- India: Tiruchirappalli (TRZ) ---
+    "UL131": {"o": "CMB", "d": "TRZ", "dep": "08:15", "arr": "09:15", "ac": "320", "ret": "UL132", "ret_day": 0},
+    "UL132": {"o": "TRZ", "d": "CMB", "dep": "10:15", "arr": "11:15", "ac": "320"},
+    "UL133": {"o": "CMB", "d": "TRZ", "dep": "13:40", "arr": "14:40", "ac": "320", "ret": "UL134", "ret_day": 0},
+    "UL134": {"o": "TRZ", "d": "CMB", "dep": "15:40", "arr": "16:40", "ac": "320"},
+    # --- Middle East ---
+    "UL253": {"o": "CMB", "d": "DMM", "dep": "18:25", "arr": "21:00", "co": "21:30", "ac": "32B", "ret": "UL254", "ret_day": 0},
+    "UL254": {"o": "DMM", "d": "CMB", "dep": "22:15", "arr": "05:55", "co": "06:25", "ac": "32B"},
+    "UL265": {"o": "CMB", "d": "RUH", "dep": "18:15", "arr": "21:20", "co": "21:50", "ac": "332", "ret": "UL266", "ret_day": 0},
+    "UL266": {"o": "RUH", "d": "CMB", "dep": "22:30", "arr": "06:20", "co": "06:50", "ac": "333"},
+    "UL225": {"o": "CMB", "d": "DXB", "dep": "18:30", "arr": "21:40", "ac": "332", "ret": "UL226", "ret_day": 0},
+    "UL226": {"o": "DXB", "d": "CMB", "dep": "23:00", "arr": "05:00", "ac": "332"},
+    "UL229": {"o": "CMB", "d": "KWI", "dep": "17:10", "arr": "20:05", "ac": "320", "ret": "UL230", "ret_day": 0},
+    "UL230": {"o": "KWI", "d": "CMB", "dep": "21:05", "arr": "03:35", "ac": "320"},
+    "UL217": {"o": "CMB", "d": "DOH", "dep": "19:00", "arr": "21:30", "ac": "320", "ret": "UL218", "ret_day": 0},
+    "UL218": {"o": "DOH", "d": "CMB", "dep": "22:30", "arr": "05:00", "ac": "320"},
+    "UL215": {"o": "CMB", "d": "BAH", "dep": "18:50", "arr": "21:40", "ac": "320", "ret": "UL216", "ret_day": 0},
+    "UL216": {"o": "BAH", "d": "CMB", "dep": "22:40", "arr": "05:20", "ac": "320"},
+    "UL205": {"o": "CMB", "d": "MCT", "dep": "18:40", "arr": "21:40", "ac": "320", "ret": "UL206", "ret_day": 0},
+    "UL206": {"o": "MCT", "d": "CMB", "dep": "22:40", "arr": "05:00", "ac": "320"},
+    "UL281": {"o": "CMB", "d": "JED", "dep": "19:30", "arr": "23:10", "ac": "332", "ret": "UL282", "ret_day": 0},
+    "UL282": {"o": "JED", "d": "CMB", "dep": "00:10", "arr": "08:10", "ac": "332"},
+    # --- East Asia ---
+    "UL470": {"o": "CMB", "d": "ICN", "dep": "19:50", "arr": "07:35", "co": "08:05", "ac": "332", "ret": "UL471", "ret_day": 1},
+    "UL471": {"o": "ICN", "d": "CMB", "dep": "12:20", "arr": "17:00", "co": "17:30", "ac": "333"},
+    "UL454": {"o": "CMB", "d": "NRT", "dep": "19:35", "arr": "08:30", "ac": "332", "ret": "UL455", "ret_day": 1},
+    "UL455": {"o": "NRT", "d": "CMB", "dep": "11:30", "arr": "16:30", "ac": "332"},
+    # --- China ---
+    "UL891": {"o": "CMB", "d": "HKG", "dep": "18:10", "arr": "02:20", "ac": "332", "ret": "UL892", "ret_day": 1},
+    "UL892": {"o": "HKG", "d": "CMB", "dep": "03:20", "arr": "05:50", "ac": "332"},
+    "UL880": {"o": "CMB", "d": "CAN", "dep": "22:30", "arr": "06:40", "ac": "332", "ret": "UL881", "ret_day": 1},
+    "UL881": {"o": "CAN", "d": "CMB", "dep": "07:40", "arr": "10:20", "ac": "332"},
+    "UL866": {"o": "CMB", "d": "PVG", "dep": "19:30", "arr": "05:00", "ac": "332", "ret": "UL867", "ret_day": 1},
+    "UL867": {"o": "PVG", "d": "CMB", "dep": "06:00", "arr": "10:20", "ac": "332"},
+    "UL868": {"o": "CMB", "d": "PEK", "dep": "19:00", "arr": "05:10", "ac": "332", "ret": "UL869", "ret_day": 1},
+    "UL869": {"o": "PEK", "d": "CMB", "dep": "06:10", "arr": "10:30", "ac": "332"},
+    # --- Southeast Asia ---
+    "UL306": {"o": "CMB", "d": "SIN", "dep": "01:50", "arr": "08:30", "ac": "320", "ret": "UL307", "ret_day": 0},
+    "UL307": {"o": "SIN", "d": "CMB", "dep": "09:45", "arr": "11:15", "ac": "320"},
+    "UL314": {"o": "CMB", "d": "KUL", "dep": "08:05", "arr": "14:35", "ac": "320", "ret": "UL315", "ret_day": 0},
+    "UL315": {"o": "KUL", "d": "CMB", "dep": "15:35", "arr": "18:05", "ac": "320"},
+    "UL318": {"o": "CMB", "d": "KUL", "dep": "01:00", "arr": "07:20", "ac": "320", "ret": "UL319", "ret_day": 0},
+    "UL319": {"o": "KUL", "d": "CMB", "dep": "08:20", "arr": "10:50", "ac": "320"},
+    "UL364": {"o": "CMB", "d": "CGK", "dep": "08:05", "arr": "14:15", "ac": "320", "ret": "UL365", "ret_day": 0},
+    "UL365": {"o": "CGK", "d": "CMB", "dep": "15:15", "arr": "19:25", "ac": "320"},
+    # --- South Asia ---
+    "UL189": {"o": "CMB", "d": "DAC", "dep": "07:50", "arr": "11:40", "ac": "320", "ret": "UL190", "ret_day": 0},
+    "UL190": {"o": "DAC", "d": "CMB", "dep": "12:40", "arr": "14:50", "ac": "320"},
+    "UL181": {"o": "CMB", "d": "KTM", "dep": "07:30", "arr": "11:15", "ac": "320", "ret": "UL182", "ret_day": 0},
+    "UL182": {"o": "KTM", "d": "CMB", "dep": "13:15", "arr": "17:05", "ac": "320"},
+    "UL185": {"o": "CMB", "d": "LHE", "dep": "13:50", "arr": "17:15", "ac": "320", "ret": "UL186", "ret_day": 0},
+    "UL186": {"o": "LHE", "d": "CMB", "dep": "18:25", "arr": "22:50", "co": "23:20", "ac": "320"},
+    # --- Europe / Oceania ---
+    "UL503": {"o": "CMB", "d": "LHR", "dep": "13:00", "arr": "19:45", "ac": "333", "ret": "UL504", "ret_day": 1},
+    "UL504": {"o": "LHR", "d": "CMB", "dep": "21:30", "arr": "13:20", "ac": "333"},
+    "UL563": {"o": "CMB", "d": "CDG", "dep": "00:05", "arr": "07:00", "ac": "333", "ret": "UL564", "ret_day": 1},
+    "UL564": {"o": "CDG", "d": "CMB", "dep": "10:00", "arr": "23:30", "ac": "333"},
+    "UL553": {"o": "CMB", "d": "FRA", "dep": "00:10", "arr": "07:05", "ac": "333", "ret": "UL554", "ret_day": 1},
+    "UL554": {"o": "FRA", "d": "CMB", "dep": "09:00", "arr": "22:30", "ac": "333"},
+    "UL604": {"o": "CMB", "d": "MEL", "dep": "00:20", "arr": "14:40", "ac": "333", "ret": "UL605", "ret_day": 1},
+    "UL605": {"o": "MEL", "d": "CMB", "dep": "16:10", "arr": "22:00", "ac": "333"},
+    "UL606": {"o": "CMB", "d": "SYD", "dep": "00:30", "arr": "16:00", "ac": "333", "ret": "UL607", "ret_day": 1},
+    "UL607": {"o": "SYD", "d": "CMB", "dep": "17:30", "arr": "23:30", "ac": "333"},
+}
+
+
+
 def _parse_hm(s):
     """'HH:MM' -> datetime.time; blank/invalid -> None."""
     if not isinstance(s, str):
@@ -3854,8 +3962,74 @@ def _cedit_open(day):
     st.session_state['caledit_target'] = None
 
 
+def _snapshot_for_undo():
+    """Remember the pre-edit roster so an accidental change can be reverted."""
+    st.session_state.setdefault('_undo_stack', [])
+    st.session_state['_undo_stack'].append(st.session_state.get('current_roster', ''))
+    if len(st.session_state['_undo_stack']) > 8:
+        st.session_state['_undo_stack'] = st.session_state['_undo_stack'][-8:]
+
+
+def _undo_last():
+    """Revert the most recent calendar edit."""
+    stack = st.session_state.get('_undo_stack', [])
+    if not stack:
+        st.warning("Nothing to undo — no calendar edits made this session.")
+        return
+    prev = stack.pop()
+    st.session_state['current_roster'] = prev
+    save_roster_to_db(st.session_state['username'], prev)
+    st.session_state.pop('caledit_target', None)
+    st.success("Reverted to the previous roster.")
+    st.rerun()
+
+
+def _fill_flight_details():
+    """Autofill the add-flight form from the UL direct-flights database."""
+    fl = (st.session_state.get('cedit_a_flt') or '').replace(' ', '').upper()
+    if not re.fullmatch(r'UL\d{1,4}', fl):
+        st.warning("Type a UL flight number first (e.g. UL404).")
+        return
+    info = UL_DIRECT.get(fl)
+    if not info:
+        st.warning(f"{fl} isn't in the flight database — fill the details manually.")
+        # clear any stale turnaround state from a previous fill
+        st.session_state['cedit_a_turn'] = False
+        st.session_state['cedit_a_ret'] = ''
+        st.session_state['cedit_a_rdep'] = ''
+        st.session_state['cedit_a_rarr'] = ''
+        st.session_state['cedit_a_rco'] = ''
+        return
+    st.session_state['cedit_a_o'] = info.get('o', 'CMB')
+    st.session_state['cedit_a_d'] = info.get('d', '')
+    st.session_state['cedit_a_ci'] = ''
+    st.session_state['cedit_a_dep'] = info.get('dep', '')
+    st.session_state['cedit_a_arr'] = info.get('arr', '')
+    st.session_state['cedit_a_co'] = info.get('co', '')
+    st.session_state['cedit_a_ac'] = info.get('ac', '')
+    ret = info.get('ret')
+    if ret and ret in UL_DIRECT:
+        ri = UL_DIRECT[ret]
+        st.session_state['cedit_a_ret'] = ret
+        st.session_state['cedit_a_rdep'] = ri.get('dep', '')
+        st.session_state['cedit_a_rarr'] = ri.get('arr', '')
+        st.session_state['cedit_a_rco'] = ri.get('co', '')
+        st.session_state['cedit_a_retday'] = int(info.get('ret_day', 0) or 0)
+        st.session_state['cedit_a_turn'] = True
+        st.success(f"Filled {fl}: {info['o']}→{info['d']} {info.get('dep','')}–{info.get('arr','')}"
+                   f" · return {ret} {'next day' if info.get('ret_day') else 'same day'}")
+    else:
+        st.session_state['cedit_a_ret'] = ''
+        st.session_state['cedit_a_rdep'] = ''
+        st.session_state['cedit_a_rarr'] = ''
+        st.session_state['cedit_a_rco'] = ''
+        st.session_state['cedit_a_turn'] = False
+        st.success(f"Filled {fl}: {info['o']}→{info['d']} {info.get('dep','')}–{info.get('arr','')}")
+
+
 def _commit_roster_change(new_rows):
     """Persist edited rows back to the current roster and reload."""
+    _snapshot_for_undo()
     st.session_state['current_roster'] = save_rows_as_roster(st.session_state['username'], new_rows)
     st.session_state.pop('caledit_target', None)
     st.success("Current roster updated — dashboard & intel recalculated.")
@@ -3863,7 +4037,10 @@ def _commit_roster_change(new_rows):
 
 
 def _time_field(label, key, default=""):
-    return st.text_input(label, value=default, key=key, placeholder="HH:MM or blank")
+    kwargs = {"placeholder": "HH:MM or blank", "key": key}
+    if key not in st.session_state:
+        kwargs["value"] = default
+    return st.text_input(label, **kwargs)
 
 
 def _render_duty_edit_form(rows, idx):
@@ -3979,18 +4156,40 @@ def _render_duty_edit_form(rows, idx):
 
 
 def _render_duty_add_form(rows, day):
-    """Form to add a new duty on `day`."""
+    """Form to add a new duty on `day`. The type selector + flight autofill +
+    turnaround tick live OUTSIDE the form so they react instantly; the fields
+    + submit button sit inside the form."""
+    ftype = st.selectbox("Add duty type", ["Flight", "Standby", "Day off", "Leave / sick",
+                                           "Time off", "Training / ground duty", "Layover"],
+                         key="cedit_add_type")
+
+    if ftype == "Flight":
+        _fl = st.text_input("Flight number (e.g. UL404)", key="cedit_a_flt",
+                            placeholder="UL404").replace(" ", "").upper()
+        _f1, _f2 = st.columns([2.6, 1])
+        with _f2:
+            if st.button("🔍 Fill from DB", key="cedit_fill_btn", use_container_width=True,
+                         help="Autofill origin/destination/times from the SriLankan direct-flights database"):
+                _fill_flight_details()
+        with _f1:
+            _info = UL_DIRECT.get(_fl)
+            if _info:
+                st.caption("✓ " + _fl + " · " + _info.get("o", "") + "→" + _info.get("d", "")
+                           + " · " + _info.get("dep", "—") + "–" + _info.get("arr", "—")
+                           + (" · return " + _info["ret"] + (" (next day)" if _info.get("ret_day") else "") if _info.get("ret") else ""))
+            elif _fl:
+                st.caption("Not in the database — enter details manually below.")
+            else:
+                st.caption("Type a flight number, then 🔍 Fill from DB — or enter details manually.")
+        turn = st.checkbox("🔄 Turnaround — also add the return leg", key="cedit_a_turn")
+
     with st.form(key="cedit_add_form"):
-        ftype = st.selectbox("Add duty type", ["Flight", "Standby", "Day off", "Leave / sick",
-                                               "Time off", "Training / ground duty", "Layover"],
-                             key="cedit_add_type")
         if ftype == "Flight":
-            fl = st.text_input("Flight number", value="UL", key="cedit_a_flt").replace(" ", "")
             c1, c2 = st.columns(2)
             with c1:
-                origin = st.text_input("From (IATA)", value="CMB", key="cedit_a_o").strip().upper()
+                origin = st.text_input("From (IATA)", key="cedit_a_o").strip().upper()
             with c2:
-                dest = st.text_input("To (IATA)", value="", key="cedit_a_d").strip().upper()
+                dest = st.text_input("To (IATA)", key="cedit_a_d").strip().upper()
             c3, c4, c5, c6 = st.columns(4)
             with c3:
                 ci = _time_field("Check-in", "cedit_a_ci")
@@ -4000,21 +4199,51 @@ def _render_duty_add_form(rows, day):
                 arr = _time_field("Arrival", "cedit_a_arr", "09:00")
             with c6:
                 co = _time_field("Check-out", "cedit_a_co")
-            ac = st.text_input("Aircraft (optional)", value="", key="cedit_a_ac").strip().upper()
+            ac = st.text_input("Aircraft (optional)", key="cedit_a_ac").strip().upper()
+            if turn:
+                _rd = int(st.session_state.get('cedit_a_retday', 0) or 0)
+                st.caption("Return departs the **" + ("next day" if _rd else "same day")
+                           + "** · From/To swap automatically.")
+                r1, r2, r3, r4 = st.columns(4)
+                with r1:
+                    rfl = st.text_input("Return flight no.", key="cedit_a_ret").replace(" ", "").upper()
+                with r2:
+                    rdep = _time_field("Return dep", "cedit_a_rdep")
+                with r3:
+                    rarr = _time_field("Return arr", "cedit_a_rarr")
+                with r4:
+                    rco = _time_field("Return co", "cedit_a_rco")
             ok, msg = True, ""
-            if not re.fullmatch(r'UL\d{1,4}', fl.upper()):
+            if not re.fullmatch(r'UL\d{1,4}', _fl):
                 ok, msg = False, "Flight number must look like UL404."
             if not re.fullmatch(r'[A-Z]{3}', origin) or not re.fullmatch(r'[A-Z]{3}', dest):
                 ok, msg = False, "From/To must be 3-letter IATA codes."
             if _parse_hm(dep) is None or _parse_hm(arr) is None:
                 ok, msg = False, "Departure & Arrival need HH:MM times."
+            if turn:
+                rfl_v = (st.session_state.get('cedit_a_ret') or '').replace(' ', '').upper()
+                if not re.fullmatch(r'UL\d{1,4}', rfl_v):
+                    ok, msg = False, "Return flight number must look like UL405."
+                elif _parse_hm(st.session_state.get('cedit_a_rdep', '')) is None \
+                        or _parse_hm(st.session_state.get('cedit_a_rarr', '')) is None:
+                    ok, msg = False, "Return leg needs Departure & Arrival HH:MM times."
             if st.form_submit_button(f"➕ Add flight to {day.strftime('%d %b')}", key="cedit_add_submit"):
-                if ok:
-                    row = build_duty_row(day, "FLIGHT", fl.upper(), ci=_parse_hm(ci), dep=_parse_hm(dep),
-                                         arr=_parse_hm(arr), co=_parse_hm(co), origin=origin, dest=dest, ac=ac or "-")
-                    _commit_roster_change(_sort_rows(list(rows) + [row]))
-                else:
+                if not ok:
                     st.error(msg)
+                else:
+                    row_out = build_duty_row(day, "FLIGHT", _fl, ci=_parse_hm(ci), dep=_parse_hm(dep),
+                                             arr=_parse_hm(arr), co=_parse_hm(co), origin=origin, dest=dest, ac=ac or "-")
+                    new_rows = [row_out]
+                    if turn:
+                        rfl_v = (st.session_state.get('cedit_a_ret') or '').replace(' ', '').upper()
+                        _rd = int(st.session_state.get('cedit_a_retday', 0) or 0)
+                        row_ret = build_duty_row(day + timedelta(days=_rd), "FLIGHT", rfl_v,
+                                                 dep=_parse_hm(st.session_state.get('cedit_a_rdep', '')),
+                                                 arr=_parse_hm(st.session_state.get('cedit_a_rarr', '')),
+                                                 co=_parse_hm(st.session_state.get('cedit_a_rco', '')),
+                                                 origin=dest, dest=origin, ac=ac or "-")
+                        new_rows.append(row_ret)
+                    _commit_roster_change(_sort_rows(list(rows) + new_rows))
         elif ftype == "Standby":
             code = st.selectbox("Standby code", _ADD_SBY_CODES, key="cedit_sb_code")
             c1, c2 = st.columns(2)
@@ -4069,7 +4298,7 @@ def _render_duty_add_form(rows, day):
                                          arr=_parse_hm(s1), co=_parse_hm(s1))
                     _commit_roster_change(_sort_rows(list(rows) + [row]))
         else:  # Layover
-            stn = st.text_input("Station (IATA)", value="", key="cedit_lay_stn").strip().upper()
+            stn = st.text_input("Station (IATA)", key="cedit_lay_stn").strip().upper()
             end = st.date_input("Until (leave = today for a single day)", value=day, key="cedit_lay_end")
             if st.form_submit_button(f"➕ Add layover from {day.strftime('%d %b')}", key="cedit_add_submit"):
                 if not re.fullmatch(r'[A-Z]{3}', stn):
@@ -4089,6 +4318,7 @@ def _render_calendar_editor(rows, sel_span):
     del_idx = st.session_state.pop('_cedit_del', None)
     if del_idx is not None and 0 <= del_idx < len(rows):
         new_rows = [r for j, r in enumerate(rows) if j != del_idx]
+        _snapshot_for_undo()
         st.session_state['current_roster'] = save_rows_as_roster(username, new_rows)
         st.session_state.pop('caledit_target', None)
         st.success("Duty removed from the current roster.")
@@ -4136,11 +4366,16 @@ def _render_calendar_editor(rows, sel_span):
 
     st.divider()
     idxs = duty_rows_on_day(rows, ed_day)
-    ehead, eclose = st.columns([6, 1])
+    ehead, eundo, eclose = st.columns([5.4, 0.8, 0.8])
     with ehead:
         st.markdown(f"**✏️ {ed_day.strftime('%A %d %b %Y')}** — {len(idxs)} duty(s) on this day")
+    with eundo:
+        if st.button("↩", key="cedit_undo", use_container_width=True,
+                     help="Undo the last calendar edit",
+                     disabled=not st.session_state.get('_undo_stack')):
+            _undo_last()
     with eclose:
-        if st.button("✕ Close", key="cedit_close", help="Close the editor"):
+        if st.button("✕", key="cedit_close", use_container_width=True, help="Close the editor"):
             st.session_state.pop('caledit_day', None)
             st.session_state.pop('caledit_target', None)
             st.rerun()
