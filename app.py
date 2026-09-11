@@ -180,6 +180,17 @@ def _month_key(ym):
     return f"{ym[0]:04d}-{ym[1]:02d}"
 
 
+def _month_of_roster(valid_dates):
+    """Calendar (year, month) containing the MEDIAN date of a pasted roster —
+    the month the paste belongs to, robust to a day or two of adjacent-month
+    rows at either end."""
+    if not valid_dates:
+        return None
+    s = sorted(valid_dates)
+    d = s[len(s) // 2]
+    return (d.year, d.month)
+
+
 def _prev_months(ym, n):
     """The n most recent (year, month) pairs ending at ym (inclusive), oldest last."""
     y, m = ym
@@ -558,6 +569,19 @@ def period_rows_for_display(username, current_rows, period_start):
     return []
 
 
+def surrounding_rows(username, current_rows, period_start):
+    """All finalized-history + current-roster rows that fall OUTSIDE the given
+    28-day period — context for cross-period checks (e.g. the duty that ends
+    before a day-off block at the very start of the period)."""
+    lo, hi = period_start, period_start + timedelta(days=ROSTER_PERIOD_DAYS)
+    out = []
+    for r in merged_history_rows(username, current_rows):
+        d = r["DateObj"].date() if r.get("DateObj") else None
+        if d is not None and not (lo <= d < hi):
+            out.append(r)
+    return out
+
+
 def _nav_go(delta):
     """‹ › ⟲ calendar-period navigation. Runs as a button `on_click` callback —
     i.e. BEFORE the script body of the rerun — so it can mutate the
@@ -731,6 +755,11 @@ GROUND_CODES = {
 
 _GROUND_CODES_SORTED = sorted(GROUND_CODES, key=len, reverse=True)
 _GROUND_CODE_PAT = "|".join(re.escape(c) for c in _GROUND_CODES_SORTED)
+
+# Annual-leave codes (any type of annual leave) count towards off-day totals and
+# suppress the mandatory-off-day check — the crew has already taken their rest
+# inside the annual-leave block.
+ANNUAL_LEAVE_CODES = {"ALV", "RLV", "ALP"}
 
 
 def ground_code_bucket(code):
@@ -2483,8 +2512,10 @@ def _day_status_map(rows):
         elif r["Type"] == "DAY OFF":
             key = "off"
         elif r["Type"] == "LEAVE":
-            # company rule: sick counts towards off days; other leave doesn't
-            key = "off" if ground_code_bucket(r.get("Code")) == "sick" else "leave"
+            # company rule: sick AND annual leave (ALV/RLV/ALP) count towards
+            # off days; other leave doesn't
+            key = "off" if (ground_code_bucket(r.get("Code")) == "sick"
+                            or r.get("Code") in ANNUAL_LEAVE_CODES) else "leave"
         elif r["Type"] == "TIMEOFF":
             key = "tof"   # time-off block: not duty, not a day off
         else:
@@ -2588,13 +2619,19 @@ def mandatory_off_days(rows):
     return mand
 
 
-def off_day_rest_check(rows):
+def off_day_rest_check(rows, context_rows=None):
     """8.2.17 day-off definition: each day-off block must give \u2265 34 h free of
     duty AND 2 local nights (8 h within 2200\u20130800 local) for the first off day,
     plus one further local night per extra consecutive off day. Free time runs
     from the previous duty's check-out to the next duty's check-in (leave days
     are free of duty, so they extend the window). Times treated as Colombo
-    local. Returns a list of (severity, message) findings."""
+    local.
+
+    Day-off blocks are taken from `rows` only (the viewed period); `context_rows`
+    are neighbouring finalized/current rows used solely to locate the duty that
+    ends before / starts after a block, so a block at the very start of a period
+    is still verified against the previous roster instead of being flagged
+    "cannot verify". Returns a list of (severity, message) findings."""
     findings = []
     day_status = _day_status_map(rows)
     off_days = sorted(d for d, s in day_status.items() if "off" in s)
@@ -2602,7 +2639,7 @@ def off_day_rest_check(rows):
         return findings
 
     duty_ivs = []
-    for r in rows:
+    for r in list(rows) + list(context_rows or []):
         if r["Type"] not in ("FLIGHT", "STANDBY", "LAYOVER", "DUTY"):
             continue
         s = r.get("CIdt") or r.get("DEPdt")
@@ -2697,10 +2734,13 @@ def tof_conflict_check(rows):
     return findings
 
 
-def fdp_roster_audit(rows):
+def fdp_roster_audit(rows, context_rows=None):
     """Chapter 08 FTL checks across the whole parsed roster: early/late/night
     classification, the 0100\u20130659 run limits, and cumulative duty hours
-    (60/105/210). Returns {counts, cumulative, findings}."""
+    (60/105/210). `context_rows` are neighbouring finalized/current rows passed
+    through to the day-off rest check so a period's edge blocks can still be
+    verified against the previous/next roster. Returns {counts, cumulative,
+    findings, days_off}."""
     duties = build_duties(rows)
     for du in duties:
         start, end = du["report"], du["chocks_on"]
@@ -2868,13 +2908,21 @@ def fdp_roster_audit(rows):
             d += timedelta(days=1)
 
     # --- each day off must satisfy the 34h / 2-local-night definition ---
-    rest_findings = off_day_rest_check(rows)
+    rest_findings = off_day_rest_check(rows, context_rows=context_rows)
     findings.extend(rest_findings)
     days_off["off_rest_bad"] = sum(1 for f in rest_findings if f[0] == "violation")
     days_off["off_rest_notes"] = sum(1 for f in rest_findings if f[0] == "note")
 
-    # --- which off days are mandatory (required by 8.2.17 a/b/c) ---
-    mand = mandatory_off_days(rows)
+    # --- which off days are mandatory (required by 8.2.17 a/b/c). Annual leave
+    # means the crew has already taken their rest, so the mandatory-off check is
+    # not applicable (8.2.17 a/b/c quotas are met inside the leave block). ---
+    has_annual = any(r["Type"] == "LEAVE" and r.get("Code") in ANNUAL_LEAVE_CODES
+                     for r in rows)
+    if has_annual:
+        days_off["mandatory_annual"] = True
+        mand = {}
+    else:
+        mand = mandatory_off_days(rows)
     days_off["mandatory_dates"] = sorted(mand)
     days_off["mandatory_count"] = len(mand)
 
@@ -3851,7 +3899,10 @@ else:
             # ---------- LEFT: FDP COMPLIANCE (Chapter 08) ----------
             if view_rows:
                 st.markdown("#### \u2696 FDP Compliance")
-                fdp = fdp_roster_audit(view_rows)
+                _view_start = _view_sel if (_view_sel is not None) else _cur_period
+                _ctx_rows = (surrounding_rows(st.session_state['username'], parsed_rows, _view_start)
+                             if _view_start is not None else [])
+                fdp = fdp_roster_audit(view_rows, context_rows=_ctx_rows)
                 fviol = [f for f in fdp["findings"] if f[0] == "violation"]
                 fnote = [f for f in fdp["findings"] if f[0] == "note"]
                 cnt = fdp["counts"]
@@ -3876,9 +3927,13 @@ else:
                 else:
                     off_rest_txt = "all OK"
                 mand_dates = do.get("mandatory_dates", [])
-                mand_txt = f"{do['mandatory_count']} of {do['off_days']}"
-                mand_line = (", ".join(d.strftime("%d %b") for d in mand_dates)
-                             if mand_dates else "none individually required")
+                if do.get("mandatory_annual"):
+                    mand_txt = "n/a · annual leave"
+                    mand_line = "annual leave present — mandatory off days not checked"
+                else:
+                    mand_txt = f"{do['mandatory_count']} of {do['off_days']}"
+                    mand_line = (", ".join(d.strftime("%d %b") for d in mand_dates)
+                                 if mand_dates else "none individually required")
                 davg = days_off_average_8_2_17_d(st.session_state['username'], parsed_rows,
                                                  upto=(_view_sel if viewing_past else None))
                 if davg["avg"] is None:
@@ -3906,7 +3961,7 @@ else:
                 )
                 st.markdown(
                     f"<div class='card'>{rows_html}"
-                    f"<div class='muted' style='font-size:11px;margin-top:4px;'>standby & duty days counted in full \u00b7 sick counts as a day off</div>"
+                    f"<div class='muted' style='font-size:11px;margin-top:4px;'>standby & duty days counted in full \u00b7 sick & annual leave count as days off</div>"
                     f"<div class='muted' style='font-size:11px;margin-top:2px;'>mandatory: {mand_line}</div>"
                     f"{davg_foot}"
                     f"<div class='muted' style='font-size:11px;margin-top:2px;'>(d) needs 3 finalized periods \u2014 finalize past rosters in Roster History.</div></div>",
@@ -4414,47 +4469,103 @@ else:
 
         with rcol:
             # --- SALARY HISTORY: per-month performed rosters (manual pin, or auto-pull) ---
-            salary_months = salary_available_months(st.session_state['username'], parsed_rows)
             today_ym = (datetime.now().year, datetime.now().month)
-            hist_months = sorted(set(_months_from_2026(today_ym)) | set(salary_months))
             sh = load_salary_history(st.session_state['username'])
             with st.expander("🗓 Salary History (per-month)", expanded=False):
+                # One-shot flags from the ✏️ / 💾 buttons below: applied here,
+                # BEFORE the text area is instantiated (the only safe time to
+                # rewrite a widget-backed key).
+                _sh_edit_target = st.session_state.pop('_sh_edit_target', None)
+                if _sh_edit_target is not None:
+                    st.session_state['salary_hist_input'] = sh.get(_sh_edit_target, {}).get("text", "")
+                if st.session_state.pop('_sh_clear_flag', False):
+                    st.session_state['salary_hist_input'] = ''
+
                 st.markdown(
                     "<div class='muted' style='margin-bottom:6px;'>Pin a whole calendar month's <b>performed</b> "
-                    "roster here to lock in its payslip. Months already <b>finalized</b> in the Dashboard's 🗂 Roster "
+                    "roster here to lock in its payslip — the month is <b>auto-detected</b> from the dates you paste, "
+                    "so there's nothing to select. Months already <b>finalized</b> in the Dashboard's 🗂 Roster "
                     "History are pulled automatically — but only once the <b>full month (1st – end)</b> is performed. "
                     "A half-month, or a month still on the live roster, shows \u201cno data\u201d — never a guess.</div>",
                     unsafe_allow_html=True)
-                sh_pick = st.selectbox(
-                    "History month", hist_months,
-                    format_func=lambda ym: datetime(ym[0], ym[1], 1).strftime("%B %Y"),
-                    index=(hist_months.index(today_ym) if today_ym in hist_months else len(hist_months) - 1),
-                    key="salary_hist_month")
-                sh_key = _month_key(sh_pick)
-                sh_text = st.text_area(
-                    "Performed roster for this month",
-                    value=sh.get(sh_key, {}).get("text", ""),
-                    height=140, key=f"sh_text_{sh_key}")
-                hb1, hb2, hb3 = st.columns([1, 1, 1])
-                if hb1.button("💾 Save month", use_container_width=True, key="sh_save"):
-                    if sh_text.strip():
-                        save_salary_history(st.session_state['username'], sh_key, sh_text)
-                        st.success(datetime(sh_pick[0], sh_pick[1], 1).strftime("%B %Y") + " saved to salary history.")
-                        st.rerun()
+
+                saved_sh = sorted(sh.items(), key=lambda kv: kv[0], reverse=True)
+                if saved_sh:
+                    for mk, entry in saved_sh:
+                        try:
+                            ym = (int(mk[:4]), int(mk[5:7]))
+                        except ValueError:
+                            continue
+                        mlabel = datetime(ym[0], ym[1], 1).strftime("%B %Y")
+                        rows = parse_roster_text(entry.get("text", ""))
+                        dates = [r["DateObj"].date() for r in rows if r.get("DateObj")]
+                        nf = sum(1 for r in rows if r["Type"] == "FLIGHT")
+                        span = (f"{min(dates).strftime('%d %b')}\u2013{max(dates).strftime('%d %b')}"
+                                if dates else "no dates")
+                        s1, s2, s3, s4 = st.columns([6, 0.7, 0.7, 0.7])
+                        with s1:
+                            st.markdown(
+                                f"<div class='bidrow'><span>{mlabel}</span>"
+                                f"<span>✅ {nf} flight(s) · {span}</span></div>",
+                                unsafe_allow_html=True)
+                        with s2:
+                            if st.button("✏️", key=f"sh_edit_{mk}",
+                                         help=f"Load {mlabel} into the box below to edit"):
+                                st.session_state['_sh_edit_target'] = mk
+                                st.rerun()
+                        with s3:
+                            if st.button("🗑", key=f"sh_del_{mk}",
+                                         help=f"Delete {mlabel} from salary history"):
+                                delete_salary_history(st.session_state['username'], mk)
+                                st.success(f"{mlabel} removed from salary history.")
+                                st.rerun()
+                        with s4:
+                            if st.button("👁", key=f"sh_show_{mk}",
+                                         help=f"Show {mlabel} in the payslip"):
+                                _show_rows, _ = salary_month_rows(st.session_state['username'], ym, parsed_rows)
+                                if any(r["Type"] == "FLIGHT" for r in _show_rows):
+                                    st.session_state['salary_month_pick'] = mlabel
+                                    st.rerun()
+                                else:
+                                    st.warning(mlabel + " has no full performed month yet — save it here, or finalize that month's periods in the Dashboard's Roster History.")
+                else:
+                    st.markdown("<div class='muted' style='margin-bottom:8px;'>No saved months yet.</div>",
+                                unsafe_allow_html=True)
+
+                sh_in = st.text_area(
+                    "Paste performed month roster (month auto-detected)", height=140,
+                    key="salary_hist_input",
+                    placeholder="Paste a full month's performed roster here — the app figures out which month it belongs to…")
+
+                _det_rows = parse_roster_text(sh_in) if sh_in.strip() else []
+                _det_dates = [r["DateObj"].date() for r in _det_rows if r.get("DateObj")]
+                _det_ym = _month_of_roster(_det_dates) if _det_dates else None
+                if _det_dates and _det_ym is not None:
+                    _det_label = datetime(_det_ym[0], _det_ym[1], 1).strftime("%B %Y")
+                    if _det_ym < (2026, 1):
+                        st.markdown(
+                            f"<div style='font-size:12px;background:#331414;border:1px solid #ff5252;color:#ff8a8a;padding:8px;border-radius:8px;margin-bottom:6px;'>"
+                            f"📍 Detected month <b>{_det_label}</b> is before 2026 — pre-2026 history is auto-removed on load, so it won't persist. The app only supports 2026 onward.</div>",
+                            unsafe_allow_html=True)
                     else:
+                        st.markdown(
+                            f"<div style='font-size:12px;background:#12301f;border:1px solid #4caf50;color:#a5d6a7;padding:8px;border-radius:8px;margin-bottom:6px;'>"
+                            f"📍 Detected month: <b>{_det_label}</b></div>",
+                            unsafe_allow_html=True)
+                elif sh_in.strip():
+                    st.markdown("<div class='muted' style='font-size:12px;margin-bottom:6px;'>⚠️ No dates detected in the pasted text — check it parses.</div>", unsafe_allow_html=True)
+
+                if st.button("💾 Save month", use_container_width=True, key="sh_save"):
+                    if not sh_in.strip():
                         st.warning("Paste the performed roster text first.")
-                if hb2.button("🗑 Delete", use_container_width=True, key="sh_del"):
-                    delete_salary_history(st.session_state['username'], sh_key)
-                    st.success(datetime(sh_pick[0], sh_pick[1], 1).strftime("%B %Y") + " removed from salary history.")
-                    st.rerun()
-                if hb3.button("👁 Show", use_container_width=True, key="sh_show"):
-                    _show_rows, _ = salary_month_rows(st.session_state['username'], sh_pick, parsed_rows)
-                    if any(r["Type"] == "FLIGHT" for r in _show_rows):
-                        st.session_state['salary_month_pick'] = datetime(sh_pick[0], sh_pick[1], 1).strftime("%B %Y")
-                        st.rerun()
+                    elif _det_ym is None:
+                        st.warning("Couldn't detect a month from the pasted text — check the dates and try again.")
                     else:
-                        st.warning(datetime(sh_pick[0], sh_pick[1], 1).strftime("%B %Y")
-                                   + " has no full performed month yet — save it here, or finalize that month's periods in the Dashboard's Roster History.")
+                        _mlabel = datetime(_det_ym[0], _det_ym[1], 1).strftime("%B %Y")
+                        save_salary_history(st.session_state['username'], _month_key(_det_ym), sh_in)
+                        st.session_state['_sh_clear_flag'] = True
+                        st.success(f"{_mlabel} saved to salary history.")
+                        st.rerun()
 
             # --- performed roster input (salary is based on the PERFORMED month, not the live roster) ---
             if 'performed_roster' not in st.session_state:
