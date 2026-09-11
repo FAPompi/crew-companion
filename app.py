@@ -5263,6 +5263,15 @@ _TAB_ICON_SVGS = [
 ]
 _TAB_ICON_URIS = [_svg_uri(s) for s in _TAB_ICON_SVGS]
 
+
+def _icon_svg_inline(idx, size=26):
+    """Render a tab icon as an inline animated <svg> for use inside page headers
+    (inline SVG in st.markdown keeps its SMIL animation, unlike <img>/background)."""
+    svg = _TAB_ICON_SVGS[idx]
+    svg = svg.replace("<svg ", f'<svg width="{size}" height="{size}" ', 1)
+    return (f"<span style='display:inline-block;vertical-align:middle;"
+            f"margin-right:9px;line-height:0;'>{svg}</span>")
+
 # Inline SVG string as page_icon → Streamlit serves it as a data-URI favicon
 # (no file dependency, no cacheable /media URL, crisp vector).
 PAGE_ICON = _FAVICON_SVG
@@ -6178,7 +6187,7 @@ else:
                             unsafe_allow_html=True)
     # ================= 💰 SALARY CALCULATOR PAGE =================
     with page_salary:
-        st.markdown("#### 💰 Salary Calculator")
+        st.markdown(f"#### {_icon_svg_inline(1)}Salary Calculator", unsafe_allow_html=True)
         st.markdown("<div class='muted' style='margin-bottom:10px;'>Computed from your saved roster — same engine as the FAU sheet (meals, overnights, SCHBLK guarantee, 75h split, APIT). Set your profile once; everything else is automatic.</div>", unsafe_allow_html=True)
 
         saved = load_profile(st.session_state['username'])
@@ -6580,7 +6589,7 @@ else:
 
     # ================= 📊 SALARY ANALYTICS PAGE =================
     with page_analytics:
-        st.markdown("#### 📊 Salary Analytics")
+        st.markdown(f"#### {_icon_svg_inline(2)}Salary Analytics", unsafe_allow_html=True)
         st.markdown("<div class='muted' style='margin-bottom:10px;'>Full performed months only (1st – end), from finalized Roster History or saved salary history — partial months are excluded. Charts use your saved crew profile.</div>", unsafe_allow_html=True)
 
         a_saved = load_profile(st.session_state['username'])
@@ -6792,7 +6801,7 @@ else:
 
     # ================= \u23f1 FDP CALCULATOR PAGE =================
     with page_fdp:
-        st.markdown("#### \u23f1 FDP Calculator")
+        st.markdown(f"#### {_icon_svg_inline(3)}FDP Calculator", unsafe_allow_html=True)
         st.markdown(
             "<div class='muted' style='margin-bottom:10px;'>Standalone Flight Duty Period calculator for "
             "<b>cabin crew</b> \u2014 FOM Part A Chapter 08. Enter all times in <b>Colombo (CMB) local time</b>. "
