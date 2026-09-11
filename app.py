@@ -3628,19 +3628,28 @@ _ADD_SBY_CODES = ["SB1", "SB2", "SB3", "SB4", "ASB", "LSB", "SSY"]
 # Standby windows (start, end) — SB4 runs overnight into the next morning.
 _SBY_WINDOWS = {
     "SB1": ("00:01", "11:59"),
-    "SB2": ("12:00", "23:59"),
-    "SB3": ("06:00", "18:00"),
+    "SB2": ("06:00", "17:59"),
+    "SB3": ("12:00", "23:59"),
     "SB4": ("18:00", "05:59"),
 }
 
 # Layover trips: outbound flight -> return flight, nights away (counted from
 # the day the outbound ARRIVES), and optional per-weekday overrides (0=Mon..
 # 6=Sun) for routes where the layover length depends on the departure day.
+# Nights derived from the SriLankan timetable (flightsfrom.com, Sep 2026) and
+# the crew's own pasted rosters; schedules shift seasonally and the number of
+# nights is always editable in the add-flight form (a pasted roster's actual
+# hotel block always wins when present).
 LAYOVER_TRIPS = {
-    "UL253": {"ret": "UL254", "nights": 1, "dow": {}},   # Dammam
-    "UL265": {"ret": "UL266", "nights": 1, "dow": {}},   # Riyadh
-    "UL470": {"ret": "UL471", "nights": 2, "dow": {}},   # Seoul
-    "UL503": {"ret": "UL504", "nights": 2, "dow": {}},   # London
+    "UL253": {"ret": "UL254", "nights": 1, "dow": {}},          # Dammam — daily, 1 night
+    "UL265": {"ret": "UL266", "nights": 1, "dow": {}},          # Riyadh — 1 night
+    "UL470": {"ret": "UL471", "nights": 2, "dow": {1: 5}},      # Seoul — Sun=2, Tue=5 nights
+    "UL503": {"ret": "UL504", "nights": 2, "dow": {}},          # London — daily; 2 (winter can be 3)
+    "UL604": {"ret": "UL605", "nights": 1, "dow": {}},          # Melbourne — daily, 1 night
+    "UL606": {"ret": "UL607", "nights": 3, "dow": {}},          # Sydney — 3 nights
+    "UL880": {"ret": "UL885", "nights": 3, "dow": {}},          # Guangzhou (Tue) — 3 nights
+    "UL884": {"ret": "UL881", "nights": 1, "dow": {3: 5, 5: 3}},  # Guangzhou Mon/Thu/Sat — 1/5/3 nights
+    "UL557": {"ret": "UL558", "nights": 1, "dow": {}},          # Frankfurt — resumes winter; 1 night
 }
 
 
@@ -3783,8 +3792,10 @@ UL_DIRECT = {
     # --- China ---
     "UL891": {"o": "CMB", "d": "HKG", "dep": "18:10", "arr": "02:20", "ac": "332", "ret": "UL892", "ret_day": 1},
     "UL892": {"o": "HKG", "d": "CMB", "dep": "03:20", "arr": "05:50", "ac": "332"},
-    "UL880": {"o": "CMB", "d": "CAN", "dep": "14:00", "arr": "22:30", "ac": "32N", "ret": "UL881", "ret_day": 1},
-    "UL881": {"o": "CAN", "d": "CMB", "dep": "04:25", "arr": "07:30", "ac": "333"},
+    "UL880": {"o": "CMB", "d": "CAN", "dep": "14:00", "arr": "22:30", "ac": "32N", "ret": "UL885", "ret_day": 3},
+    "UL885": {"o": "CAN", "d": "CMB", "dep": "03:15", "arr": "06:05", "ac": "32A"},
+    "UL884": {"o": "CMB", "d": "CAN", "dep": "17:35", "arr": "02:26", "ac": "333", "ret": "UL881", "ret_day": 1},
+    "UL881": {"o": "CAN", "d": "CMB", "dep": "01:50", "arr": "04:35", "ac": "32A"},
     "UL866": {"o": "CMB", "d": "PVG", "dep": "14:15", "arr": "23:50", "ac": "332", "ret": "UL867", "ret_day": 1},
     "UL867": {"o": "PVG", "d": "CMB", "dep": "01:20", "arr": "05:40", "ac": "332"},
     "UL868": {"o": "CMB", "d": "PEK", "dep": "19:00", "arr": "05:10", "ac": "332", "ret": "UL869", "ret_day": 1},
@@ -3812,6 +3823,8 @@ UL_DIRECT = {
     "UL564": {"o": "CDG", "d": "CMB", "dep": "10:00", "arr": "23:30", "ac": "333"},
     "UL553": {"o": "CMB", "d": "FRA", "dep": "00:10", "arr": "07:05", "ac": "333", "ret": "UL554", "ret_day": 1},
     "UL554": {"o": "FRA", "d": "CMB", "dep": "09:00", "arr": "22:30", "ac": "333"},
+    "UL557": {"o": "CMB", "d": "FRA", "dep": "00:40", "arr": "07:05", "ac": "333", "ret": "UL558", "ret_day": 1},
+    "UL558": {"o": "FRA", "d": "CMB", "dep": "15:05", "arr": "05:34", "co": "06:04", "ac": "333"},
     "UL604": {"o": "CMB", "d": "MEL", "dep": "00:20", "arr": "14:40", "ac": "333", "ret": "UL605", "ret_day": 1},
     "UL605": {"o": "MEL", "d": "CMB", "dep": "16:10", "arr": "22:00", "ac": "333"},
     "UL606": {"o": "CMB", "d": "SYD", "dep": "00:05", "arr": "14:40", "ac": "333", "ret": "UL607", "ret_day": 1},
@@ -4150,14 +4163,17 @@ def _fill_flight_details(day=None):
         st.session_state['cedit_a_rdep'] = ri.get('dep', '')
         st.session_state['cedit_a_rarr'] = ri.get('arr', '')
         st.session_state['cedit_a_rco'] = _hm_shift(ri.get('arr', ''), 30)
-        st.session_state['cedit_a_rci'] = _hm_shift(ri.get('dep', ''), -80) if lay else ''
+        st.session_state['cedit_a_rci'] = _hm_shift(ri.get('dep', ''), -60) if lay else ''
         src = "your roster" if from_roster else "flight database"
         if lay:
             dep_t, arr_t = _parse_hm(dep), _parse_hm(arr)
             overnight = bool(dep_t and arr_t and arr_t < dep_t)
             nights = _lay_nights(lay, day) if day else lay['nights']
             st.session_state['cedit_a_retday'] = (1 if overnight else 0) + nights
+            st.session_state['cedit_a_nights'] = nights
             st.session_state['cedit_a_layover'] = True
+            if day:
+                st.session_state['cedit_a_retdate'] = day + timedelta(days=st.session_state['cedit_a_retday'])
             retdate = (day + timedelta(days=st.session_state['cedit_a_retday'])) if day else None
             st.success(f"Filled {fl}: {info['o']}→{info['d']} {dep}–{arr} · layover {nights} night(s)"
                        f" · returns {ret} {retdate.strftime('%d %b') if retdate else ''} · from {src}")
@@ -4357,6 +4373,20 @@ def _render_duty_add_form(rows, day):
         else:
             turn = st.checkbox("🔄 Turnaround — also add the return leg", key="cedit_a_turn")
 
+        # Live nights picker for layovers — lets you correct seasonal lengths
+        # (e.g. some winter Londons run longer) before saving.
+        if _lay and turn:
+            _li = _flight_info(_fl) or {}
+            _ldt = _parse_hm(_li.get('dep', '')); _lat = _parse_hm(_li.get('arr', ''))
+            _lovn = bool(_ldt and _lat and _lat < _ldt)
+            if 'cedit_a_nights' not in st.session_state:
+                st.session_state['cedit_a_nights'] = _lay_nights(_lay, day)
+            _n_pick = st.number_input("Nights away", min_value=0, max_value=21, step=1,
+                                      key="cedit_a_nights",
+                                      help="Auto-filled from the schedule — adjust for seasonal changes.")
+            st.session_state['cedit_a_retday'] = (1 if _lovn else 0) + int(_n_pick)
+            st.session_state['cedit_a_retdate'] = day + timedelta(days=st.session_state['cedit_a_retday'])
+
     elif ftype == "Standby":
         _sby_code = st.selectbox("Standby code", _ADD_SBY_CODES, key="cedit_sb_code",
                                  on_change=_sby_code_changed)
@@ -4381,8 +4411,9 @@ def _render_duty_add_form(rows, day):
             if turn:
                 if _lay:
                     _rd = int(st.session_state.get('cedit_a_retday', 0) or 0)
+                    _nn = int(st.session_state.get('cedit_a_nights', _lay_nights(_lay, day)) or 0)
                     st.caption("Return departs **" + (day + timedelta(days=_rd)).strftime('%d %b')
-                               + "** · hotel " + str(_lay_nights(_lay, day)) + " night(s)"
+                               + "** · hotel " + str(_nn) + " night(s)"
                                + " · From/To swap automatically.")
                     r1, r2, r3, r4, r5 = st.columns(5)
                     with r1:
@@ -4439,7 +4470,7 @@ def _render_duty_add_form(rows, day):
                         htl_start = arr_dt.date() if isinstance(arr_dt, datetime) else day
                         htl_co_t = _parse_hm(st.session_state.get('cedit_a_co', ''))
                         rci_t = (_parse_hm(st.session_state.get('cedit_a_rci', ''))
-                                 or _hm_shift(st.session_state.get('cedit_a_rdep', ''), -80))
+                                 or _hm_shift(st.session_state.get('cedit_a_rdep', ''), -60))
                         rdep_t = _parse_hm(st.session_state.get('cedit_a_rdep', ''))
                         rarr_t = _parse_hm(st.session_state.get('cedit_a_rarr', ''))
                         rco_t = _parse_hm(st.session_state.get('cedit_a_rco', ''))
