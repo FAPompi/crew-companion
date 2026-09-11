@@ -3644,12 +3644,13 @@ LAYOVER_TRIPS = {
     "UL253": {"ret": "UL254", "nights": 1, "dow": {}},          # Dammam — daily, 1 night
     "UL265": {"ret": "UL266", "nights": 1, "dow": {}},          # Riyadh — 1 night
     "UL470": {"ret": "UL471", "nights": 2, "dow": {1: 5}},      # Seoul — Sun=2, Tue=5 nights
-    "UL503": {"ret": "UL504", "nights": 2, "dow": {}},          # London — daily; 2 (winter can be 3)
+    "UL503": {"ret": "UL504", "nights": 1, "dow": {}},          # London — daily; 1 night (winter up to 2)
+    "UL563": {"ret": "UL564", "nights": 1, "dow": {}},          # Paris — 1 night
+    "UL557": {"ret": "UL558", "nights": 1, "dow": {}},          # Frankfurt — 1 night (resumes winter)
     "UL604": {"ret": "UL605", "nights": 1, "dow": {}},          # Melbourne — daily, 1 night
-    "UL606": {"ret": "UL607", "nights": 3, "dow": {}},          # Sydney — 3 nights
+    "UL606": {"ret": "UL607", "nights": 1, "dow": {}},          # Sydney — 1 night (varies — use the stepper)
     "UL880": {"ret": "UL885", "nights": 3, "dow": {}},          # Guangzhou (Tue) — 3 nights
     "UL884": {"ret": "UL881", "nights": 1, "dow": {3: 5, 5: 3}},  # Guangzhou Mon/Thu/Sat — 1/5/3 nights
-    "UL557": {"ret": "UL558", "nights": 1, "dow": {}},          # Frankfurt — resumes winter; 1 night
 }
 
 
@@ -3696,6 +3697,41 @@ def _remove_days(rows, lo, hi):
     for r in rows:
         cov = _row_coverage(r)
         if cov and not (cov[1] < lo or cov[0] > hi):
+            removed.append(r)
+        else:
+            kept.append(r)
+    return kept, removed
+
+
+def _time_span(r):
+    """(start, end) datetimes a row actually occupies, or None. Uses the same
+    fields as _row_coverage but keeps the times, so overlap checks can tell a
+    05:59 standby handover from an 08:00 duty apart."""
+    s = r.get('CIdt') or r.get('DEPdt')
+    e = r.get('COdt') or r.get('ARRdt')
+    if isinstance(s, datetime) and isinstance(e, datetime):
+        return s, e
+    d0 = r.get('DateObj')
+    if isinstance(d0, datetime):
+        d1 = r.get('EndDateObj')
+        if isinstance(d1, datetime) and d1.date() > d0.date():
+            return d0, d1
+        return d0, d0 + timedelta(days=1)
+    return None
+
+
+def _remove_conflicts(rows, new_row):
+    """Split rows into (kept, removed) — removed = any row whose time span
+    overlaps new_row's. Time-aware, so an overnight SB4 (18:00→05:59) clears a
+    full-day OFF or an early-morning duty on the next day, but leaves an
+    after-06:00 duty untouched."""
+    ns = _time_span(new_row)
+    if not ns:
+        return list(rows), []
+    kept, removed = [], []
+    for r in rows:
+        rs = _time_span(r)
+        if rs and not (rs[1] <= ns[0] or rs[0] >= ns[1]):
             removed.append(r)
         else:
             kept.append(r)
@@ -4511,7 +4547,13 @@ def _render_duty_add_form(rows, day):
                 else:
                     row = build_duty_row(day, "STANDBY", _sby_code, ci=_parse_hm(s0), dep=_parse_hm(s0),
                                          arr=_parse_hm(s1), co=_parse_hm(s1))
-                    _commit_roster_change(_sort_rows(list(rows) + [row]))
+                    kept, removed = _remove_conflicts(rows, row)
+                    note = None
+                    if removed:
+                        note = ("⏱ " + _sby_code + " added (" + row['Departure'] + "–"
+                                + row['Checkout'] + "). Removed to make room:\n"
+                                + "\n".join("• " + _row_summary(r) for r in removed))
+                    _commit_roster_change(_sort_rows(kept + [row]), note=note)
         elif ftype == "Day off":
             code = st.selectbox("Off code", _ADD_OFF_CODES, key="cedit_off_code")
             end = st.date_input("Until (leave = today for a single day)", value=day, key="cedit_off_end")
