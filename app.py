@@ -107,6 +107,12 @@ def init_db():
             PRIMARY KEY (username, month)
         )
     ''')
+    # Migration: 'excluded' flag — 1 when the user removed an auto-pulled month
+    # from the salary tab (kept as a marker so the month isn't silently re-pulled).
+    try:
+        c.execute("ALTER TABLE salary_history ADD COLUMN excluded INTEGER DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass   # column already present
     c.execute('''
         CREATE TABLE IF NOT EXISTS roster_history (
             username TEXT,
@@ -219,11 +225,46 @@ def _months_from_2026(upto_ym):
 def save_salary_history(username, month_key, text):
     conn = sqlite3.connect('crew_companion.db')
     c = conn.cursor()
-    c.execute('''INSERT INTO salary_history (username, month, roster_text, saved_at)
-                 VALUES (?, ?, ?, ?)
+    c.execute('''INSERT INTO salary_history (username, month, roster_text, saved_at, excluded)
+                 VALUES (?, ?, ?, ?, 0)
                  ON CONFLICT(username, month) DO UPDATE SET
-                   roster_text = excluded.roster_text, saved_at = excluded.saved_at''',
+                   roster_text = excluded.roster_text, saved_at = excluded.saved_at,
+                   excluded = 0''',
               (username, month_key, text, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+    conn.commit()
+    conn.close()
+
+
+def exclude_salary_month(username, month_key):
+    """Stop auto-pulling this month from finalized Roster History (a manual
+    entry, if any, is kept). Stored as a marker row with empty text."""
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    c.execute('''INSERT INTO salary_history (username, month, roster_text, saved_at, excluded)
+                 VALUES (?, ?, '', ?, 1)
+                 ON CONFLICT(username, month) DO UPDATE SET excluded = 1''',
+              (username, month_key, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+    conn.commit()
+    conn.close()
+
+
+def restore_salary_month(username, month_key):
+    """Undo an exclusion: drop the marker row (or clear the flag if a manual
+    entry exists under the same month)."""
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    c.execute('''SELECT roster_text FROM salary_history WHERE username = ? AND month = ?''',
+              (username, month_key))
+    row = c.fetchone()
+    if row is None:
+        conn.close()
+        return
+    if (row[0] or '').strip():
+        c.execute('''UPDATE salary_history SET excluded = 0 WHERE username = ? AND month = ?''',
+                  (username, month_key))
+    else:
+        c.execute('''DELETE FROM salary_history WHERE username = ? AND month = ?''',
+                  (username, month_key))
     conn.commit()
     conn.close()
 
@@ -237,11 +278,12 @@ def delete_salary_history(username, month_key):
 
 
 def load_salary_history(username):
-    """{month_key: {'text': ..., 'saved_at': ...}} for the user."""
+    """{month_key: {'text': ..., 'saved_at': ..., 'excluded': bool}} for the user."""
     conn = sqlite3.connect('crew_companion.db')
     c = conn.cursor()
-    c.execute('SELECT month, roster_text, saved_at FROM salary_history WHERE username = ?', (username,))
-    out = {mk: {"text": txt or "", "saved_at": sa} for mk, txt, sa in c.fetchall()}
+    c.execute('SELECT month, roster_text, saved_at, excluded FROM salary_history WHERE username = ?', (username,))
+    out = {mk: {"text": txt or "", "saved_at": sa, "excluded": bool(ex)}
+           for mk, txt, sa, ex in c.fetchall()}
     conn.close()
     return out
 
@@ -333,7 +375,7 @@ def salary_month_rows(username, ym, current_rows):
     sh = load_salary_history(username)
     if key in sh and sh[key]["text"].strip():
         return _clip_rows_to_month(parse_roster_text(sh[key]["text"]), ym), "manual"
-    if _month_full_performed_coverage(username, current_rows, y, m):
+    if not sh.get(key, {}).get("excluded") and _month_full_performed_coverage(username, current_rows, y, m):
         hist = _clip_rows_to_month(_finalized_performed_rows(username, current_rows), ym)
         if any(r["Type"] == "FLIGHT" for r in hist):
             return hist, "history"
@@ -350,17 +392,66 @@ def salary_available_months(username, current_rows):
     calendar month fully covered by finalized performed rosters or a full-month
     performed-slot paste. Partial months are NOT offered."""
     months = set()
-    for key in load_salary_history(username):
-        try:
-            months.add((int(key[:4]), int(key[5:7])))
-        except ValueError:
-            pass
+    for key, entry in load_salary_history(username).items():
+        if not entry.get("excluded") and entry.get("text", "").strip():
+            try:
+                months.add((int(key[:4]), int(key[5:7])))
+            except ValueError:
+                pass
     y, m = datetime.now().year, datetime.now().month
     for ym in _months_from_2026((y, m)):
         rows, _ = salary_month_rows(username, ym, current_rows)
         if any(r["Type"] == "FLIGHT" for r in rows):
             months.add(ym)
     return sorted(months)
+
+
+def _dt_fmt(dt_):
+    """Portal-style datetime stamp: 'DDMMMYY HH:MM'."""
+    if not isinstance(dt_, datetime):
+        return ""
+    return dt_.strftime("%d%b%y").upper() + " " + dt_.strftime("%H:%M")
+
+
+def _rows_to_roster_text(rows):
+    """Rebuild a tab-separated roster text from parsed rows (Activity | Checkin |
+    Start | Dep | Arr | End | Checkout | AcType), so an auto-pulled month can be
+    loaded into the paste box for editing. The parser is content-based, so this
+    round-trips cleanly (check-in cells stay on the first sector of each duty)."""
+    lines = ["Checkin\tActivity\tStart\tDep\tArr\tEnd\tCheckout\tAcType"]
+    for r in rows:
+        act = (r.get("Code") or r.get("Flight / Code") or r["Type"]).replace(" ", "")
+        if r["Type"] == "FLIGHT":
+            o, d = _route_od(r.get("Route"))
+            cells = [
+                _dt_fmt(r.get("CIdt")), act, _dt_fmt(r.get("DEPdt")),
+                o or "CMB", d or "CMB", _dt_fmt(r.get("ARRdt")), _dt_fmt(r.get("COdt")),
+                r.get("Aircraft") or "-",
+            ]
+        elif r["Type"] == "LAYOVER":
+            stn = (r.get("Route") or "CMB").strip()
+            cells = ["", act, _dt_fmt(r.get("DEPdt")), stn, stn, _dt_fmt(r.get("ARRdt")), "", "-"]
+        elif r["Type"] in ("STANDBY", "DUTY"):
+            cells = [
+                _dt_fmt(r.get("CIdt")), act, _dt_fmt(r.get("DEPdt")),
+                "CMB", "CMB", _dt_fmt(r.get("ARRdt")), _dt_fmt(r.get("COdt")), "-",
+            ]
+        else:  # DAY OFF / LEAVE / TIMEOFF
+            cells = ["", act, _dt_fmt(r.get("DEPdt")), "CMB", "CMB", _dt_fmt(r.get("ARRdt")), "", "-"]
+        lines.append("\t".join(cells))
+    return "\n".join(lines)
+
+
+def pulled_salary_months(username, current_rows):
+    """Months the salary calculator currently AUTO-PULLS from finalized Roster
+    History (source 'history' — no manual pin). Returns [(ym, rows), ...]."""
+    out = []
+    y, m = datetime.now().year, datetime.now().month
+    for ym in _months_from_2026((y, m)):
+        rows, src = salary_month_rows(username, ym, current_rows)
+        if src == "history":
+            out.append((ym, rows))
+    return out
 
 
 # --- roster periods ---
@@ -4474,10 +4565,11 @@ else:
             with st.expander("🗓 Salary History (per-month)", expanded=False):
                 # One-shot flags from the ✏️ / 💾 buttons below: applied here,
                 # BEFORE the text area is instantiated (the only safe time to
-                # rewrite a widget-backed key).
-                _sh_edit_target = st.session_state.pop('_sh_edit_target', None)
-                if _sh_edit_target is not None:
-                    st.session_state['salary_hist_input'] = sh.get(_sh_edit_target, {}).get("text", "")
+                # rewrite a widget-backed key). `_sh_edit_text` carries the text
+                # the ✏️ button wants loaded (manual entry or a pulled month).
+                _sh_edit_text = st.session_state.pop('_sh_edit_text', None)
+                if _sh_edit_text is not None:
+                    st.session_state['salary_hist_input'] = _sh_edit_text
                 if st.session_state.pop('_sh_clear_flag', False):
                     st.session_state['salary_hist_input'] = ''
 
@@ -4489,7 +4581,8 @@ else:
                     "A half-month, or a month still on the live roster, shows \u201cno data\u201d — never a guess.</div>",
                     unsafe_allow_html=True)
 
-                saved_sh = sorted(sh.items(), key=lambda kv: kv[0], reverse=True)
+                saved_sh = sorted([(mk, e) for mk, e in sh.items() if e.get("text", "").strip()],
+                                  key=lambda kv: kv[0], reverse=True)
                 if saved_sh:
                     for mk, entry in saved_sh:
                         try:
@@ -4505,13 +4598,13 @@ else:
                         s1, s2, s3, s4 = st.columns([6, 0.7, 0.7, 0.7])
                         with s1:
                             st.markdown(
-                                f"<div class='bidrow'><span>{mlabel}</span>"
+                                f"<div class='bidrow'><span>📌 {mlabel}</span>"
                                 f"<span>✅ {nf} flight(s) · {span}</span></div>",
                                 unsafe_allow_html=True)
                         with s2:
                             if st.button("✏️", key=f"sh_edit_{mk}",
                                          help=f"Load {mlabel} into the box below to edit"):
-                                st.session_state['_sh_edit_target'] = mk
+                                st.session_state['_sh_edit_text'] = entry.get("text", "")
                                 st.rerun()
                         with s3:
                             if st.button("🗑", key=f"sh_del_{mk}",
@@ -4531,6 +4624,70 @@ else:
                 else:
                     st.markdown("<div class='muted' style='margin-bottom:8px;'>No saved months yet.</div>",
                                 unsafe_allow_html=True)
+
+                # --- months AUTO-PULLED from the Dashboard's finalized Roster
+                # History (no manual pin) — shown so people can see what's being
+                # pulled and choose to pin (✏️ → edit & save) or remove (🗑). ---
+                pulled = pulled_salary_months(st.session_state['username'], parsed_rows)
+                if pulled:
+                    st.markdown("<div class='muted' style='font-size:11.5px;margin:10px 0 4px;'>🔗 Pulled from performed rosters (Roster History):</div>",
+                                unsafe_allow_html=True)
+                    for ym, prows in pulled:
+                        mk = _month_key(ym)
+                        mlabel = datetime(ym[0], ym[1], 1).strftime("%B %Y")
+                        dates = [r["DateObj"].date() for r in prows if r.get("DateObj")]
+                        nf = sum(1 for r in prows if r["Type"] == "FLIGHT")
+                        span = (f"{min(dates).strftime('%d %b')}\u2013{max(dates).strftime('%d %b')}"
+                                if dates else "no dates")
+                        s1, s2, s3, s4 = st.columns([6, 0.7, 0.7, 0.7])
+                        with s1:
+                            st.markdown(
+                                f"<div class='bidrow'><span>🔗 {mlabel}</span>"
+                                f"<span>{nf} flight(s) · {span}</span></div>",
+                                unsafe_allow_html=True)
+                        with s2:
+                            if st.button("✏️", key=f"sh_pull_edit_{mk}",
+                                         help=f"Load {mlabel} into the box to edit & save as a pinned month"):
+                                st.session_state['_sh_edit_text'] = _rows_to_roster_text(prows)
+                                st.rerun()
+                        with s3:
+                            if st.button("🗑", key=f"sh_pull_del_{mk}",
+                                         help=f"Stop pulling {mlabel} from performed rosters (remove it from salary)"):
+                                exclude_salary_month(st.session_state['username'], mk)
+                                st.success(f"{mlabel} will no longer be pulled into the salary tab.")
+                                st.rerun()
+                        with s4:
+                            if st.button("👁", key=f"sh_pull_show_{mk}",
+                                         help=f"Show {mlabel} in the payslip"):
+                                _show_rows, _ = salary_month_rows(st.session_state['username'], ym, parsed_rows)
+                                if any(r["Type"] == "FLIGHT" for r in _show_rows):
+                                    st.session_state['salary_month_pick'] = mlabel
+                                    st.rerun()
+                                else:
+                                    st.warning(mlabel + " has no full performed month yet.")
+
+                # --- months the user removed from salary (excluded) ---
+                hidden = sorted([(mk, e) for mk, e in sh.items()
+                                 if not e.get("text", "").strip() and e.get("excluded")],
+                                key=lambda kv: kv[0])
+                if hidden:
+                    htxt = ""
+                    for mk, _e in hidden:
+                        try:
+                            hym = (int(mk[:4]), int(mk[5:7]))
+                        except ValueError:
+                            continue
+                        hlabel = datetime(hym[0], hym[1], 1).strftime("%B %Y")
+                        htxt += f"<span style='margin-right:8px;white-space:nowrap;'>{hlabel} <span style='color:#8aa0b8;'>· hidden from salary</span></span>"
+                    st.markdown(
+                        f"<div class='muted' style='font-size:11.5px;margin:8px 0 4px;'>🙈 Removed from salary: {htxt}"
+                        f"</div>",
+                        unsafe_allow_html=True)
+                    for mk, _e in hidden:
+                        if st.button("↩", key=f"sh_restore_{mk}",
+                                     help=f"Restore {datetime(int(mk[:4]), int(mk[5:7]), 1).strftime('%B %Y')} to salary"):
+                            restore_salary_month(st.session_state['username'], mk)
+                            st.rerun()
 
                 sh_in = st.text_area(
                     "Paste performed month roster (month auto-detected)", height=140,
