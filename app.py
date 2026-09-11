@@ -3421,16 +3421,18 @@ def _duty_sectors_html(du, rows):
     return rows_html
 
 
-def layover_flight_duties(rows, station, lv_date):
+def layover_flight_duties(rows, station, lv_date, duties=None):
     """Inbound duty (last sector arrives at `station` on the layover start date)
     and outbound duty (departs `station` after the layover) — merged into the
     layover card so you don't have to click the flights separately."""
+    if duties is None:
+        duties = build_duties(rows)
     inbound = outbound = None
-    for du in build_duties(rows):
+    for du in duties:
         if (du["dest"] == station and isinstance(du["chocks_on"], datetime)
                 and du["chocks_on"].date() == lv_date):
             inbound = du
-    for du in build_duties(rows):
+    for du in duties:
         if (du["origin"] == station and isinstance(du["report"], datetime)
                 and du["report"].date() > lv_date):
             outbound = du
@@ -4583,37 +4585,67 @@ else:
 
             st.markdown(f"<div class='card'>{build_calendar_html(cal_rows, span=sel_span)}</div>", unsafe_allow_html=True)
 
-            # Flight & Layover Intel — one selector for every duty AND layover
+            # Flight & Layover Intel — grouped: each layover trip is ONE entry
+            # (inbound + 🏨 + outbound); standalone turnarounds get their own entry.
             if viewing_past:
                 st.markdown(_current_only_note("Flight & layover intel"), unsafe_allow_html=True)
             else:
-                intel_items = []   # (kind, payload, label)
-                for du in build_duties(parsed_rows):
-                    d0 = (du["sectors"][0]["dep"].date().strftime("%d %b")
-                          if isinstance(du["sectors"][0].get("dep"), datetime) else "")
-                    intel_items.append(("flight", du, f"✈ {du['label']}" + (f" — {d0}" if d0 else "")))
+                _duties = build_duties(parsed_rows)
+                _trip_duties = set()
+                _trips = []   # (layover, inbound, outbound)
                 for lv in analytics["layovers"]:
                     if not lv["station"]:
                         continue
+                    _inb, _outb = layover_flight_duties(parsed_rows, lv["station"], lv["date"], duties=_duties)
+                    if _inb is not None:
+                        _trip_duties.add(id(_inb))
+                    if _outb is not None:
+                        _trip_duties.add(id(_outb))
+                    _trips.append((lv, _inb, _outb))
+
+                intel_items = []   # (kind, payload, label, anchor_date)
+                for lv, _inb, _outb in _trips:
                     city = STATION_INFO.get(lv["station"], (lv["station"],))[0]
-                    intel_items.append(("layover", lv,
-                                        f"🏨 {city} ({lv['station']}) — {lv['date'].strftime('%d %b') if lv['date'] else '?'}"))
+                    _fns = []
+                    for _du in (_inb, _outb):
+                        if _du:
+                            _fns += [s["flight"].replace(" ", "") for s in _du["sectors"]]
+                    _fns = sorted(set(_fns))
+                    fl_lbl = "/".join(_fns) if _fns else "?"
+                    lo = (_inb["sectors"][0]["dep"].date()
+                          if _inb and isinstance(_inb["sectors"][0].get("dep"), datetime) else None)
+                    hi = (_outb["chocks_on"].date()
+                          if _outb and isinstance(_outb.get("chocks_on"), datetime) else None)
+                    if lo and hi and lo != hi:
+                        span = f"{lo.strftime('%d')}\u2013{hi.strftime('%d %b')}"
+                    elif hi:
+                        span = hi.strftime("%d %b")
+                    elif lo:
+                        span = lo.strftime("%d %b")
+                    else:
+                        span = ""
+                    _anchor = lo if lo else (lv["date"] if lv.get("date") else None)
+                    _lbl = f"🏨 {fl_lbl} · {city} ({lv['station']})" + (f" — {span}" if span else "")
+                    intel_items.append(("layover", lv, _lbl, _anchor))
+                for du in _duties:
+                    if id(du) in _trip_duties:
+                        continue   # already shown inside its layover-trip entry
+                    d0 = (du["sectors"][0]["dep"].date().strftime("%d %b")
+                          if isinstance(du["sectors"][0].get("dep"), datetime) else "")
+                    _anchor = (du["sectors"][0]["dep"].date()
+                               if isinstance(du["sectors"][0].get("dep"), datetime) else None)
+                    intel_items.append(("flight", du, f"✈ {du['label']}" + (f" — {d0}" if d0 else ""), _anchor))
+                intel_items.sort(key=lambda it: (it[3] is None, it[3] or datetime.min.date()))
                 if intel_items:
                     today = datetime.now().date()
                     def_idx = 0
-                    for i, (kind, payload, _lbl) in enumerate(intel_items):
-                        if kind == "flight":
-                            dep = payload["sectors"][0].get("dep")
-                            d = dep.date() if isinstance(dep, datetime) else None
-                        else:
-                            lvd = payload.get("date")
-                            d = lvd.date() if isinstance(lvd, datetime) else None
-                        if d is not None and d >= today:
+                    for i, (kind, payload, _lbl, _anchor) in enumerate(intel_items):
+                        if _anchor is not None and _anchor >= today:
                             def_idx = i
                             break
                     sel = st.selectbox("Flight & Layover Intel:", list(range(len(intel_items))), index=def_idx,
                                        format_func=lambda i: intel_items[i][2])
-                    kind, payload, _lbl = intel_items[sel]
+                    kind, payload, _lbl, _anchor = intel_items[sel]
                     if kind == "flight":
                         st.markdown(flight_intel_card(payload, parsed_rows), unsafe_allow_html=True)
                     else:
