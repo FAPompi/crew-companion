@@ -5343,6 +5343,7 @@ st.markdown("""
     .chip-cont { background:#0c2833; color:#4dd0e1; border-left:3px solid #4dd0e1; }
     .hbar { display:flex; align-items:center; justify-content:space-between; background:#121e2c;
             border:1px solid #1f2b3a; border-radius:12px; padding:10px 18px; margin-bottom:14px; }
+    .logo-slot { height:64px; display:inline-flex; align-items:center; overflow:visible; }
     .avatar { width:38px; height:38px; border-radius:50%; background:#0d3340; color:#4dd0e1;
               display:inline-flex; align-items:center; justify-content:center; font-weight:700; margin-right:10px; }
     .spot { background:#0f1926; border:1px solid #1f2b3a; border-radius:8px; padding:9px 11px;
@@ -5603,7 +5604,7 @@ else:
         st.markdown(
             f"<div class='hbar'>"
             f"<div style='display:flex;align-items:center;'>"
-            f"{_brand_logo(_logo_for_ring(80))}"
+            f"<span class='logo-slot'>{_brand_logo(_logo_for_ring(70))}</span>"
             f"<div style='margin-left:13px;'>"
             f"<div class='brand-word' style='font-size:20px;'>CHOCKS ON</div>"
             f"<div class='brand-tag'>Mind off. &nbsp;·&nbsp; {month_label}</div>"
