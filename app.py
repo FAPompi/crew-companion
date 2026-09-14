@@ -5178,9 +5178,29 @@ def compute_salary(rows, prof, acting=None):
 
 # --- 4. STREAMLIT CONFIG & UI ---
 # Brand: Chocks On — "Chocks on. Mind off." (flight-path roundel, see /branding/).
+# The paper plane rests at the end of its dotted flight path (82,48, nose -27°),
+# then every cycle it takes off and flies one smooth closed loop around the
+# OUTSIDE of the roundel (the dashed orbit circle agreed in /branding/, now
+# hidden) — over the top, down the right side, across the bottom — passes
+# through the gold origin dot (40,96), follows the flight path home, and lands
+# back at its perch in the exact static pose. No fade. The loop is a C1-smooth
+# Catmull-Rom spline tangent to -27° at the perch so takeoff/landing/rest all
+# match the static logo. SMIL (Chrome/Firefox); static on Safari.
+_LOGO_HOLD = 30.0     # seconds the plane sits still at its perch
+_LOGO_TRAVEL = 9.0    # seconds for one full loop
+_LOGO_CYCLE = _LOGO_HOLD + _LOGO_TRAVEL
+_LOGO_SCALE = 179.13 / 120.0   # render-size multiplier to keep the ring pixel-identical
+
+_LOGO_ORBIT_PATH = (
+    "M 0.00,0.00 C 11.05,-5.63 21.73,-29.62 30.00,-22.00 C 38.27,-14.38 53.97,26.78 49.60,45.70 "
+    "C 45.23,64.62 19.07,91.12 3.80,91.50 C -11.47,91.88 -38.41,57.36 -42.00,48.00 "
+    "C -45.59,38.64 -41.00,27.00 -34.00,19.00 C -27.00,11.00 -11.05,5.63 0.00,0.00"
+)
+
 def _brand_logo(size=40):
+    t_hold = _LOGO_HOLD / _LOGO_CYCLE
     return (
-        '<svg class="brand-logo" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" '
+        '<svg class="brand-logo" xmlns="http://www.w3.org/2000/svg" viewBox="-16.94 -15.05 179.13 179.13" '
         f'width="{size}" height="{size}">'
         '<defs><linearGradient id="bglg" x1="0" y1="0" x2="0" y2="1">'
         '<stop offset="0" stop-color="#0FB5AE"/><stop offset="1" stop-color="#0A7E7A"/>'
@@ -5192,14 +5212,18 @@ def _brand_logo(size=40):
         '<circle cx="40" cy="96" r="2.8" fill="#F0A93B"/>'
         '<path d="M40,96 C 30,70 58,60 82,48" stroke="#F0A93B" stroke-width="2.6" fill="none" '
         'stroke-linecap="round" stroke-dasharray="0.1 7.5" opacity="0.6"/>'
-        '<g transform="translate(82,48) rotate(-27) scale(1.7)">'
+        '<g transform="translate(82,48)"><g>'
+        f'<animateMotion path="{_LOGO_ORBIT_PATH}" '
+        f'dur="{_LOGO_CYCLE}s" repeatCount="indefinite" calcMode="spline" rotate="auto" '
+        f'keyTimes="0;{t_hold:.6f};1" keyPoints="0;0;1" keySplines="0 0 1 1;0.42 0 0.58 1"/>'
+        '<g transform="scale(1.7)">'
         '<path d="M15,0 L-9.5,10.5 L-13,0 Z" fill="#0A7E7A"/>'
         '<path d="M15,0 L-13,0 L-9.5,-10.5 Z" fill="#0FB5AE"/>'
         '<path d="M15,0 L-9.5,-10.5 L-6,-3.5 Z" fill="#FFFFFF" opacity="0.12"/>'
         '<path d="M15,0 L-13,0" stroke="#F0A93B" stroke-width="1.7" stroke-linecap="round"/>'
         '<path d="M15,0 L-4.6,-3.2 L-4.6,3.2 Z" fill="#35C7C0"/>'
         '<path d="M-4.6,-3.2 L-4.6,3.2" stroke="#0A7E7A" stroke-width="0.8" opacity="0.55"/>'
-        '</g></svg>'
+        '</g></g></g></svg>'
     )
 
 # --- brand micro-assets: favicon (SVG data-URI) + animated tab icons ---
@@ -5485,7 +5509,7 @@ if 'acked' not in st.session_state:
 if not st.session_state['logged_in']:
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        st.markdown(f"<div style='text-align:center;margin-bottom:2px;'>{_brand_logo(88)}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='text-align:center;margin-bottom:2px;'>{_brand_logo(int(88 * _LOGO_SCALE))}</div>", unsafe_allow_html=True)
         st.markdown("<div class='brand-word' style='text-align:center;font-size:34px;'>CHOCKS ON</div>", unsafe_allow_html=True)
         st.markdown("<div class='brand-tag' style='text-align:center;font-size:14px;margin-top:2px;'>Mind off.</div>", unsafe_allow_html=True)
         st.markdown("<div style='text-align:center;color:#7e8ba0;font-size:12px;margin:6px 0 16px;'>Your roster, salary &amp; rest — sorted before you land.</div>", unsafe_allow_html=True)
@@ -5575,7 +5599,7 @@ else:
         st.markdown(
             f"<div class='hbar'>"
             f"<div style='display:flex;align-items:center;'>"
-            f"{_brand_logo(42)}"
+            f"{_brand_logo(int(42 * _LOGO_SCALE))}"
             f"<div style='margin-left:13px;'>"
             f"<div class='brand-word' style='font-size:20px;'>CHOCKS ON</div>"
             f"<div class='brand-tag'>Mind off. &nbsp;·&nbsp; {month_label}</div>"
