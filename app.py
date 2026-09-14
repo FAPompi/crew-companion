@@ -5186,9 +5186,9 @@ def compute_salary(rows, prof, acting=None):
 # back at its perch in the exact static pose. No fade. The loop is a C1-smooth
 # Catmull-Rom spline tangent to -27° at the perch so takeoff/landing/rest all
 # match the static logo. SMIL (Chrome/Firefox); static on Safari.
-_LOGO_HOLD = 30.0     # seconds the plane sits still at its perch
+_LOGO_INITIAL = 2.0   # seconds after page load before the FIRST flight
+_LOGO_HOLD = 30.0     # seconds the plane sits still between loops
 _LOGO_TRAVEL = 9.0    # seconds for one full loop
-_LOGO_CYCLE = _LOGO_HOLD + _LOGO_TRAVEL
 # Size the logo by the VISIBLE ring diameter. The orbit viewBox is a square
 # centred on the ring (viewBox "-50 -50 220 220"), so the ring is 115/220 of
 # the rendered size and — crucially — the ring is CENTRED in the SVG (the old
@@ -5203,7 +5203,15 @@ _LOGO_ORBIT_PATH = (
 )
 
 def _brand_logo(size=40):
-    t_hold = _LOGO_HOLD / _LOGO_CYCLE
+    # Two SMIL segments: (1) a one-shot flight that BEGINS 2s after the SVG
+    # timeline starts (the plane sits at its perch until then), then (2) an
+    # indefinite 30s-pause-then-9s-flight loop starting at 11s. The first
+    # segment deliberately uses begin="2s" instead of begin="0s": begin="0s"
+    # races the SVG timeline origin in Chrome and intermittently never fires,
+    # which left the login logo frozen.
+    t_first = _LOGO_INITIAL + _LOGO_TRAVEL
+    t_loop = _LOGO_HOLD + _LOGO_TRAVEL
+    kt_loop = f"0;{_LOGO_HOLD / t_loop:.6f};1"
     return (
         '<svg class="brand-logo" xmlns="http://www.w3.org/2000/svg" viewBox="-50 -50 220 220" '
         f'width="{size}" height="{size}">'
@@ -5218,9 +5226,12 @@ def _brand_logo(size=40):
         '<path d="M40,96 C 30,70 58,60 82,48" stroke="#F0A93B" stroke-width="2.6" fill="none" '
         'stroke-linecap="round" stroke-dasharray="0.1 7.5" opacity="0.6"/>'
         '<g transform="translate(82,48)"><g>'
-        f'<animateMotion path="{_LOGO_ORBIT_PATH}" '
-        f'dur="{_LOGO_CYCLE}s" repeatCount="indefinite" calcMode="spline" rotate="auto" '
-        f'keyTimes="0;{t_hold:.6f};1" keyPoints="0;0;1" keySplines="0 0 1 1;0.42 0 0.58 1"/>'
+        f'<animateMotion path="{_LOGO_ORBIT_PATH}" dur="{_LOGO_TRAVEL}s" begin="{_LOGO_INITIAL}s" fill="freeze" '
+        f'calcMode="spline" rotate="auto" keyTimes="0;1" keyPoints="0;1" '
+        f'keySplines="0.42 0 0.58 1"/>'
+        f'<animateMotion path="{_LOGO_ORBIT_PATH}" dur="{t_loop}s" begin="{t_first}s" '
+        f'repeatCount="indefinite" calcMode="spline" rotate="auto" keyTimes="{kt_loop}" '
+        f'keyPoints="0;0;1" keySplines="0 0 1 1;0.42 0 0.58 1"/>'
         '<g transform="scale(1.7)">'
         '<path d="M15,0 L-9.5,10.5 L-13,0 Z" fill="#0A7E7A"/>'
         '<path d="M15,0 L-13,0 L-9.5,-10.5 Z" fill="#0FB5AE"/>'
@@ -5380,10 +5391,8 @@ st.markdown(
 # ===== Chocks On brand skin (items 1–7): theme, widgets, alerts, login card, accents =====
 _BG_FLIGHTPATH = (
     '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800">'
-    '<path d="M-40,660 C 260,540 500,580 780,430" stroke="#0FB5AE" stroke-width="2" fill="none" stroke-dasharray="0.1 12" opacity="0.30"/>'
-    '<circle cx="780" cy="430" r="5" fill="#0FB5AE" opacity="0.30"/>'
-    '<path d="M1240,140 C 1100,170 1020,170 900,150" stroke="#0FB5AE" stroke-width="2" fill="none" stroke-dasharray="0.1 12" opacity="0.20"/>'
-    '<circle cx="900" cy="150" r="5" fill="#0FB5AE" opacity="0.20"/>'
+    '<path d="M-40,660 C 260,540 500,580 780,430" stroke="#0FB5AE" stroke-width="2" fill="none" stroke-linecap="round" stroke-dasharray="0.1 12" opacity="0.30"/>'
+    '<path d="M1240,140 C 1100,170 1020,170 900,150" stroke="#0FB5AE" stroke-width="2" fill="none" stroke-linecap="round" stroke-dasharray="0.1 12" opacity="0.20"/>'
     '</svg>'
 )
 _BRAND_SKIN_CSS = """
