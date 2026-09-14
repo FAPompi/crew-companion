@@ -125,6 +125,23 @@ def init_db():
             PRIMARY KEY (username, period_start)
         )
     ''')
+    # Alerts inbox — persistent per-user feed of audit findings (in-app only for
+    # now; email/SMS notifications are a later decision).
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            category TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            message TEXT NOT NULL,
+            source_key TEXT NOT NULL,
+            first_seen TEXT NOT NULL,
+            last_seen TEXT NOT NULL,
+            is_read INTEGER NOT NULL DEFAULT 0,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            UNIQUE (username, source_key)
+        )
+    ''')
     conn.commit()
     conn.close()
 
@@ -133,6 +150,116 @@ def make_hash(password):
 
 def check_hash(password, hashed_text):
     return make_hash(password) == hashed_text
+
+
+# --- Alerts inbox (in-app notification feed; email/SMS later) ---
+def _alert_source_key(category, severity, message):
+    return hashlib.md5(f"{category}|{severity}|{message}".encode("utf-8")).hexdigest()
+
+
+def inbox_sync(username, current):
+    """Upsert the current (category, severity, message) alerts for a user, deactivate
+    any that are no longer present, and return (active, resolved, unread_count)."""
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    now = datetime.now().isoformat(timespec='seconds')
+    keys = []
+    for category, severity, message in current:
+        k = _alert_source_key(category, severity, message)
+        keys.append(k)
+        c.execute('''
+            INSERT INTO alerts (username, category, severity, message, source_key,
+                                first_seen, last_seen, is_read, is_active)
+            VALUES (?,?,?,?,?,?,?,0,1)
+            ON CONFLICT(username, source_key) DO UPDATE SET
+                category=excluded.category,
+                severity=excluded.severity,
+                message=excluded.message,
+                last_seen=excluded.last_seen,
+                is_active=1
+        ''', (username, category, severity, message, k, now, now))
+    if keys:
+        ph = ",".join("?" for _ in keys)
+        c.execute(f"UPDATE alerts SET is_active=0 WHERE username=? AND is_active=1 AND source_key NOT IN ({ph})",
+                  [username] + keys)
+    else:
+        c.execute("UPDATE alerts SET is_active=0 WHERE username=? AND is_active=1", (username,))
+    conn.commit()
+    c.execute('''
+        SELECT id, category, severity, message, first_seen, last_seen, is_read
+        FROM alerts WHERE username=? AND is_active=1
+        ORDER BY CASE severity WHEN 'violation' THEN 0 WHEN 'warning' THEN 1 ELSE 2 END,
+                 last_seen DESC, id DESC
+    ''', (username,))
+    active = [{"id": r[0], "category": r[1], "severity": r[2], "message": r[3],
+               "first_seen": r[4], "last_seen": r[5], "is_read": r[6]} for r in c.fetchall()]
+    c.execute("SELECT COUNT(*) FROM alerts WHERE username=? AND is_active=1 AND is_read=0", (username,))
+    unread = c.fetchone()[0]
+    c.execute('''
+        SELECT id, category, severity, message, first_seen, last_seen, is_read
+        FROM alerts WHERE username=? AND is_active=0
+        ORDER BY last_seen DESC, id DESC
+    ''', (username,))
+    resolved = [{"id": r[0], "category": r[1], "severity": r[2], "message": r[3],
+                 "first_seen": r[4], "last_seen": r[5], "is_read": r[6]} for r in c.fetchall()]
+    conn.close()
+    return active, resolved, unread
+
+
+def inbox_mark_all_read(username):
+    conn = sqlite3.connect('crew_companion.db')
+    conn.execute("UPDATE alerts SET is_read=1 WHERE username=? AND is_active=1", (username,))
+    conn.commit()
+    conn.close()
+
+
+def inbox_clear_resolved(username):
+    conn = sqlite3.connect('crew_companion.db')
+    conn.execute("DELETE FROM alerts WHERE username=? AND is_active=0", (username,))
+    conn.commit()
+    conn.close()
+
+
+def _render_inbox(username, active, resolved, unread):
+    """Render the inbox contents inside the header bell popover."""
+    if not active and not resolved:
+        st.markdown("<div class='muted'>No alerts yet — paste your roster to run the audits.</div>",
+                    unsafe_allow_html=True)
+        return
+    if not active:
+        st.markdown("<div style='color:#a5d6a7;font-weight:700;'>✅ All clear — no active alerts.</div>",
+                    unsafe_allow_html=True)
+    else:
+        for a in active:
+            if a["severity"] == "violation":
+                chip, border, bg, fg = "⚠️ Breach", "#ff5252", "#2c1f1f", "#ff8a8a"
+            elif a["severity"] == "warning":
+                chip, border, bg, fg = "▲ Warning", "#ff6d00", "#332414", "#ffb74d"
+            else:
+                chip, border, bg, fg = "ℹ️ Note", "#ffc107", "#33260f", "#ffd54f"
+            new_chip = ("<span style='background:#00bcd4;color:#06212b;border-radius:4px;"
+                        "padding:0 5px;font-size:10px;font-weight:700;margin-right:4px;'>NEW</span>"
+                        if not a["is_read"] else "")
+            st.markdown(
+                f"<div style='font-size:12px;background:{bg};border:1px solid {border};color:{fg};"
+                f"padding:8px;border-radius:8px;margin-bottom:6px;'>"
+                f"{new_chip}<b>{chip}</b> · <span style='color:#9fb3c8;'>{a['category']}</span><br>"
+                f"{a['message']}</div>",
+                unsafe_allow_html=True)
+        if unread:
+            if st.button("Mark all as read", key="inbox_mark_read", use_container_width=True):
+                inbox_mark_all_read(username)
+                st.rerun()
+    if resolved:
+        with st.expander(f"Resolved / past ({len(resolved)})"):
+            for a in resolved:
+                st.markdown(
+                    f"<div style='font-size:11.5px;color:#8aa0b8;padding:4px 0;"
+                    f"border-bottom:1px solid #22374d;'>{a['category']} · {a['message']}</div>",
+                    unsafe_allow_html=True)
+            if st.button("Clear resolved", key="inbox_clear_resolved", use_container_width=True):
+                inbox_clear_resolved(username)
+                st.rerun()
 
 def add_user(username, password, full_name, rank):
     conn = sqlite3.connect('crew_companion.db')
@@ -2370,7 +2497,8 @@ def _mins_between(dep_str, arr_str):
         return 0
 
 def compute_analytics(rows):
-    block_min, redeyes, n_flights = 0, 0, 0
+    block_min, flown_min, redeyes, n_flights = 0, 0, 0, 0
+    _today_ana = datetime.now().date()
     duty_days, daily_min = set(), {}
     layovers = enrich_layovers(rows)
     for r in rows:
@@ -2384,6 +2512,8 @@ def compute_analytics(rows):
             else:
                 continue
             block_min += m
+            if r["DateObj"] and r["DateObj"].date() <= _today_ana:
+                flown_min += m
             n_flights += 1
             try:
                 h = int(r["Departure"][:2])
@@ -2401,6 +2531,7 @@ def compute_analytics(rows):
         streak = streak + 1 if (days[i] - days[i-1]).days == 1 else 1
         max_streak = max(max_streak, streak)
     block_hrs = block_min / 60
+    block_flown = flown_min / 60
     fat = compute_fatigue(rows)
     fatigue = fat["score"]
     fat_label = fat["label"]
@@ -2410,7 +2541,7 @@ def compute_analytics(rows):
         nights = lv.get("nights") or (max(1, int((lv["ground_hrs"] or 24) // 24)) if lv["ground_hrs"] else 1)
         rate = PER_DIEM.get(stn, PER_DIEM_DEFAULT)
         allow_rows.append((stn, nights, rate, nights * rate))
-    return {"block_hrs": round(block_hrs, 1), "block_target": 85, "flights": n_flights,
+    return {"block_hrs": round(block_hrs, 1), "block_flown": round(block_flown, 1), "flights": n_flights,
             "redeyes": redeyes, "max_streak": max_streak, "fatigue": fatigue,
             "fatigue_label": fat_label, "fatigue_parts": fat["parts"], "daily_min": daily_min,
             "allowance_rows": allow_rows, "allowance_total": sum(a[3] for a in allow_rows),
@@ -5605,11 +5736,31 @@ else:
         _p0, _p1 = roster_period_bounds(datetime.now().date())
         month_label = f"Roster {_p0.strftime('%d %b')} – {_p1.strftime('%d %b %Y')}"
 
+    # ---- Alerts inbox: aggregate every check on the CURRENT roster ----
+    _inbox_current = []
+
+    def _add_alert(cat, sev, msg):
+        _inbox_current.append((cat, sev, msg))
+
+    if parsed_rows:
+        _inbox_period = roster_period_of_roster(valid_dates_all)
+        _inbox_ctx = (surrounding_rows(st.session_state['username'], parsed_rows, _inbox_period)
+                      if _inbox_period is not None else [])
+        for _sev, _msg in fdp_roster_audit(parsed_rows, context_rows=_inbox_ctx)["findings"]:
+            _add_alert("FDP & Rest", _sev, _msg)
+        for _sev, _msg in audit_roster(parsed_rows):
+            _add_alert("Roster Guardian", _sev, _msg)
+        for _msg in cross_period_cumulative(st.session_state['username'], parsed_rows)["findings"]:
+            _add_alert("Cumulative Limits", "violation", _msg)
+        if analytics["fatigue"] >= 7:
+            _add_alert("Fatigue", "warning",
+                       f"Fatigue score {analytics['fatigue']}/10 ({analytics['fatigue_label']}) on the current roster.")
+    inbox_active, inbox_resolved, inbox_unread = inbox_sync(st.session_state['username'], _inbox_current)
+
     # ---------- HEADER ----------
     initials = "".join(w[0] for w in st.session_state['full_name'].split()[:2]).upper() or "?"
-    n_alerts = st.session_state.get('alert_count', 0)
-    bell = f"🔔 <span style='color:#ff5252;font-weight:700;'>{n_alerts}</span>" if n_alerts else "🔔"
-    hcol1, hcol2 = st.columns([6, 1])
+    _bell_label = f"🔔 {inbox_unread}" if inbox_unread else "🔔"
+    hcol1, hcol2, hcol3 = st.columns([6, 1, 1])
     with hcol1:
         st.markdown(
             f"<div class='hbar'>"
@@ -5620,11 +5771,13 @@ else:
             f"<div class='brand-tag'>Mind off. &nbsp;·&nbsp; {month_label}</div>"
             f"</div></div>"
             f"<div style='display:flex;align-items:center;'>"
-            f"<span style='margin-right:18px;font-size:16px;'>{bell}</span>"
             f"<span class='avatar'>{initials}</span>"
             f"<span style='font-size:13px;'>{st.session_state['full_name']}<br><span class='muted'>({st.session_state['rank']})</span></span>"
             f"</div></div>", unsafe_allow_html=True)
     with hcol2:
+        with st.popover(_bell_label, use_container_width=True):
+            _render_inbox(st.session_state['username'], inbox_active, inbox_resolved, inbox_unread)
+    with hcol3:
         if st.button("Log Out", use_container_width=True):
             st.session_state['logged_in'] = False
             st.rerun()
@@ -5685,12 +5838,21 @@ else:
                     f"<div class='muted' style='font-size:12px;margin-bottom:8px;'>"
                     f"Showing <b>{_view_label}</b> (performed) \u2014 archived period.</div>",
                     unsafe_allow_html=True)
-            pct = view_analytics["block_hrs"] / view_analytics["block_target"] if view_analytics["block_target"] else 0
-            donut = donut_svg(pct, str(view_analytics["block_hrs"]), f"of {view_analytics['block_target']} hrs")
+            _total_fly = view_analytics["block_hrs"] or 0.0
+            _flown = view_analytics["block_flown"]
+            _pct_fly = (_flown / _total_fly) if _total_fly else 0.0
+            donut = donut_svg(_pct_fly, f"{_flown:g}", f"of {_total_fly:g} hrs")
+            if viewing_past and _view_label:
+                _blk_cap = f"this period (performed) \u00b7 {view_analytics['flights']} sectors"
+            elif _total_fly:
+                _blk_cap = (f"flown so far ({_pct_fly*100:.0f}% of this roster's flying) "
+                            f"\u00b7 {view_analytics['flights']} sectors")
+            else:
+                _blk_cap = "no flying rostered this period"
             st.markdown(
                 f"<div class='card' style='text-align:center;'><h5>Cumulative Block Hours</h5>"
                 f"{donut}"
-                f"<div class='muted'>this {'period' if _view_label else 'roster'} ({pct*100:.0f}%) \u00b7 {view_analytics['flights']} sectors</div></div>",
+                f"<div class='muted'>{_blk_cap}</div></div>",
                 unsafe_allow_html=True)
             spark = sparkline_svg([view_analytics['daily_min'].get(d, 0) for d in sorted(view_analytics['daily_min'])] or [0])
             fat_color = "#4caf50" if view_analytics['fatigue'] < 4 else ("#ff9800" if view_analytics['fatigue'] < 7 else "#ff5252")
