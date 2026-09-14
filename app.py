@@ -5189,11 +5189,12 @@ def compute_salary(rows, prof, acting=None):
 _LOGO_HOLD = 30.0     # seconds the plane sits still at its perch
 _LOGO_TRAVEL = 9.0    # seconds for one full loop
 _LOGO_CYCLE = _LOGO_HOLD + _LOGO_TRAVEL
-# Size the logo by the VISIBLE ring diameter (the orbit viewBox is oversized, so
-# the ring is only 115/179.13 of the rendered size). ring_px = desired outer-ring
-# diameter in pixels.
+# Size the logo by the VISIBLE ring diameter. The orbit viewBox is a square
+# centred on the ring (viewBox "-50 -50 220 220"), so the ring is 115/220 of
+# the rendered size and — crucially — the ring is CENTRED in the SVG (the old
+# asymmetric viewBox offset the ring toward the top-left).
 def _logo_for_ring(ring_px):
-    return int(ring_px * 179.13 / 115.0)
+    return int(ring_px * 220.0 / 115.0)
 
 _LOGO_ORBIT_PATH = (
     "M 0.00,0.00 C 11.05,-5.63 21.73,-29.62 30.00,-22.00 C 38.27,-14.38 53.97,26.78 49.60,45.70 "
@@ -5204,7 +5205,7 @@ _LOGO_ORBIT_PATH = (
 def _brand_logo(size=40):
     t_hold = _LOGO_HOLD / _LOGO_CYCLE
     return (
-        '<svg class="brand-logo" xmlns="http://www.w3.org/2000/svg" viewBox="-16.94 -15.05 179.13 179.13" '
+        '<svg class="brand-logo" xmlns="http://www.w3.org/2000/svg" viewBox="-50 -50 220 220" '
         f'width="{size}" height="{size}">'
         '<defs><linearGradient id="bglg" x1="0" y1="0" x2="0" y2="1">'
         '<stop offset="0" stop-color="#0FB5AE"/><stop offset="1" stop-color="#0A7E7A"/>'
@@ -5604,7 +5605,7 @@ else:
         st.markdown(
             f"<div class='hbar'>"
             f"<div style='display:flex;align-items:center;'>"
-            f"<span class='logo-slot'>{_brand_logo(_logo_for_ring(70))}</span>"
+            f"<span class='logo-slot'>{_brand_logo(_logo_for_ring(64))}</span>"
             f"<div style='margin-left:13px;'>"
             f"<div class='brand-word' style='font-size:20px;'>CHOCKS ON</div>"
             f"<div class='brand-tag'>Mind off. &nbsp;·&nbsp; {month_label}</div>"
