@@ -284,6 +284,33 @@ def login_user(username, password):
         return data
     return None
 
+
+def update_profile(username, full_name, rank):
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    c.execute('UPDATE users SET full_name=?, rank=? WHERE username=?', (full_name, rank, username))
+    conn.commit()
+    conn.close()
+
+
+def change_password(username, new_password):
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    c.execute('UPDATE users SET password=? WHERE username=?', (make_hash(new_password), username))
+    conn.commit()
+    conn.close()
+
+
+def delete_account(username):
+    """Remove the user and every row they own across all tables."""
+    conn = sqlite3.connect('crew_companion.db')
+    c = conn.cursor()
+    for table in ('users', 'rosters', 'profiles', 'performed_rosters',
+                  'salary_history', 'roster_history', 'alerts'):
+        c.execute(f'DELETE FROM {table} WHERE username=?', (username,))
+    conn.commit()
+    conn.close()
+
 def save_roster_to_db(username, text):
     conn = sqlite3.connect('crew_companion.db')
     c = conn.cursor()
@@ -5431,6 +5458,15 @@ _TAB_ICON_SVGS = [
      '<path d="M12 12V7" stroke="#F0A93B" stroke-width="1.9" stroke-linecap="round"/>'
      '<path d="M12 12H15.8" stroke="#0A7E7A" stroke-width="1.5" stroke-linecap="round" opacity="0.75"/>'
      '</g><circle cx="12" cy="12" r="1.1" fill="#F0A93B"/></svg>'),
+    # 4 · Account — settings sliders
+    ('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">'
+     '<path d="M4 7h8M16.5 7H20M4 12h2M10.5 12H20M4 17h10M18.5 17H20" stroke="#0FB5AE" stroke-width="1.6" stroke-linecap="round"/>'
+     '<circle cx="14.5" cy="7" r="2" fill="#F0A93B">'
+     '<animate attributeName="r" values="2;2.7;2" dur="2.8s" repeatCount="indefinite"/></circle>'
+     '<circle cx="8.5" cy="12" r="2" fill="#0FB5AE"/>'
+     '<circle cx="16.5" cy="17" r="2" fill="#0A7E7A">'
+     '<animate attributeName="opacity" values="1;0.45;1" dur="3.2s" repeatCount="indefinite"/></circle>'
+     '</svg>'),
 ]
 _TAB_ICON_URIS = [_svg_uri(s) for s in _TAB_ICON_SVGS]
 
@@ -5514,6 +5550,7 @@ st.markdown(
 [data-testid="stTabs"]:has([data-testid="stTab"][data-key="3"]) [data-testid="stTab"][data-key="1"] {{ background-image: url("{_TAB_ICON_URIS[1]}") !important; }}
 [data-testid="stTabs"]:has([data-testid="stTab"][data-key="3"]) [data-testid="stTab"][data-key="2"] {{ background-image: url("{_TAB_ICON_URIS[2]}") !important; }}
 [data-testid="stTabs"]:has([data-testid="stTab"][data-key="3"]) [data-testid="stTab"][data-key="3"] {{ background-image: url("{_TAB_ICON_URIS[3]}") !important; }}
+[data-testid="stTabs"]:has([data-testid="stTab"][data-key="3"]) [data-testid="stTab"][data-key="4"] {{ background-image: url("{_TAB_ICON_URIS[4]}") !important; }}
 </style>
 """,
     unsafe_allow_html=True,
@@ -5637,6 +5674,17 @@ button[kind="secondary"]:hover, [data-testid="stBaseButton-secondary"]:hover {
 ::-webkit-scrollbar-thumb { background: #1F3348; border-radius: 8px; }
 ::-webkit-scrollbar-thumb:hover { background: #0FB5AE; }
 * { scrollbar-width: thin; scrollbar-color: #1F3348 #0B1F33; }
+
+/* 8 · mobile-friendly (Path A · phase 1) */
+@media (max-width: 768px) {
+    .block-container { padding: 0.7rem 0.5rem !important; }
+    .hbar { flex-wrap: wrap !important; gap: 8px !important; padding: 10px 12px !important; }
+    .hbar > div { flex-wrap: wrap; row-gap: 4px; }
+    .brand-word { font-size: 16px !important; }
+    .cal-cell { min-height: 56px !important; padding: 4px 5px !important; }
+    .cal-date { font-size: 11px !important; }
+    .chip { font-size: 10.5px !important; padding: 2px 4px !important; }
+}
 
 /* tidy: hide the Streamlit "Deploy" button (Cloud-only noise) */
 [data-testid="stAppDeployButton"] { display: none; }
@@ -5782,7 +5830,7 @@ else:
             st.session_state['logged_in'] = False
             st.rerun()
 
-    page_dash, page_salary, page_analytics, page_fdp = st.tabs(["Dashboard", "Salary Calculator", "Salary Analytics", "FDP Calculator"])
+    page_dash, page_salary, page_analytics, page_fdp, page_acct = st.tabs(["Dashboard", "Salary Calculator", "Salary Analytics", "FDP Calculator", "⚙️ Account"])
 
     with page_dash:
         _cur_period = roster_period_of_roster(valid_dates_all) if valid_dates_all else None
@@ -7626,3 +7674,68 @@ else:
 - CMB\u2013London/CDG/Frankfurt layovers reporting **2200\u20130559** local: max FDP **13:00**, extendable with in-flight
   relief \u2014 and **6 Economy seats must be blocked** for cabin-crew rest.
 """)
+
+    # ---------- ⚙️ ACCOUNT SETTINGS ----------
+    with page_acct:
+        st.markdown("#### ⚙️ Account Settings")
+        _acct_user = st.session_state['username']
+
+        if st.session_state.get('_acct_flash'):
+            st.success(st.session_state.pop('_acct_flash'))
+
+        # --- Profile ---
+        st.markdown("##### Profile")
+        _rank_opts = ["Senior Cabin Crew", "Cabin Crew", "Purser", "Flight Deck"]
+        _cur_rank = st.session_state.get('rank', 'Senior Cabin Crew')
+        _rank_idx = _rank_opts.index(_cur_rank) if _cur_rank in _rank_opts else 0
+        acct_a, acct_b = st.columns(2)
+        with acct_a:
+            st.text_input("Username / login email", value=_acct_user, disabled=True, key="acct_user_ro")
+        with acct_b:
+            new_rank = st.selectbox("Rank", _rank_opts, index=_rank_idx, key="acct_rank")
+        new_name = st.text_input("Full name", value=st.session_state.get('full_name', ''), key="acct_name")
+        if st.button("Save profile", key="acct_save", use_container_width=True):
+            _nm = new_name.strip() or st.session_state.get('full_name', '')
+            update_profile(_acct_user, _nm, new_rank)
+            st.session_state['full_name'] = _nm
+            st.session_state['rank'] = new_rank
+            st.session_state['_acct_flash'] = "Profile updated."
+            st.rerun()
+
+        st.markdown("---")
+        # --- Change password ---
+        st.markdown("##### Change password")
+        with st.form("acct_pw_form", clear_on_submit=True):
+            cur_pw = st.text_input("Current password", type="password", key="acct_curpw")
+            new_pw = st.text_input("New password", type="password", key="acct_newpw")
+            new_pw2 = st.text_input("Confirm new password", type="password", key="acct_newpw2")
+            pw_submit = st.form_submit_button("Change password", use_container_width=True)
+        if pw_submit:
+            if login_user(_acct_user, cur_pw) is None:
+                st.error("Current password is incorrect.")
+            elif len(new_pw) < 6:
+                st.warning("New password must be at least 6 characters.")
+            elif new_pw != new_pw2:
+                st.warning("New passwords do not match.")
+            else:
+                change_password(_acct_user, new_pw)
+                st.session_state['_acct_flash'] = "Password changed."
+                st.rerun()
+
+        st.markdown("---")
+        # --- Danger zone ---
+        st.markdown("##### ⚠️ Danger zone")
+        st.markdown(
+            "<div class='muted'>Deleting your account permanently removes your roster, finalized "
+            "history, salary records and alerts. This cannot be undone.</div>",
+            unsafe_allow_html=True)
+        _del_confirm = st.text_input("To confirm, type your username", key="acct_del_confirm")
+        if st.button("🗑 Delete my account", key="acct_delete", use_container_width=True):
+            if _del_confirm.strip() == _acct_user:
+                delete_account(_acct_user)
+                for _k in ('logged_in', 'username', 'full_name', 'rank', 'current_roster', 'acked'):
+                    st.session_state.pop(_k, None)
+                st.session_state['logged_in'] = False
+                st.rerun()
+            else:
+                st.error(f"Type your username ({_acct_user}) to confirm deletion.")
