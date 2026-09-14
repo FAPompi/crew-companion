@@ -5189,7 +5189,11 @@ def compute_salary(rows, prof, acting=None):
 _LOGO_HOLD = 30.0     # seconds the plane sits still at its perch
 _LOGO_TRAVEL = 9.0    # seconds for one full loop
 _LOGO_CYCLE = _LOGO_HOLD + _LOGO_TRAVEL
-_LOGO_SCALE = 179.13 / 120.0   # render-size multiplier to keep the ring pixel-identical
+# Size the logo by the VISIBLE ring diameter (the orbit viewBox is oversized, so
+# the ring is only 115/179.13 of the rendered size). ring_px = desired outer-ring
+# diameter in pixels.
+def _logo_for_ring(ring_px):
+    return int(ring_px * 179.13 / 115.0)
 
 _LOGO_ORBIT_PATH = (
     "M 0.00,0.00 C 11.05,-5.63 21.73,-29.62 30.00,-22.00 C 38.27,-14.38 53.97,26.78 49.60,45.70 "
@@ -5509,7 +5513,7 @@ if 'acked' not in st.session_state:
 if not st.session_state['logged_in']:
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
-        st.markdown(f"<div style='text-align:center;margin-bottom:2px;'>{_brand_logo(int(88 * _LOGO_SCALE))}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='text-align:center;margin-bottom:2px;'>{_brand_logo(_logo_for_ring(150))}</div>", unsafe_allow_html=True)
         st.markdown("<div class='brand-word' style='text-align:center;font-size:34px;'>CHOCKS ON</div>", unsafe_allow_html=True)
         st.markdown("<div class='brand-tag' style='text-align:center;font-size:14px;margin-top:2px;'>Mind off.</div>", unsafe_allow_html=True)
         st.markdown("<div style='text-align:center;color:#7e8ba0;font-size:12px;margin:6px 0 16px;'>Your roster, salary &amp; rest — sorted before you land.</div>", unsafe_allow_html=True)
@@ -5599,7 +5603,7 @@ else:
         st.markdown(
             f"<div class='hbar'>"
             f"<div style='display:flex;align-items:center;'>"
-            f"{_brand_logo(int(42 * _LOGO_SCALE))}"
+            f"{_brand_logo(_logo_for_ring(80))}"
             f"<div style='margin-left:13px;'>"
             f"<div class='brand-word' style='font-size:20px;'>CHOCKS ON</div>"
             f"<div class='brand-tag'>Mind off. &nbsp;·&nbsp; {month_label}</div>"
