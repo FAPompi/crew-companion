@@ -925,6 +925,52 @@ def load_profile(username):
     except Exception:
         return {}
 
+
+def _sync_profile_keys(username):
+    """Seed the salary-profile widget state from the saved profile. Called on
+    login so every session (and every different user on the same browser) starts
+    from the DB values instead of stale widget state."""
+    saved = load_profile(username)
+    cat = saved.get("cat", "C3")
+    if cat not in HOURLY_PAY:
+        cat = "C3"
+    st.session_state["prof_cat"] = cat
+    st.session_state["prof_rate"] = float(saved.get("rate", 318.56) or 318.56)
+    st.session_state["prof_schblk"] = saved.get("schblk", "70h 00m")
+    st.session_state["prof_basic"] = float(saved.get("basic", 0.0) or 0.0)
+    st.session_state["prof_festival"] = bool(saved.get("festival", False))
+    st.session_state["prof_crge"] = float(saved.get("crge", 10000.0) or 0.0)
+    st.session_state["prof_transport"] = float(saved.get("transport", 1000.0) or 0.0)
+    st.session_state["prof_medical"] = float(saved.get("medical", 500.0) or 0.0)
+    st.session_state["prof_fau"] = float(saved.get("fau", 2100.0) or 0.0)
+    st.session_state["prof_stamp"] = float(saved.get("stamp", 0.0) or 0.0)
+    st.session_state["prof_apiit"] = float(saved.get("apiit", 0.0) or 0.0)
+    st.session_state["prof_epf_pct"] = float(saved.get("epf_pct", 10.0) or 10.0)
+
+
+def _prof_autosave():
+    """Auto-save the salary Crew Profile fields (fired on_change). Merges with the
+    stored profile so keys like fbpp_overrides / acting are never dropped."""
+    u = st.session_state.get('username')
+    if not u:
+        return
+    prev = load_profile(u)
+    prev.update({
+        "cat": st.session_state.get("prof_cat", prev.get("cat", "C3")),
+        "rate": float(st.session_state.get("prof_rate", prev.get("rate", 318.56)) or 318.56),
+        "schblk": st.session_state.get("prof_schblk", prev.get("schblk", "70h 00m")),
+        "festival": bool(st.session_state.get("prof_festival", prev.get("festival", False))),
+        "basic": float(st.session_state.get("prof_basic", prev.get("basic", 0.0)) or 0.0),
+        "crge": float(st.session_state.get("prof_crge", prev.get("crge", 10000.0)) or 0.0),
+        "transport": float(st.session_state.get("prof_transport", prev.get("transport", 1000.0)) or 0.0),
+        "medical": float(st.session_state.get("prof_medical", prev.get("medical", 500.0)) or 0.0),
+        "fau": float(st.session_state.get("prof_fau", prev.get("fau", 2100.0)) or 0.0),
+        "stamp": float(st.session_state.get("prof_stamp", prev.get("stamp", 0.0)) or 0.0),
+        "apiit": float(st.session_state.get("prof_apiit", prev.get("apiit", 0.0)) or 0.0),
+        "epf_pct": float(st.session_state.get("prof_epf_pct", prev.get("epf_pct", 10.0)) or 10.0),
+    })
+    save_profile(u, prev)
+
 def load_roster_from_db(username):
     conn = sqlite3.connect('crew_companion.db')
     c = conn.cursor()
@@ -5767,6 +5813,7 @@ if not st.session_state['logged_in']:
                     st.session_state['username'] = user_record[0]
                     st.session_state['full_name'] = user_record[2]
                     st.session_state['rank'] = user_record[3]
+                    _sync_profile_keys(user_record[0])
                     st.rerun()
                 else:
                     st.error("Invalid credentials.")
@@ -6621,26 +6668,23 @@ else:
 
         with pcol:
             st.markdown("##### Crew Profile")
+            st.markdown("<div class='muted' style='margin-bottom:6px;'>Changes save automatically as you edit — no button needed.</div>", unsafe_allow_html=True)
             cats = list(HOURLY_PAY.keys())
-            cat = st.selectbox("Category", cats, index=cats.index(saved.get("cat", "C3")) if saved.get("cat", "C3") in cats else 5)
-            usd_rate = st.number_input("USD → LKR rate", value=float(saved.get("rate", 318.56)), step=0.01, format="%.2f")
-            schblk = st.text_input("SCHBLK (scheduled block hrs)", value=saved.get("schblk", "70h 00m"))
-            basic = st.number_input("Basic Salary (Rs)", value=float(saved.get("basic", 0.0)), step=500.0)
-            festival = st.toggle("Festival Advance taken (Rs 5,000)", value=bool(saved.get("festival", False)))
+            cat = st.selectbox("Category", cats, key="prof_cat", on_change=_prof_autosave)
+            usd_rate = st.number_input("USD → LKR rate", step=0.01, format="%.2f", key="prof_rate", on_change=_prof_autosave)
+            schblk = st.text_input("SCHBLK (scheduled block hrs)", key="prof_schblk", on_change=_prof_autosave)
+            basic = st.number_input("Basic Salary (Rs)", step=500.0, key="prof_basic", on_change=_prof_autosave)
+            festival = st.toggle("Festival Advance taken (Rs 5,000)", key="prof_festival", on_change=_prof_autosave)
             with st.expander("⚙️ Advanced (salary components & deductions)"):
-                crge = st.number_input("CRGE (Rs)", value=float(saved.get("crge", 10000.0)), step=500.0)
-                transport = st.number_input("Transport deduction (Rs)", value=float(saved.get("transport", 1000.0)), step=100.0)
-                medical = st.number_input("Medical contribution (Rs)", value=float(saved.get("medical", 500.0)), step=100.0)
-                fau = st.number_input("FAU subs (Rs)", value=float(saved.get("fau", 2100.0)), step=100.0)
-                stamp = st.number_input("Stamp duty (Rs)", value=float(saved.get("stamp", 0.0)), step=5.0)
-                apiit = st.number_input("APIIT (Rs)", value=float(saved.get("apiit", 0.0)), step=100.0)
-                epf_pct = st.number_input("EPF %", value=float(saved.get("epf_pct", 10.0)), step=1.0)
+                crge = st.number_input("CRGE (Rs)", step=500.0, key="prof_crge", on_change=_prof_autosave)
+                transport = st.number_input("Transport deduction (Rs)", step=100.0, key="prof_transport", on_change=_prof_autosave)
+                medical = st.number_input("Medical contribution (Rs)", step=100.0, key="prof_medical", on_change=_prof_autosave)
+                fau = st.number_input("FAU subs (Rs)", step=100.0, key="prof_fau", on_change=_prof_autosave)
+                stamp = st.number_input("Stamp duty (Rs)", step=5.0, key="prof_stamp", on_change=_prof_autosave)
+                apiit = st.number_input("APIIT (Rs)", step=100.0, key="prof_apiit", on_change=_prof_autosave)
+                epf_pct = st.number_input("EPF %", step=1.0, key="prof_epf_pct", on_change=_prof_autosave)
             if st.button("💾 Save Profile", use_container_width=True):
-                save_profile(st.session_state['username'],
-                             {"cat": cat, "rate": usd_rate, "schblk": schblk, "festival": festival,
-                              "basic": basic, "crge": crge, "transport": transport,
-                              "medical": medical, "fau": fau, "stamp": stamp, "apiit": apiit,
-                              "epf_pct": epf_pct})
+                _prof_autosave()
                 st.success("Profile saved — it will load automatically next time.")
 
         with rcol:
